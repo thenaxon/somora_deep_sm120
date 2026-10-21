@@ -98,6 +98,9 @@ class EngineLoop:
 
     def submit(self, req: GenRequest) -> GenRequest:
         req.request_id = str(next(self._ids))  # numeric strings: LLM._run_engine sorts ids with int()
+        if not self.alive:  # crashed engine: fail now instead of after --request-timeout
+            req.out.put(("error", f"engine is not running: {self._error!r}"))
+            return req
         self._inbox.put(("add", req))
         return req
 

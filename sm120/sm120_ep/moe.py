@@ -184,20 +184,47 @@ class EPRoutedExperts:
                 rows = self.decode_rows
                 if T > rows:
                     raise RuntimeError(f"EP decode step has {T} rows > SM120_EP_DECODE_ROWS={rows}")
-        elif dp_sync.active() and dp_sync._STATE["prefill_rows"] is not None:
-            rows = dp_sync._STATE["prefill_rows"]
-            if T > rows:  # the step's token count bounds every layer's T (would desync the collectives otherwise)
-                raise RuntimeError(f"EP prefill layer has {T} rows > the step's DP-max token count {rows}")
+            counts = None
+        elif dp_sync.active() and dp_sync._STATE["prefill_counts"] is not None:
+            counts = dp_sync._STATE["prefill_counts"]
+            rows = max(counts)
+            if T > counts[self.rank]:  # the step's token count bounds every layer's T (else the collectives desync)
+                raise RuntimeError(f"EP prefill layer has {T} rows > the step's token count {counts[self.rank]}")
         else:
-            rows = max(self.transport.all_gather_counts(T, x.device))
+            counts = self.transport.all_gather_counts(T, x.device)
+            rows = max(counts)
         send = self._pack(x, topk_idx, topk_weights, rows)
         recv = torch.empty((self.world * rows, self.row_bytes), dtype=torch.uint8, device=x.device)
         self.transport.all_gather(recv, send)
-        xg, idl, wg = self._unpack_local(recv)
-        part = self.inner(xg, idl, wg)  # bf16 [world*rows, H], zeros where no local route
+        real = None if counts is None or sum(counts) == self.world * rows else _real_rows(counts, rows, x.device)
+        if real is None:
+            xg, idl, wg = self._unpack_local(recv)
+            part = self.inner(xg, idl, wg)  # bf16 [world*rows, H], zeros where no local route
+        else:
+            # prefill: run the experts on the ranks' real rows only (padding rows have no routes, but b12x
+            # still quantizes and schedules them: 22.5 vs 6.8 ms per layer for one busy rank of four)
+            xg, idl, wg = self._unpack_local(recv.index_select(0, real))
+            sub = self.inner(xg, idl, wg)
+            part = torch.zeros((self.world * rows, sub.shape[1]), dtype=sub.dtype, device=x.device)
+            part.index_copy_(0, real, sub)
         out = torch.empty((rows, self.hidden), dtype=part.dtype, device=x.device)
         self.transport.reduce_scatter_sum(out, part.contiguous())
         return out[:T]
+
+
+_REAL_ROWS: dict = {}
+
+
+def _real_rows(counts, rows: int, device) -> torch.Tensor:
+    """Row index of every rank's real (non-padding) rows in the all-gathered [world*rows] buffer; built once per
+    (counts, rows), i.e. once per prefill step, and shared by all layers (no host sync)."""
+    key = (tuple(counts), rows, str(device))
+    t = _REAL_ROWS.get(key)
+    if t is None:
+        _REAL_ROWS.clear()
+        t = torch.cat([torch.arange(r * rows, r * rows + c, device=device) for r, c in enumerate(counts) if c])
+        _REAL_ROWS[key] = t
+    return t
 
 
 def wrap(moe, inner=None):

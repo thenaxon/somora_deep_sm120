@@ -3,7 +3,7 @@
 All notable changes to this project are documented here. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0 any minor release may change interfaces.
 
-## [0.1.1] - unreleased
+## [0.1.1] - 2026-10-21
 
 ### Fixed
 - CUDA-graph server crash (`CUDA error: an illegal instruction` in decode graph replay) after a prompt that needed a b12x plan not seen before: the lazy preparation evicted and unloaded b12x programs that captured graphs still launch. The programs launched during graph warm-up and capture are now retained (`sm120_patches` P9, test `tests/graph_replay_lazy_prep.sh`).
@@ -16,7 +16,8 @@ before 1.0 any minor release may change interfaces.
   check no longer depends on timing under CUDA graphs.
 - No more `/dev/shm/psm_*` leaks (2 GB per engine and stop): runtime patch P11 unlinks the multimodal pool's name after
   the worker fork; `server.py` turns SIGTERM into a clean shutdown (as PID 1 the default action was to ignore it until
-  `docker stop` killed it), and the `--dp` proxy forwards it to the ranks.
+  `docker stop` killed it), and the `--dp` proxy forwards it to the ranks. `docker stop` now takes about 1.5 s, exits
+  with 0 and logs no tracebacks: forked worker processes exit quietly and the engine is closed before interpreter exit.
 - `/v1/completions` accepts a prompt of a single token id; after an engine crash, new requests fail at once instead of
   waiting for the per-token timeout.
 

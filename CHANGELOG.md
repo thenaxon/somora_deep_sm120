@@ -3,7 +3,7 @@
 All notable changes to this project are documented here. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0 any minor release may change interfaces.
 
-## [Unreleased]
+## [0.2.1] - unreleased
 
 ### Fixed
 - Prefill with `--prefix-cache` was split into `--prefix-cache-grain`-sized engine steps (512 tokens by default): a
@@ -38,6 +38,21 @@ before 1.0 any minor release may change interfaces.
   reference files.
 - docs/EVAL.md: KV-cache precision of the reference, DeepInfer and an FP8-KV vLLM deployment, and how to tell which
   engine is numerically right on the full model.
+- Engram prefetch at request admission (`sm120_engram.EngramPrefetcher`, patch E7):
+  - A prompt's rows are computed on the CPU exactly like DeepInfer's and read into the page cache by a background
+    thread, ahead of the prefill chunks that need them, in admission order.
+  - Bounded by `SM120_ENGRAM_PREFETCH_AHEAD`; aborts cancel queued prompts; results stay bit-identical.
+  - Switches `SM120_ENGRAM_PREFETCH*`; `SM120_ENGRAM_TRACE=1` prints per-gather and per-prefetch timing.
+  - Cold-cache TTFT on the RTX 5090 test machine: 32k-token prompt 9.2 s -> 6.7 s (`host`), 11.4 s -> 6.6 s
+    (`uring`). Without engram it is 6.3 s.
+- `tests_engram.py` T7: the prefetcher's row ids and page ranges against DeepInfer's.
+
+### Changed
+- Engram scale planes are kept in the page cache (`SM120_ENGRAM_SCALES=resident`, 5.7 GiB for both tables): one NVMe
+  read per cold lookup instead of two (cold 4k-token gather 0.78 s -> 0.30 s). `uring` reads only the weight rows with
+  O_DIRECT.
+- `uring` mode gathers prefill-sized batches (`SM120_ENGRAM_URING_MMAP_TOKENS`, 256 tokens) through the mmap, so
+  prefetched rows are used; decode batches stay O_DIRECT.
 
 ## [0.2.0] - 2026-10-21
 

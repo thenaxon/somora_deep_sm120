@@ -32,11 +32,11 @@ NVIDIA driver >= 595 is required (CUDA 13.2). Pinned versions are listed in [COM
 
 ```bash
 git clone <this repo> somora_deep_sm120 && cd somora_deep_sm120
-docker build -t somora_deep_sm120:0.2.0 -f docker/Dockerfile .      # clones DeepInfer at the pinned commit
+docker build -t somora_deep_sm120:0.2.1 -f docker/Dockerfile .      # clones DeepInfer at the pinned commit
 
 docker run --rm --gpus all --ipc=host --shm-size=16g -p 8000:8000 \
   -v /models:/models:ro -v sm120-cache:/cache \
-  somora_deep_sm120:0.2.0 --model /models/<checkpoint> --prefix-cache
+  somora_deep_sm120:0.2.1 --model /models/<checkpoint> --prefix-cache
 
 curl -s localhost:8000/v1/chat/completions -H 'content-type: application/json' \
   -d '{"model": "<checkpoint>", "messages": [{"role": "user", "content": "Hello"}], "max_tokens": 32}'
@@ -160,7 +160,7 @@ use the container paths `/work` (work dir), `/ckpt` (original HF shards, read-on
 ## Running the tests
 
 ```bash
-docker run --rm --gpus all --ipc=host --shm-size=16g --entrypoint bash somora_deep_sm120:0.2.0 -c '
+docker run --rm --gpus all --ipc=host --shm-size=16g --entrypoint bash somora_deep_sm120:0.2.1 -c '
   cd /opt/sm120/tests && pytest -q test_attn_shims.py test_mhc_einsum.py test_gemm_moe_graphs.py test_ep_moe.py \
   && python3 test_ep_dp_sync.py && bash run_runtime_unit.sh'
 ```

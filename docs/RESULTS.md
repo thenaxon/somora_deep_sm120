@@ -12,7 +12,7 @@ same checkpoint on the same machine. Single-GPU results with truncated test chec
 
 - **Hardware:** 4× RTX PRO 6000 Blackwell Max-Q (96 GB, SM120), PCIe only (all GPU pairs `NODE`, no NVLink), driver 595.91, 246 GB host RAM.
 - **Model:** DeepSeek-V4.1-Flash (all 48 shards, unmodified), mounted read-only.
-- **This engine:** `somora_deep_sm120:0.2.0` with `--dp 4` (DP attention + EP MoE over NCCL, `SM120_EP_IMPL=allgather`), `SM120_ENGRAM_MODE=host`, `SM120_ENGRAM_PREFAULT=1`, `--gpu-memory-utilization 0.92 --max-model-len 40960 --max-num-seqs 16 --max-num-batched-tokens 4096 --max-blocks 4096 --prefix-cache`.
+- **This engine:** `somora_deep_sm120:0.2.1` with `--dp 4` (DP attention + EP MoE over NCCL, `SM120_EP_IMPL=allgather`), `SM120_ENGRAM_MODE=host`, `SM120_ENGRAM_PREFAULT=1`, `--gpu-memory-utilization 0.92 --max-model-len 40960 --max-num-seqs 16 --max-num-batched-tokens 4096 --max-blocks 4096 --prefix-cache`.
 - **Baseline:** a vLLM fork with b12x kernels, TP=4, DSpark speculative decoding (adaptive, up to 7 drafts), FP8 KV cache, engram tables pinned in host RAM.
 - **Tools:** the repo's `eval/` tools (`compare_endpoints.py`, `loadgen.py`, `quality_check.py`) plus a few real code/chat prompts. The two engines could not share the GPUs, so they ran one after the other.
 

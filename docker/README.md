@@ -2,7 +2,7 @@
 
 | file | image | what |
 |---|---|---|
-| `docker/Dockerfile` | `somora_deep_sm120:0.2.0` | **self-contained serving image**: DeepInfer (pinned commit) + SM120 shims + OpenAI server + prefix cache; the entrypoint starts the server |
+| `docker/Dockerfile` | `somora_deep_sm120:0.2.1` | **self-contained serving image**: DeepInfer (pinned commit) + SM120 shims + OpenAI server + prefix cache; the entrypoint starts the server |
 | `docker/Dockerfile.dev` | `somora_deep_sm120:dev` | dev/test image: the same base and DeepInfer build, but the repo is **mounted** at `/opt/sm120` instead of copied |
 | `docker/entrypoint.sh` | | entrypoint of the serving image (`/opt/sm120/docker/entrypoint.sh`) |
 
@@ -11,7 +11,7 @@
 The build context is the repo root:
 
 ```bash
-docker build -t somora_deep_sm120:0.2.0 -f docker/Dockerfile .
+docker build -t somora_deep_sm120:0.2.1 -f docker/Dockerfile .
 # a different DeepInfer commit (untested):
 docker build -t somora_deep_sm120:custom --build-arg DEEPINFER_COMMIT=<sha> -f docker/Dockerfile .
 ```
@@ -55,12 +55,12 @@ Environment defaults (override with `-e`):
 ```bash
 docker run --rm --gpus all --ipc=host --shm-size=16g -p 8000:8000 \
   -v /models:/models:ro -v /var/cache/deepinfer:/cache \
-  somora_deep_sm120:0.2.0 --model /models/DeepSeek-V4.1-Flash --prefix-cache
+  somora_deep_sm120:0.2.1 --model /models/DeepSeek-V4.1-Flash --prefix-cache
 # entrypoint options: --model PATH (required) --served-model-name NAME --no-graphs (CUDA graphs are on by default)
 #   --host 0.0.0.0 --port 8000; everything else goes to server.py:
 #   --gpu-memory-utilization 0.9 --max-model-len 16384 --max-num-seqs 8 --max-num-batched-tokens 4096 --prefix-cache
 #   [--prefix-cache-grain 512 --prefix-cache-entries 64 --prefix-cache-max-block-frac 0.5] --nextn N --deterministic
-docker run --rm somora_deep_sm120:0.2.0 --help
+docker run --rm somora_deep_sm120:0.2.1 --help
 ```
 
 The API (`/v1/models`, `/v1/completions`, `/v1/chat/completions` incl. SSE streaming, `/health`) is described in

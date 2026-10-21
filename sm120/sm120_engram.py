@@ -32,6 +32,11 @@ Environment (all optional):
                                             SM120_ENGRAM_STATS_INTERVAL seconds (default 60) while they change
     SM120_ENGRAM_CKPT=<dir>                 directory used to resolve shards (default: the loader's hf_dir)
     SM120_ENGRAM_URING_QD=<n>               io_uring queue depth for mode=uring (default 128)
+    SM120_ENGRAM_URING_MMAP_TOKENS=<n>      mode=uring: batches of >= n tokens gather through the mmap (default 256)
+    SM120_ENGRAM_SCALES=resident|disk       keep the scale planes in the page cache (default resident)
+    SM120_ENGRAM_PREFETCH=1|0               read a prompt's rows ahead from request admission on (EngramPrefetcher)
+    SM120_ENGRAM_PREFETCH_METHOD=touch|fadvise, _AHEAD=<tokens> (32768), _BLOCK=<tokens> (4096), _THREADS=<n> (16)
+    SM120_ENGRAM_TRACE=0|1                  one line per prefill gather / prefetch block
 
 See docs/ENGRAM.md for the semantics and DeepInfer's data path.
 """
@@ -239,6 +244,8 @@ def post_load_cache_policy(ckpt_dir: str | None) -> dict:
     3. Log the tables' page-cache residency."""
     t0 = time.time()
     res = {}
+    for t in {id(t): t for t in _TABLES if t.source is not None}.values():
+        t.prefault_scales()  # the other ranks' weight streaming may have evicted them; cheap when resident
     tables = [t for t in _TABLES if t.source is not None and t._uring is None]
     engram_files = {os.path.realpath(loc.path) for t in tables for loc in t.source if loc is not None}
     if ckpt_dir and _env("SM120_ENGRAM_DROP_WEIGHT_PAGES", "1") not in ("0", "false", "no"):
@@ -309,6 +316,7 @@ class EngramHostTable:
         self.kind = "cuda" if weight_u8 is not None and weight_u8.is_cuda else "host"
         self._registered: list[int] = []
         self._uring = None
+        self.uring_scales = False  # uring: scales read by the O_DIRECT reader too (SM120_ENGRAM_SCALES=disk)
 
     # ---- constructors
     @classmethod
@@ -389,18 +397,19 @@ class EngramHostTable:
                 total += r
         return total
 
-    def prefault(self, threads: int | None = None, chunk_bytes: int = 256 << 20) -> float:
+    def prefault(self, threads: int | None = None, chunk_bytes: int = 256 << 20, scales_only: bool = False) -> float:
         """Read the whole table once (sequential, parallel) so later lookups hit the page cache. Returns
-        seconds. On a machine with less free RAM than the table this only churns the cache: it warns."""
+        seconds. On a machine with less free RAM than the table this only churns the cache: it warns.
+        scales_only: just the E8M0 scale plane (1/33 of the table, see prefault_scales)."""
         if self.source is None:
             return 0.0
         avail = _mem_available()
-        if avail is not None and self.nbytes > avail:
+        if not scales_only and avail is not None and self.nbytes > avail:
             warnings.warn(f"{self.name}: table {self.nbytes / 2**30:.1f} GiB > MemAvailable "
                           f"{avail / 2**30:.1f} GiB, prefault cannot keep it resident", RuntimeWarning, stacklevel=2)
         t0 = time.time()
         jobs = []
-        for loc in self.source:
+        for loc in (self.source[1:] if scales_only else self.source):
             if loc is None:
                 continue
             mm = _mmap_file(loc.path)
@@ -412,6 +421,17 @@ class EngramHostTable:
             list(pool.map(lambda x: int(x[:: mmap.PAGESIZE].sum()), jobs))
         self.advise(_env("SM120_ENGRAM_ADVICE", "random"))
         return time.time() - t0
+
+    def prefault_scales(self) -> float:
+        """Keep the scale plane in the page cache (SM120_ENGRAM_SCALES=resident, the default).
+
+        A lookup reads one 256-byte weight row and one 8-byte scale row; both sit on different 4 KiB pages, so a cold
+        lookup is two random NVMe reads. The scale planes are only 2.9 GiB per table (5.7 GiB for both, one copy
+        for all ranks of a host); with them resident a cold lookup is one read: 3.2x faster cold gathers on the RTX
+        5090 test machine (0.24 -> 0.76 Mrows/s). Every lookup touches the scale pages, so the LRU keeps them."""
+        if self.source is None or self.source[1] is None or _env("SM120_ENGRAM_SCALES", "resident") != "resident":
+            return 0.0
+        return self.prefault(scales_only=True)
 
     # ---- GPU access
     def to_uva(self, device: torch.device | str | None = None) -> "EngramHostTable":
@@ -459,18 +479,23 @@ class EngramHostTable:
         device = torch.device(device)
         if device.index is None:
             device = torch.device("cuda", torch.cuda.current_device())
+        # resident scales (the default): O_DIRECT reads of the weight rows only, scales from the page cache (mmap)
+        disk_scales = self.groups and _env("SM120_ENGRAM_SCALES", "resident") != "resident"
         cache = DiskRowCache(device=device, max_lookups=max_lookups, table_rows=self.rows, shard_start=0,
                              shard_end=self.rows, shard_rows=self.rows, weight_row_bytes=self.row_bytes,
-                             scale_row_bytes=self.groups, queue_depth=int(_env("SM120_ENGRAM_URING_QD", "128")))
+                             scale_row_bytes=self.groups if disk_scales else 0,
+                             queue_depth=int(_env("SM120_ENGRAM_URING_QD", "128")))
         wloc, sloc = self.source
         cache.add_shard(0, wloc.path, wloc.offset)
-        if sloc is not None:
+        if sloc is not None and disk_scales:
             cache.add_shard(0, sloc.path, sloc.offset, scale=True)
         cache.freeze()
-        out = EngramHostTable(None, None, rows=self.rows, row_bytes=self.row_bytes, groups=self.groups,
+        # the mmap views stay: scale rows (resident) and, for prefill-sized batches, prefetched weight rows
+        out = EngramHostTable(self.weight, self.scale, rows=self.rows, row_bytes=self.row_bytes, groups=self.groups,
                               name=self.name, source=self.source)
         out.kind = "uring"
         out._uring = cache
+        out.uring_scales = bool(disk_scales)
         return out
 
     def close(self) -> None:
@@ -485,7 +510,7 @@ class EngramHostTable:
             self._uring = None
 
     # ---- gathers
-    def gather_host(self, idx: torch.Tensor, out_w: torch.Tensor, out_s: torch.Tensor | None,
+    def gather_host(self, idx: torch.Tensor, out_w: torch.Tensor | None, out_s: torch.Tensor | None,
                     pool: ThreadPoolExecutor | None = None, chunk: int = 4096) -> None:
         """CPU gather: idx int64 CPU [n] -> out_w [n, row_bytes], out_s [n, groups] (uint8, CPU/pinned).
         index_select releases the GIL, so `pool` threads fault pages in parallel (that is the NVMe queue
@@ -497,7 +522,7 @@ class EngramHostTable:
         bad = (idx < 0) | (idx >= self.rows)
         any_bad = bool(bad.any())
         sel_all = idx.masked_fill(bad, 0) if any_bad else idx
-        planes = [(self.weight, out_w, 0)]
+        planes = [(self.weight, out_w, 0)] if out_w is not None else []  # out_w None: scales only (uring)
         if out_s is not None and self.scale is not None:
             planes.append((self.scale, out_s, E8M0_ONE))
 
@@ -565,6 +590,11 @@ def open_table(ckpt_dir: str | None, layer_id: int, *, wloc: TensorLoc | None = 
         wloc, sloc = find_engram_tensors(ckpt_dir, layer_id)
     table = EngramHostTable.from_locations(wloc, sloc, name=f"layers.{layer_id}.engram",
                                            prefault=None if mode in ("auto", "host") else False)
+    if mode in ("auto", "host", "uring"):
+        dt = table.prefault_scales()
+        if dt:
+            print(f"[sm120_engram] {table.name}: scale plane ({table.rows * table.groups / 2**30:.1f} GiB) read into "
+                  f"the page cache in {dt:.1f} s (SM120_ENGRAM_SCALES=resident)", flush=True)
     if mode in ("auto", "host"):
         return table
     if mode == "uva":
@@ -610,6 +640,8 @@ class EngramFetcher:
         self.row_offsets = [0] * self.num_layers
         self.threads = int(threads or _env("SM120_ENGRAM_THREADS", "32"))
         self.chunk = int(_env("SM120_ENGRAM_CHUNK", "4096"))
+        self.uring_mmap_tokens = int(_env("SM120_ENGRAM_URING_MMAP_TOKENS", "256"))
+        self._via_host: set = set()
         self._pool: ThreadPoolExecutor | None = None
         self._layer_pool: ThreadPoolExecutor | None = None
         self._bufs: dict | None = None
@@ -631,7 +663,7 @@ class EngramFetcher:
                 assert t.groups == self.groups, (t.name, t.groups, self.groups)
         self.tables = list(tables)
         self.row_offsets = list(row_offsets or [0] * self.num_layers)
-        if any(t.kind == "host" for t in tables) and self.threads > 1 and self._pool is None:
+        if any(t.kind in ("host", "uring") for t in tables) and self.threads > 1 and self._pool is None:
             self._pool = ThreadPoolExecutor(max_workers=self.threads, thread_name_prefix="sm120-engram")
             self._layer_pool = ThreadPoolExecutor(max_workers=max(1, self.num_layers), thread_name_prefix="sm120-engram-l")
 
@@ -658,13 +690,15 @@ class EngramFetcher:
     def _alloc_buffers(self) -> dict:
         L, n = self.num_layers, self.num_max_tokens * self.num_entries_per_token
         pin = self.is_cuda
-        host = any(t is not None and t.kind == "host" for t in self.tables)
+        # uring tables gather prefill-sized batches through the mmap too (SM120_ENGRAM_URING_MMAP_TOKENS)
+        staged = lambda t: t is not None and t.kind in ("host", "uring")  # noqa: E731
+        host = any(staged(t) for t in self.tables)
         b: dict = {"idx_host": None, "stage_w": [None] * L, "stage_s": [None] * L, "dev_w": [], "dev_s": [], "ids64": None}
         if host:
             b["idx_host"] = torch.empty((L, self.num_max_tokens, self.num_entries_per_token), dtype=torch.int32,
                                         device="cpu", pin_memory=pin)
         for l, t in enumerate(self.tables):
-            if t is not None and t.kind == "host":
+            if staged(t):
                 b["stage_w"][l] = torch.empty((n, self.row_bytes), dtype=torch.uint8, device="cpu", pin_memory=pin)
                 b["stage_s"][l] = torch.empty((n, max(self.groups, 1)), dtype=torch.uint8, device="cpu", pin_memory=pin)
             b["dev_w"].append(torch.empty((n, self.row_bytes), dtype=torch.uint8, device=self.device)
@@ -701,10 +735,20 @@ class EngramFetcher:
             gen = self._gen
             b = self._buffers()
             n = T * E
+            # uring tables: prefill-sized batches go through the mmap (rows the prefetcher read ahead are in the page
+            # cache; cold rows fault at the device's IOPS like O_DIRECT reads), decode-sized ones are O_DIRECT reads
+            via_host = {l for l, t in enumerate(self.tables)
+                        if t.kind == "host" or (t.kind == "uring" and t.weight is not None and T >= self.uring_mmap_tokens)}
+            self._via_host = via_host
+            if _PREFETCH is not None and T > 1:
+                _PREFETCH.consumed(T)
             if (self.is_cuda and self._async is None and kinds <= {"host", "uring"}
                     and _env("SM120_ENGRAM_GRAPH", "async") == "async"):
                 self._async = _AsyncGraphFetch(self)  # eager: pinned buffers, thread, Triton JIT before capture
-            if "host" in kinds:
+            # uring layers read their resident scales through the mmap: they need the ids on the host as well
+            scales_host = {l for l, t in enumerate(self.tables)
+                           if t.kind == "uring" and l not in via_host and self.use_fp8 and not t.uring_scales}
+            if via_host or scales_host:
                 t0 = time.perf_counter()
                 idx_host = b["idx_host"][:, :T]
                 idx_host.copy_(indices, non_blocking=self.is_cuda)
@@ -715,14 +759,13 @@ class EngramFetcher:
                     ev.record(torch.cuda.current_stream(self.device))
                     ev.synchronize()
                 self.stats["sync_s"] += time.perf_counter() - t0
-                for l, t in enumerate(self.tables):
-                    if t.kind == "host":
-                        job = (self._gather_layer, l, n)
-                        self._futures[l] = (self._layer_pool.submit(*job) if self._layer_pool is not None
-                                            else _done(job[0](*job[1:])))
+                for l in sorted(via_host):
+                    job = (self._gather_layer, l, n)
+                    self._futures[l] = (self._layer_pool.submit(*job) if self._layer_pool is not None
+                                        else _done(job[0](*job[1:])))
             if "uring" in kinds:
                 for l, t in enumerate(self.tables):
-                    if t.kind == "uring":
+                    if t.kind == "uring" and l not in via_host:
                         b["ids64"][l, :n].copy_(indices[l].reshape(-1))
                         if self.row_offsets[l]:
                             b["ids64"][l, :n].sub_(self.row_offsets[l])
@@ -763,7 +806,7 @@ class EngramFetcher:
         self.stats["pre_sync_s"] = self.stats.get("pre_sync_s", 0.0) + self.stats["sync_s"] - sync0
         t_gather = time.perf_counter()
         for l, t in enumerate(self.tables):
-            if t.kind == "host":  # wait for the CPU gather and issue the H2D copies (no formatting needed)
+            if l in self._via_host:  # wait for the CPU gather and issue the H2D copies (no formatting needed)
                 fut = self._futures[l]
                 if fut is not None:
                     fut.result()
@@ -782,6 +825,17 @@ class EngramFetcher:
 
     @torch.inference_mode()
     def _gather_layer(self, l: int, n: int) -> None:
+        t0 = time.perf_counter()
+        try:
+            self._gather_layer_inner(l, n)
+        finally:
+            if _TRACE and n >= 256 * self.num_entries_per_token:
+                p = _PREFETCH
+                print(f"[sm120_engram] trace gather layer {l} rows {n} {1e3 * (time.perf_counter() - t0):.1f} ms"
+                      + (f" | prefetch issued {p._issued} consumed {p._consumed} queued {len(p._q)}" if p else ""),
+                      flush=True)
+
+    def _gather_layer_inner(self, l: int, n: int) -> None:
         t0 = time.perf_counter()
         b = self._bufs
         idx = b["idx_host"][l, : n // self.num_entries_per_token].reshape(-1).to(torch.int64)
@@ -802,7 +856,7 @@ class EngramFetcher:
             b = self._bufs
             t = self.tables[l]
             dev_w, dev_s = b["dev_w"][l][:n], b["dev_s"][l][:n]
-            if t.kind == "host":
+            if l in self._via_host:
                 t0 = time.perf_counter()
                 fut = self._futures[l]
                 if fut is not None:
@@ -820,10 +874,16 @@ class EngramFetcher:
                 t.gather_cuda(idx, dev_w, dev_s if self.use_fp8 else None)
             elif t.kind == "uring":
                 cache_ = t._uring
+                if self.use_fp8 and not t.uring_scales:  # resident scales: from the page cache
+                    idx = b["idx_host"][l, :T].reshape(-1).to(torch.int64)
+                    if self.row_offsets[l]:
+                        idx -= self.row_offsets[l]
+                    t.gather_host(idx, None, b["stage_s"][l][:n], pool=self._pool, chunk=self.chunk)
+                    dev_s.copy_(b["stage_s"][l][:n], non_blocking=True)
                 with cache_.transaction():
                     cache_.read_rows(b["ids64"][l], n)
                     dev_w.copy_(cache_.weight[:n])
-                    if self.use_fp8:
+                    if self.use_fp8 and t.uring_scales:
                         dev_s.copy_(cache_.scale[:n])
             else:
                 raise RuntimeError(f"unknown table kind {t.kind}")
@@ -932,8 +992,8 @@ class _AsyncGraphFetch:
         hooks = []
         for l in range(L):
             t = f.tables[l]
-            if t.kind == "uring":  # rows land in b12x's mapped-host staging (CUDA views)
-                src_w, src_s = t._uring.weight, t._uring.scale
+            if t.kind == "uring":  # rows land in b12x's mapped-host staging (CUDA views); resident scales in stage_s
+                src_w, src_s = t._uring.weight, (t._uring.scale if t.uring_scales else b["stage_s"][l])
             else:
                 src_w, src_s = b["stage_w"][l], b["stage_s"][l]
 
@@ -971,6 +1031,8 @@ class _AsyncGraphFetch:
                 t = f.tables[l]
                 if t.kind == "uring":
                     c = t._uring  # b12x DiskRowCache: drive its native reader directly from host ids
+                    if f.use_fp8 and not t.uring_scales:
+                        t.gather_host(idx, None, b["stage_s"][l][:n], pool=f._pool, chunk=f.chunk)
                     c.ids_host[:n].copy_(idx)
                     c._native.ple_reader_run(c._reader, c._ids_buffer, c._weight_buffer, c._scale_buffer, n)
                 else:
@@ -1015,6 +1077,16 @@ def _dump_stats(only_changed: bool = False) -> None:
               f"prestage {st.get('prestage_s', 0.0) / max(1, st.get('prestages', 0)) * 1e3:.3f} ms "
               f"(sync {st.get('pre_sync_s', 0.0) / max(1, st.get('prestages', 0)) * 1e3:.3f}, gather+H2D "
               f"{st.get('pre_gather_s', 0.0) / max(1, st.get('prestages', 0)) * 1e3:.3f})", flush=True)
+    p = _PREFETCH
+    if p is not None and (not only_changed or getattr(p, "_stats_seen", None) != p.stats["tokens"]):
+        p._stats_seen = p.stats["tokens"]
+        _dump_prefetch_stats()
+
+
+def _dump_prefetch_stats() -> None:
+    if _PREFETCH is not None:
+        print(f"[sm120_engram] prefetch stats (pid {os.getpid()}) {dict(_PREFETCH.stats)} issued {_PREFETCH._issued} "
+              f"consumed {_PREFETCH._consumed} queued {len(_PREFETCH._q)}", flush=True)
 
 
 def _stats_loop(interval: float) -> None:
@@ -1041,6 +1113,337 @@ def _done(value) -> Future:
     f: Future = Future()
     f.set_result(value)
     return f
+
+
+# ------------------------------------------------------------------------------------------------ prefetch
+_PREFETCH = None  # EngramPrefetcher of this process (start_prefetcher), None when off
+_TRACE = os.environ.get("SM120_ENGRAM_TRACE", "0") not in ("0", "")  # per prefill-gather timing lines
+
+_FADVISE_SRC = r"""
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <pthread.h>
+#include <stdint.h>
+typedef struct { int fd; const int64_t *r; int64_t n; } job_t;
+static void *run(void *p) {
+  job_t *j = p;
+  for (int64_t i = 0; i < j->n; i++) posix_fadvise(j->fd, j->r[2 * i], j->r[2 * i + 1], POSIX_FADV_WILLNEED);
+  return 0;
+}
+/* ranges: int64 [n][2] (byte offset, length), sorted and coalesced; WILLNEED from `threads` threads */
+int64_t sm120_fadvise_ranges(int fd, const int64_t *ranges, int64_t n, int threads) {
+  pthread_t t[64]; job_t j[64];
+  if (threads < 1) threads = 1;
+  if (threads > 64) threads = 64;
+  int64_t k = (n + threads - 1) / threads;
+  int m = 0;
+  for (; m < threads && m * k < n; m++) {
+    j[m].fd = fd; j[m].r = ranges + 2 * m * k; j[m].n = (m + 1) * k <= n ? k : n - m * k;
+    if (pthread_create(&t[m], 0, run, &j[m])) { run(&j[m]); j[m].n = 0; }
+  }
+  for (int i = 0; i < m; i++) if (j[i].n) pthread_join(t[i], 0);
+  return n;
+}
+"""
+_FADVISE_LIB = None
+
+
+def _fadvise_lib():
+    """posix_fadvise(WILLNEED) over many page ranges without the GIL: a 30-line C helper built once with the system C
+    compiler into the cache directory (the serving image has gcc). None when no compiler: Python fallback."""
+    global _FADVISE_LIB
+    if _FADVISE_LIB is None:
+        _FADVISE_LIB = False
+        try:
+            import ctypes
+            import hashlib
+            import subprocess
+
+            base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+            d = os.path.join(base, "sm120_engram")
+            os.makedirs(d, exist_ok=True)
+            tag = hashlib.sha1(_FADVISE_SRC.encode()).hexdigest()[:12]
+            so = os.path.join(d, f"fadvise_{tag}.so")
+            if not os.path.exists(so):
+                src = os.path.join(d, f"fadvise_{tag}_{os.getpid()}.c")
+                with open(src, "w") as f:
+                    f.write(_FADVISE_SRC)
+                tmp = f"{so}.{os.getpid()}"
+                subprocess.run([os.environ.get("CC", "cc"), "-O2", "-shared", "-fPIC", "-pthread", src, "-o", tmp],
+                               check=True, capture_output=True, timeout=120)
+                os.replace(tmp, so)
+                os.unlink(src)
+            lib = ctypes.CDLL(so)
+            lib.sm120_fadvise_ranges.restype = ctypes.c_int64
+            lib.sm120_fadvise_ranges.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int64, ctypes.c_int]
+            _FADVISE_LIB = lib
+        except Exception as exc:  # noqa: BLE001
+            print(f"[sm120_engram] prefetch: no C helper ({exc!r}); falling back to Python posix_fadvise", flush=True)
+    return _FADVISE_LIB or None
+
+
+def page_ranges(offsets: np.ndarray, length: int, page: int = mmap.PAGESIZE) -> np.ndarray:
+    """Byte ranges [n, 2] (offset, length) covering `length` bytes at every offset: page aligned, sorted, deduplicated
+    and coalesced (adjacent pages become one range, one larger read)."""
+    if offsets.size == 0:
+        return np.zeros((0, 2), dtype=np.int64)
+    first = offsets // page
+    last = (offsets + length - 1) // page
+    pages = np.unique(np.concatenate([first, last]) if (last != first).any() else first)
+    brk = np.flatnonzero(np.diff(pages) != 1) + 1
+    starts = np.concatenate([[0], brk])
+    ends = np.concatenate([brk, [pages.size]])
+    return np.ascontiguousarray(np.stack([pages[starts] * page, (ends - starts) * page], 1).astype(np.int64))
+
+
+def ngram_windows(comp: np.ndarray, max_ngram_size: int, pad: int, sentinel: int = -1) -> np.ndarray:
+    """Vectorised DeepInfer `fill_engram_row` over a whole prompt: row p = [c(p), c(p-1), ...], PAD before the start and
+    from the first sentinel (image token) backwards. comp: int64 [n] compressed ids. -> int32 [n, max_ngram_size]."""
+    n = comp.shape[0]
+    out = np.empty((n, max_ngram_size), dtype=np.int32)
+    dead = np.zeros(n, dtype=bool)
+    for r in range(max_ngram_size):
+        src = np.full(n, pad, dtype=np.int64)
+        hit = np.zeros(n, dtype=bool)
+        if r < n:
+            src[r:] = comp[: n - r]
+            hit[r:] = comp[: n - r] == sentinel
+        dead |= hit
+        out[:, r] = np.where(dead, pad, src)
+    return out
+
+
+class EngramPrefetcher:
+    """Reads the Engram rows of a prompt into the page cache before the prefill needs them.
+
+    The rows are fully determined by the prompt's token ids: at admission (server submit / LLMEngine.add_request) the
+    prompt is hashed on the CPU exactly like DeepInfer (compressed ids -> n-gram windows -> engram_hash) and a
+    background thread reads the weight rows (sorted) through the mmap from SM120_ENGRAM_PREFETCH_THREADS threads
+    (SM120_ENGRAM_PREFETCH_METHOD=touch, default) or issues posix_fadvise(WILLNEED) for their pages, coalesced, from a
+    small C helper (=fadvise). Either way the NVMe reads happen while the GPU computes earlier chunks or other
+    requests, and the prefill's own gather hits the page cache. Nothing about the
+    data path changes (the gather still reads the same rows from the same file), so results are bit-identical; a
+    wrong or late prefetch only costs I/O. Bounded: at most SM120_ENGRAM_PREFETCH_AHEAD prompt tokens (default 32768,
+    ~6 GiB of page cache for both tables) are prefetched beyond what the prefills have consumed; FIFO over requests,
+    SM120_ENGRAM_PREFETCH_BLOCK tokens (default 4096, one prefill chunk) at a time; abort removes a queued request."""
+
+    def __init__(self, tables: Sequence[EngramHostTable], layer_slots: Sequence[int]) -> None:
+        self.tables = [t for t in tables]
+        self.slots = list(layer_slots)  # table i hashes with row layer_slots[i] of the hash tensors
+        self.ahead = int(_env("SM120_ENGRAM_PREFETCH_AHEAD", "32768"))
+        self.block = int(_env("SM120_ENGRAM_PREFETCH_BLOCK", "4096"))
+        self.io_threads = int(_env("SM120_ENGRAM_PREFETCH_THREADS", "16"))
+        # touch (default): read the rows through the mmap into a scratch buffer from io_threads threads, so the pages
+        # are mapped and referenced like the ones the gathers used; fadvise: posix_fadvise(WILLNEED), unmapped
+        # page-cache pages, which the kernel reclaims first under memory pressure, i.e. before they are used
+        self.method = _env("SM120_ENGRAM_PREFETCH_METHOD", "touch")
+        self._pool = ThreadPoolExecutor(max_workers=self.io_threads, thread_name_prefix="sm120-engram-pf")
+        self._scratch = None
+        self.hash = None  # (multipliers, vocab_sizes, offsets) CPU tensors, set_hash_metadata
+        self._fds = {}
+        self._q: list = []  # [request id, compressed ids, next position, pad, sentinel, admission seq or None]
+        self._ids: set = set()  # queued or done recently (server submit and LLMEngine.add_request both report a prompt)
+        self._recent: list = []
+        self._admit_seq = 0
+        self._cv = threading.Condition()
+        self._issued = 0  # prompt tokens prefetched
+        self._consumed = 0  # tokens the eager fetches have gathered since
+        self._stop = False
+        self.stats = {"requests": 0, "tokens": 0, "cancelled": 0, "ranges": 0, "pages": 0, "hash_s": 0.0,
+                      "io_s": 0.0, "throttled_s": 0.0}
+        self.thread = threading.Thread(target=self._run, name="sm120-engram-prefetch", daemon=True)
+        self.thread.start()
+
+    # ---- inputs
+    def set_hash_metadata(self, multipliers: torch.Tensor, vocab_sizes: torch.Tensor, offsets: torch.Tensor) -> None:
+        self.hash = (multipliers.detach().cpu(), vocab_sizes.detach().cpu(), offsets.detach().cpu())
+
+    def submit(self, request_id: str, token_ids, admitted: bool = False) -> bool:
+        """Queue a prompt (any thread). False when it cannot be prefetched (no hash metadata / tokenizer yet).
+
+        admitted=True: reported by LLMEngine.add_request (E7) in the scheduler's admission order. The server reports
+        prompts earlier, at submit, from several HTTP threads whose order can differ from the admission order; the
+        worker serves admitted requests in admission order first, so the rows it reads ahead are the next chunks
+        the (FIFO) scheduler prefills."""
+        if self.hash is None:
+            return False
+        with self._cv:
+            if request_id in self._ids:
+                if admitted:
+                    for e in self._q:
+                        if e[0] == request_id and e[5] is None:
+                            self._admit_seq += 1
+                            e[5] = self._admit_seq
+                            self._cv.notify_all()
+                return True
+        tok = sys.modules.get("deepinfer.model_executor.models.v4_modules.engram")
+        ct = getattr(tok, "CompressedTokenizer", None)
+        if ct is None or ct.lookup_table_np is None:
+            return False
+        ids = np.asarray(token_ids, dtype=np.int32).reshape(-1)
+        comp = np.asarray(ct.encode(ids), dtype=np.int64)
+        with self._cv:
+            if request_id in self._ids:
+                return True
+            self._ids.add(request_id)
+            seq = None
+            if admitted:
+                self._admit_seq += 1
+                seq = self._admit_seq
+            self._q.append([request_id, comp, 0, int(ct.compressed_pad_token), int(ct.IMAGE_SENTINEL), seq])
+            self.stats["requests"] += 1
+            self._cv.notify_all()
+        return True
+
+    def cancel(self, request_id: str) -> None:
+        with self._cv:
+            n = len(self._q)
+            self._q = [e for e in self._q if e[0] != request_id]
+            if len(self._q) != n:
+                self.stats["cancelled"] += 1
+
+    def consumed(self, n_tokens: int) -> None:
+        with self._cv:
+            self._consumed += int(n_tokens)
+            self._cv.notify_all()
+
+    def close(self) -> None:
+        with self._cv:
+            self._stop = True
+            self._cv.notify_all()
+        self.thread.join(timeout=5)
+        self._pool.shutdown(wait=False)
+
+    # ---- worker
+    def _fd(self, path: str) -> int:
+        fd = self._fds.get(path)
+        if fd is None:
+            fd = self._fds[path] = os.open(path, os.O_RDONLY)
+        return fd
+
+    def _next_block(self):
+        with self._cv:
+            while not self._stop:
+                if self._q and self._issued - self._consumed < self.ahead:
+                    adm = [e for e in self._q if e[5] is not None]
+                    e = min(adm, key=lambda x: x[5]) if adm else self._q[0]
+                    rid, comp, pos, pad, sentinel, _ = e
+                    n = min(self.block, comp.shape[0] - pos)
+                    e[2] = pos + n
+                    if e[2] >= comp.shape[0]:
+                        self._q.remove(e)
+                        self._recent.append(rid)
+                        if len(self._recent) > 4096:
+                            self._ids.discard(self._recent.pop(0))
+                    self._issued += n
+                    return comp, pos, n, pad, sentinel
+                t0 = time.perf_counter()
+                self._cv.wait(timeout=0.5)
+                if self._q:
+                    self.stats["throttled_s"] += time.perf_counter() - t0
+            return None
+
+    @torch.inference_mode()
+    def _run(self) -> None:
+        while True:
+            job = self._next_block()
+            if job is None:
+                return
+            comp, pos, n, pad, sentinel = job
+            try:
+                self._prefetch(comp, pos, n, pad, sentinel)
+            except Exception as exc:  # noqa: BLE001 - advisory only
+                print(f"[sm120_engram] prefetch failed: {exc!r}", flush=True)
+
+    def hash_rows(self, comp: np.ndarray, pos: int, n: int, pad: int, sentinel: int) -> torch.Tensor:
+        """Row ids of prompt positions [pos, pos+n): int32 [L, n, cols], -1 on image tokens (DeepInfer's values)."""
+        mult, vs, offs = self.hash
+        N = mult.shape[1]
+        lo = max(0, pos - (N - 1))  # the windows of [pos, pos+n) look back N-1 tokens
+        win = ngram_windows(comp[lo : pos + n], N, pad, sentinel)[pos - lo :]
+        img = torch.from_numpy(comp[pos : pos + n] == sentinel)
+        return engram_hash(torch.from_numpy(np.ascontiguousarray(win)), mult, vs, offs, img)
+
+    def _prefetch(self, comp: np.ndarray, pos: int, n: int, pad: int, sentinel: int) -> None:
+        t0 = time.perf_counter()
+        h = self.hash_rows(comp, pos, n, pad, sentinel)
+        self.stats["hash_s"] += time.perf_counter() - t0
+        lib = _fadvise_lib() if self.method == "fadvise" else None
+        for t, slot in zip(self.tables, self.slots):
+            rows = h[slot].reshape(-1).to(torch.int64).numpy()
+            rows = rows[(rows >= 0) & (rows < t.rows)]
+            if self.method != "fadvise" and t.weight is not None:
+                t1 = time.perf_counter()
+                k = rows.shape[0]
+                if self._scratch is None or self._scratch.shape[0] < k:
+                    self._scratch = torch.empty((k, t.row_bytes), dtype=torch.uint8)
+                t.gather_host(torch.from_numpy(np.sort(rows)), self._scratch[:k], None, pool=self._pool)
+                self.stats["io_s"] += time.perf_counter() - t1
+                self.stats["rows"] = self.stats.get("rows", 0) + k
+                continue
+            planes = [(t.source[0], t.row_bytes)]
+            if t.source[1] is not None and _env("SM120_ENGRAM_SCALES", "resident") != "resident":
+                planes.append((t.source[1], t.groups))
+            for loc, width in planes:
+                r = page_ranges(rows * width + loc.offset, width)
+                t1 = time.perf_counter()
+                fd = self._fd(os.path.realpath(loc.path))
+                if lib is not None:
+                    lib.sm120_fadvise_ranges(fd, r.ctypes.data, r.shape[0], self.io_threads)
+                else:
+                    for o, ln in r.tolist():
+                        os.posix_fadvise(fd, o, ln, os.POSIX_FADV_WILLNEED)
+                self.stats["io_s"] += time.perf_counter() - t1
+                self.stats["ranges"] += int(r.shape[0])
+                self.stats["pages"] += int(r[:, 1].sum() // mmap.PAGESIZE) if r.size else 0
+        self.stats["tokens"] += n
+        if _TRACE:
+            print(f"[sm120_engram] trace prefetch pos {pos} tokens {n} {1e3 * (time.perf_counter() - t0):.1f} ms | "
+                  f"issued {self._issued} consumed {self._consumed}", flush=True)
+
+
+def start_prefetcher(tables: Sequence[EngramHostTable], layer_slots: Sequence[int] | None = None):
+    """Create this process' prefetcher for checkpoint-backed host / uring tables (SM120_ENGRAM_PREFETCH=1, default)."""
+    global _PREFETCH
+    if _env("SM120_ENGRAM_PREFETCH", "1") in ("0", "false", "no"):
+        return None
+    use = [(t, i) for i, t in enumerate(tables) if t.kind in ("host", "uring") and t.source is not None]
+    if not use:
+        return None
+    if _PREFETCH is not None:
+        _PREFETCH.close()
+    slots = [i if layer_slots is None else layer_slots[i] for _, i in use]
+    _PREFETCH = EngramPrefetcher([t for t, _ in use], slots)
+    if _HASH_META:
+        _PREFETCH.set_hash_metadata(*_HASH_META)
+    if _PREFETCH.method == "fadvise":
+        _fadvise_lib()  # build the C helper now, not on the first request
+    return _PREFETCH
+
+
+def set_hash_metadata(multipliers, vocab_sizes, offsets) -> None:
+    _HASH_META[:] = [multipliers, vocab_sizes, offsets]
+    if _PREFETCH is not None:
+        _PREFETCH.set_hash_metadata(multipliers, vocab_sizes, offsets)
+
+
+_HASH_META: list = []
+
+
+def prefetch_prompt(request_id, token_ids, admitted: bool = False) -> bool:
+    """Queue a prompt's Engram rows for prefetching (no-op without a prefetcher). Any thread. admitted=True from
+    LLMEngine.add_request (admission order, see EngramPrefetcher.submit)."""
+    p = _PREFETCH
+    if p is None:
+        return False
+    if p.hash is None and _HASH_META:
+        p.set_hash_metadata(*_HASH_META)
+    return p.submit(str(request_id), token_ids, admitted=admitted)
+
+
+def prefetch_cancel(request_id) -> None:
+    if _PREFETCH is not None:
+        _PREFETCH.cancel(str(request_id))
 
 
 # ------------------------------------------------------------------------------------------------ hash metadata

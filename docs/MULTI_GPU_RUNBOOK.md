@@ -27,12 +27,12 @@ Build on the host (about 6 minutes with a warm network; the finished image is ab
 
 ```bash
 git clone <this repo> somora_deep_sm120 && cd somora_deep_sm120
-docker build -t somora_deep_sm120:0.2.0 -f docker/Dockerfile .
+docker build -t somora_deep_sm120:0.2.1 -f docker/Dockerfile .
 ```
 
 If the host has no access to the repository (e.g. no GitHub credentials for a private checkout), clone the tag on
 another machine and copy the tree over, or build elsewhere and transfer the image:
-`docker save somora_deep_sm120:0.2.0 | ssh <host> docker load`. The build itself only needs network access to
+`docker save somora_deep_sm120:0.2.1 | ssh <host> docker load`. The build itself only needs network access to
 PyPI, the PyTorch wheel index and GitHub (for the pinned DeepInfer commit).
 
 ## 2. Checkpoint and mounts
@@ -62,9 +62,17 @@ at start-up and again after the post-load step (`[sm120_engram] engram tables re
 | >= tables + 10 % (about 225 GB) | `host` + prefault: once all ranks have loaded their weights, rank 0 drops the weight shards' page-cache pages and reads both tables into the page cache | `-e SM120_ENGRAM_MODE=host -e SM120_ENGRAM_PREFAULT=1` |
 | below that (e.g. 246 GB total RAM: about 190 GB after start-up) | **`uring`** (O_DIRECT reads per lookup batch, no page-cache thrash, flat latency) | `-e SM120_ENGRAM_MODE=uring -e SM120_ENGRAM_THREADS=16 --security-opt seccomp=unconfined --ulimit memlock=-1` |
 
-`host` without prefault also works below the threshold (page cache as LRU, NVMe serves misses), but its latency
-depends on what else the cache holds; on the RTX 5090 test machine a 4k-token prefill with a cold cache costs
-0.4-0.7 s more than with the rows cached, `uring` the same as a cold `host` cache. `uring` needs io_uring, which
+`host` without prefault also works below the threshold (page cache as LRU, NVMe serves misses). Two defaults make
+the cold case cheap in both modes:
+- The scale planes are kept in the page cache (5.7 GiB for both tables, one copy per host). A cold lookup is then one
+  NVMe read instead of two.
+- Each rank reads a prompt's rows ahead from request admission on, overlapping the queue wait and the compute of
+  earlier chunks (ENGRAM.md §3.3). Budget about 6 GiB of page cache per rank for that (`SM120_ENGRAM_PREFETCH_AHEAD`,
+  32768 tokens).
+
+On the RTX 5090 test machine a cold 32k-token prompt now costs 0.36 s more than without engram (it was 2.9 s), and
+`uring` prefills the same way (its prefill batches read through the mmap). `uring` keeps the lower decode latency on a
+cold page cache. `uring` needs io_uring, which
 Docker's default seccomp profile blocks ("io_uring initialization failed: Operation not permitted"), and locked
 memory for its registered buffers ("Cannot allocate memory" without `--ulimit memlock=-1`).
 
@@ -104,7 +112,7 @@ All 4 rank processes map the same files, so the page cache holds one copy.
 ## 4. Validate the multi-GPU path first
 
 ```bash
-docker run --rm --gpus all --ipc=host --shm-size=32g --entrypoint bash somora_deep_sm120:0.2.0 -c '
+docker run --rm --gpus all --ipc=host --shm-size=32g --entrypoint bash somora_deep_sm120:0.2.1 -c '
   nvidia-smi topo -m
   torchrun --nproc_per_node 4 /opt/sm120/tests/bench_ep_comm.py --out /tmp/bench_ep_comm.json --moe
   python3 /opt/sm120/tests/test_ep_moe.py'
@@ -118,7 +126,7 @@ Then follow the remaining steps of [MULTI_GPU.md](MULTI_GPU.md) §6 (W=4 NCCL te
 docker run -d --name sm120-serve --gpus all --ipc=host --shm-size=32g --ulimit memlock=-1 -p 8100:8000 \
   -v /models/DeepSeek-V4.1-Flash:/models/ds41:ro -v /srv/sm120/cache:/cache -v /srv/work:/work \
   -e SM120_EP_IMPL=allgather -e SM120_EP_TRANSPORT=nccl -e SM120_ENGRAM_MODE=<per §3> \
-  somora_deep_sm120:0.2.0 --model /models/ds41 --served-model-name deepseek-v4.1-flash \
+  somora_deep_sm120:0.2.1 --model /models/ds41 --served-model-name deepseek-v4.1-flash \
     --dp 4 --gpu-memory-utilization 0.92 --max-model-len 40960 --max-num-seqs 16 --max-num-batched-tokens 4096 \
     --max-blocks 4096 --prefix-cache --no-graphs        # drop --no-graphs once eager works
 docker logs -f sm120-serve     # 4 ranks start (one engine process per GPU, NCCL EP group), then the dp proxy serves

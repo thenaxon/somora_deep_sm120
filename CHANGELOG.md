@@ -3,6 +3,36 @@
 All notable changes to this project are documented here. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0 any minor release may change interfaces.
 
+## [Unreleased]
+
+### Added
+- Tool calling in `/v1/chat/completions`: `tools`, `tool_choice` (`auto`, `none`, `required`, named function),
+  `parallel_tool_calls`, history with assistant `tool_calls` and `role: "tool"` messages, `message.tool_calls` with
+  `finish_reason: "tool_calls"`, and streaming `tool_calls` deltas. Rendering and parsing use the checkpoint's
+  `encoding/encoding.py` (DSML format) (`server/tools.py`).
+- `response_format`: `text`, `json_object`, `json_schema` (`strict` honoured).
+- Grammar-constrained decoding through DeepInfer's structured output (xgrammar EBNF in `SamplingParams.so_args`):
+  `tool_choice` `required` or a named function only admits valid calls whose arguments follow the JSON schema;
+  `response_format` output follows the schema. In thinking mode the grammar starts after `</think>`.
+- Tests: `tests/test_tools.py` (CPU), `tests/test_tools_server.py`, `tests/test_openai_sdk.py` (official `openai`
+  SDK incl. `chat.completions.parse` with pydantic), `tests/run_tools_tests.sh`.
+- `eval/quality_set.jsonl`: 8 tool-calling and 3 structured-output items; `eval/quality_check.py` scores them.
+
+### Changed
+- Thinking-mode streaming sends the reasoning as `delta.reasoning_content` (it was sent as `content`).
+- Requests submitted after an engine crash now fail at once instead of waiting for `--request-timeout`.
+
+### Fixed
+- `/v1/completions` rejected a one-token token-id prompt (`[id]`) as a malformed string list.
+- xgrammar 0.2.2 admits raw control characters in length-bounded JSON strings; the server patches that character class.
+- xgrammar 0.2.2 builds wrong digit patterns for some integer ranges (`minimum: 0, maximum: 120` admits 121-129); ranges
+  with up to 1024 values are passed to it as an explicit `enum`.
+
+### Known issues
+- With CUDA graphs (`--graphs`, the image default), a server with some request history can lose its engine on the first
+  prefill of a new size (illegal instruction / illegal memory access in the decode graph replay). This also happens without
+  tools. Eager mode is not affected. Details and a partial workaround: [docs/SERVER.md](docs/SERVER.md#tool-calling-and-structured-output).
+
 ## [0.1.0] - unreleased
 
 First release. Experimental.

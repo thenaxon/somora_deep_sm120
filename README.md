@@ -61,6 +61,10 @@ More in [docker/README.md](docker/README.md) and [docs/SERVER.md](docs/SERVER.md
   (asynchronously inside the CUDA graph) ([docs/ENGRAM.md](docs/ENGRAM.md)).
 - **OpenAI-compatible server**: `/v1/completions` and `/v1/chat/completions` with SSE streaming, cancellation,
   seeded sampling and logprobs ([docs/SERVER.md](docs/SERVER.md)).
+- **Tool calling and structured output**: OpenAI `tools` / `tool_choice` / `parallel_tool_calls` (streaming included)
+  in the model's own DSML format, and `response_format` `json_object` / `json_schema`. `tool_choice` `required`, a named
+  function and `response_format` are grammar-constrained through DeepInfer's xgrammar structured output; tested with the
+  official `openai` SDK ([docs/SERVER.md](docs/SERVER.md#tool-calling-and-structured-output)).
 - **Exact prefix caching**: a cache hit gives the same result as a miss, bit for bit, with the deterministic MoE
   ([docs/PREFIX_CACHE.md](docs/PREFIX_CACHE.md)).
 - **Multi-GPU expert parallelism for PCIe**: DP attention + EP MoE over NCCL instead of DeepEP, with a DP proxy in front

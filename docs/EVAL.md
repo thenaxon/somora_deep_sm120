@@ -8,7 +8,7 @@ All tools in `eval/` are stdlib-only clients of any OpenAI-compatible endpoint: 
 |---|---|
 | `eval/compare_endpoints.py` | greedy A/B on identical token ids: exact match, first divergence, position-wise agreement, chosen-token logprob deltas, top-K overlap and deltas, near-tie classification of the divergence. Record/replay (`--save-a`, `--a file:PATH`) for endpoints that cannot run at the same time |
 | `eval/loadgen.py` | closed-loop load at concurrency 1/4/16/64 × prompt 512/4k/32k, 256 output tokens: TTFT, TPOT, E2E p50/p99, output and total tok/s; random token-id prompts (no prefix-cache help) |
-| `eval/quality_check.py` + `eval/quality_set.jsonl` | 14 prompts with known answers: math (5), Python code with asserts (3, `--exec-code` runs them in a separate `python3 -I` process with a timeout), German (4), a fact, and an 8k-token passkey needle |
+| `eval/quality_check.py` + `eval/quality_set.jsonl` | 25 prompts with known answers: math (5), Python code with asserts (3, `--exec-code` runs them in a separate `python3 -I` process with a timeout), German (4), a fact, an 8k-token passkey needle, tool calling (8) and structured output (3), see below |
 
 ## Requirements on the endpoint
 
@@ -17,6 +17,31 @@ All tools in `eval/` are stdlib-only clients of any OpenAI-compatible endpoint: 
   non-streaming, and not with `--nextn > 0`).
 - **Logprob semantics.** vLLM reports raw-logit logprobs. DeepInfer's own sampler only has *processed* logprobs (after temperature
   and top-p/k, which is degenerate for greedy), so `server.py` computes log_softmax of the raw logits in `server/logprob_tap.py`.
+
+## Tool calling and structured-output items
+
+The items with a `"request"` field send extra request fields (`tools`, `tool_choice`, `response_format`) and are scored on
+the structured result, greedy like the rest:
+
+| id | request | passes when |
+|---|---|---|
+| `tool-pick-weather`, `tool-pick-stock` | 3 tools (weather, stock price, e-mail), `tool_choice` auto | exactly one call of the right tool with the right arguments (`city` Vienna/Wien + `unit` celsius; `ticker` NVDA) |
+| `tool-args-email` | same tools | `send_email` with the address, subject and body extracted from the prompt |
+| `tool-parallel` | same tools | two `get_weather` calls, one for Vienna and one for Berlin (any order) |
+| `tool-not-needed` | same tools, an arithmetic question | no tool call, answer 42 |
+| `tool-result-turn` | history: the weather call + its `role: "tool"` result | no new call; the answer uses the result (21 °C, sunny) |
+| `tool-enum-required` | thermostat tool with an enum and an integer range, `tool_choice: "required"` | `set_thermostat(mode="heat", temperature=23)` (integer, not a string) |
+| `tool-de-named` | German prompt, named `tool_choice` | `get_weather` with `city` Graz |
+| `json-extract-nested` | `json_schema` (strict, nested address object) | valid JSON, valid against the schema, extracted fields correct (age 34, zip 1010, city Wien/Vienna, ...) |
+| `json-enum-sentiment` | `json_schema` with enums | valid against the schema, `sentiment` = negative |
+| `json-object` | `json_object` | valid JSON, `primes` = [2, 3, 5, 7, 11] |
+
+Expectation keys (`quality_check.py --help`): `tool_calls` (each expected call must match a distinct returned call: name and
+argument specs, strings case-insensitive, `{"regex": ...}`, `{"len": n}`), `exact_count`, `no_tool_calls`, `json` with `schema`
+(checked against the request's `json_schema`) and `fields` (dotted paths).
+
+For the vLLM baseline, tool calls need the server started with `--enable-auto-tool-choice` and a tool-call parser for the model;
+without them the tool items fail on the baseline for that reason only. `response_format` works on vLLM without extra flags.
 
 ## Verified results (RTX 5090, 3-layer test checkpoint `ckpt3`, two server instances one after the other)
 
@@ -49,4 +74,5 @@ These runs check the harness, not model quality: the 3-layer truncated model pro
   magnitude ([RUNTIME.md](RUNTIME.md)).
 
 **quality_check.py** scored 0/14 against `ckpt3`, as expected for a 3-layer model. Retrieval, code-block detection and the 2k-token
-needle prompt all ran through. Meaningful quality numbers need the full checkpoint on multi-GPU hardware.
+needle prompt all ran through. Meaningful quality numbers need the full checkpoint on multi-GPU hardware. The tool and JSON items
+(added in 0.2.0) were run against `ckpt3` to check the scoring paths: 1/25 overall. Every tool and JSON item was sent and scored. The constrained ones (`tool-enum-required`, `tool-de-named`, the JSON items) came back structurally valid but with wrong values, which is what the 3-layer model should produce.

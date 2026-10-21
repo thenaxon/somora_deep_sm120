@@ -5,6 +5,10 @@ before 1.0 any minor release may change interfaces.
 
 ## [Unreleased]
 
+### Added
+- Start-up banner: somora lettering with "deep sm120", version, checkpoint, DP size and port
+  (`server/banner.py`, `SM120_BANNER=0` disables it).
+
 ### Changed
 - Multi-GPU runbook: Hugging Face hub caches must be mounted at their root (snapshot files are symlinks into
   `blobs/`); realistic image size (about 7 GB); building when the host cannot reach the repository; host-RAM

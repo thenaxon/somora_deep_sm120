@@ -439,6 +439,11 @@ def main() -> int:
     ap.add_argument("--log-level", default="INFO")
     args = ap.parse_args()
     logging.basicConfig(level=args.log_level, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    if args.dp_rank is None:  # once per server, not in the per-GPU children of --dp
+        import banner
+
+        banner.print_banner(f"v{banner.version()}  ·  {os.path.basename(os.path.normpath(args.ckpt))}"
+                            f"  ·  dp {args.dp}  ·  :{args.port}")
     if args.dp_rank is None and (args.dp > 1 or args.force_proxy):
         import dp_proxy
 

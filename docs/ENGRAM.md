@@ -415,10 +415,32 @@ original shard directory must be visible at the same absolute path wherever the 
 4. DeepInfer's `skip_load` (dummy weights) path still allocates the full tables (`torch.zeros`); not patched.
 5. E2 assumes table and scale live in safetensors shards under the HF dir (or `SM120_ENGRAM_CKPT`) and resolve through
    DeepInfer's `resolve_hf_name`.
-6. Prefetch, test machine (62 GB RAM): in a series of 4 x 32k-token prompt batches, every second batch is about 5 s
-   slower (31 s instead of 26 s; without engram 25 s). The gathers of its 2nd and 3rd prompt miss the page cache even
-   though their rows were read ahead. This is most likely reclaim once the page cache is full. Unmapping the consumed
-   weight pages (`MADV_DONTNEED`) made it worse: the gathers stalled behind the zap. The prefetcher does not see which
-   chunk the scheduler runs next: it assumes FIFO prefill in admission order (DeepInfer's behaviour in these tests).
+6. **Prefetch under page-cache pressure** (test machine, 62 GB RAM).
+   - **Cold, clean cache** (only the table pages dropped, the rest of the page cache mostly free): 4 x 32k wall
+     26.1 s (no engram 25.1 s).
+   - **Full cache** (other weight shards read first, `free` about 0; this matches the 0.2.1 release retest, which
+     measured 30.5 s `host` / 30.0 s `uring`): 26-29 s, with the second 4 x 32k batch of a series 3-5 s slower.
+     Every read then allocates through reclaim, and the prefill gathers' misses wait behind the prefetch reads on the
+     same NVMe. 30-35 % of the 4096-token gathers take 100-600 ms instead of 17-35 ms.
+   - **The throttle is not the cause.** `SM120_ENGRAM_PREFETCH_AHEAD` 8192 and 32768 give the same wall time (28.5 vs
+     28.9 s). `throttled_s` only counts the time the prefetcher waits because it is far enough ahead.
+   - **Things that did not help, so they are not in the code:**
+     - unmapping the consumed weight pages (`MADV_DONTNEED`): the gathers stalled behind the 150-500 ms zap;
+     - keeping the prefetched rows in private memory (rows only, 256 B each, so eviction cannot touch them): 95 %
+       staged hits, but 15.9 s gather time against 10.8 s for `touch`, because the per-gather lookup costs 30-50 ms of
+       CPU and the remaining misses still wait behind the prefetch reads;
+     - `fadvise` readahead: 21 s against 16 s.
+   - The prefetcher does not see which chunk the scheduler runs next. It assumes FIFO prefill in admission order,
+     which is DeepInfer's behaviour in these tests.
+   - **4-GPU host** (4 ranks, about 230 GB RAM, one NVMe):
+     - Random prompts are the worst case. A 32k prompt reads about 1.6 s worth of rows at the device's random-read
+       limit (about 0.8 M reads/s), against about 6.3 s of prefill compute. Four ranks prefilling 32k prompts at the
+       same time therefore need about 6.4 s of NVMe per 6.3 s of compute: the shared NVMe, not the throttle, becomes
+       the limit at full prefill load.
+     - What helps there is a page cache that holds most of the tables. With about 190 GB available after start-up,
+       about 90 % of the 189 GiB fits. It fills by use: the start-up prefault is skipped below tables + 10 %, see
+       MULTI_GPU_RUNBOOK.md §3. The Zipf-like reuse of real text helps on top.
+     - With the tables fully in RAM (pinned, one copy for all ranks, `SM120_ENGRAM_PIN`, MULTI_GPU_RUNBOOK.md §3)
+       the shared NVMe stops mattering.
 7. Prefetch cannot help a lone request's first chunk, whose gather starts right after admission. For that chunk only the
    resident scales help.

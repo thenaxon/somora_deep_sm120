@@ -7,6 +7,7 @@ All tools in `eval/` are stdlib-only clients of any OpenAI-compatible endpoint: 
 | tool | what |
 |---|---|
 | `eval/compare_endpoints.py` | greedy A/B on identical token ids: exact match, first divergence, position-wise agreement, chosen-token logprob deltas, top-K overlap and deltas, near-tie classification of the divergence. Record/replay (`--save-a`, `--a file:PATH`) for endpoints that cannot run at the same time |
+| `compare_endpoints.py --teacher-forced` | numerical fidelity: both endpoints (and optionally DeepSeek's reference implementation) score the same continuation; top-1 agreement and KL per position; see [Numerical fidelity](#numerical-fidelity) |
 | `eval/loadgen.py` | closed-loop load at concurrency 1/4/16/64 × prompt 512/4k/32k, 256 output tokens: TTFT, TPOT, E2E p50/p99, output and total tok/s; random token-id prompts (no prefix-cache help) |
 | `eval/quality_check.py` + `eval/quality_set.jsonl` | 28 prompts with known answers: math (5), Python code with asserts (3, `--exec-code` runs them in a separate `python3 -I` process with a timeout), German (4), a fact, an 8k-token passkey needle, tool calling (8), structured output (3) and images (3), see below. Items with `known_fail` (currently `math-reason`, which the model gets wrong without thinking mode) are reported as KFAIL/KPASS and not counted. Scores are reported per category |
 
@@ -52,6 +53,82 @@ argument specs, strings case-insensitive, `{"regex": ...}`, `{"len": n}`), `exac
 
 For the vLLM baseline, tool calls need the server started with `--enable-auto-tool-choice` and a tool-call parser for the model;
 without them the tool items fail on the baseline for that reason only. `response_format` works on vLLM without extra flags.
+
+## Numerical fidelity
+
+`compare_endpoints.py` without options compares two endpoints' greedy outputs; they diverge at the first near-tie, and
+everything after that is incomparable. `--teacher-forced` scores a fixed continuation instead: for every position j of
+the continuation each endpoint gets prompt + continuation[:j] and returns its top-K logprobs for the next token
+(`max_tokens 1`). Requests run `--parallel` at a time and benefit from prefix caching.
+
+- The continuation is the greedy output of `--cont-from a|b|ref` (default: the reference if given, else A), or a prompt
+  item's own `"continuation"` text (e.g. human-written; then the per-endpoint NLL is a small perplexity test).
+- `tools/ref/ref_to_fidelity.py` converts dumps of DeepSeek's reference implementation (`tools/ref/ref_runner.py`) into
+  such a file. Positions 0-4 have exact reference distributions; later ones are normalised over the dump's top-50.
+- Per pair (A-B, ref-A, ref-B): **top-1 agreement** (same argmax), **KL(P‖Q)** on the union of both top-K sets (a
+  missing token gets that side's K-th logprob, both renormalised over the union; an estimate, comparable between runs
+  with the same K), and the logprob delta of the forced token.
+- `--reference` is a file (reference dump, or any recording) or a live endpoint URL; with it the summary states which of
+  A and B is closer to it (lower KL mean, higher top-1 agreement).
+- `--save-a/--save-b` record the scored positions; `--a/--b file:PATH` replay them, for endpoints that cannot run at the
+  same time.
+
+```bash
+python3 eval/compare_endpoints.py --tokenizer-dir /models/V4.1 --teacher-forced --max-tokens 256 --top-logprobs 20 \
+    --prompts prompts.jsonl --a http://host:8000 --save-a di_tf.json            # DeepInfer, then stop it
+python3 eval/compare_endpoints.py --tokenizer-dir /models/V4.1 --teacher-forced --max-tokens 256 --top-logprobs 20 \
+    --prompts prompts.jsonl --a file:di_tf.json --b http://host:8001 --json tf_di_vllm.json   # vLLM baseline
+```
+
+Both endpoints must return raw-logit logprobs (vLLM's default; this server's `logprobs`, not available with
+`--nextn > 0`). Run the fidelity check with speculative decoding off on both sides.
+
+### KV-cache precision of the implementations
+
+| implementation | sliding-window KV | compressed KV (C4 / C128) | indexer keys |
+|---|---|---|---|
+| DeepSeek reference (`inference/model.py`) | FP8 e4m3, per-32 scales | FP4 (e2m1, per-16 scales) | FP4 |
+| DeepInfer / this repo | FP8 e4m3 (528 B records) | FP4 (288 B records) | MXFP4 (68 B) |
+| vLLM with `--kv-cache-dtype fp8` | FP8 | FP8 by that flag (check the vLLM version's V4 KV layout) | per vLLM's V4 kernels |
+
+DeepInfer stores the KV in the same formats as the reference implementation (that is DeepSeek's design, see
+[ATTENTION.md](ATTENTION.md)). A vLLM deployment with an FP8 KV cache presumably keeps the compressed tokens in FP8,
+not in the model's FP4 (verify for the deployed version). A greedy A/B difference between the two is therefore expected even if both are implemented
+correctly, and "higher precision" is not the same as "closer to the reference".
+
+### Who is right? (full model)
+
+A divergence at token 1 without a near-tie and a chosen-token logprob delta of ~0.1 nats in the greedy mode can come
+from one early difference that every later token inherits. To find out:
+
+1. **Teacher-forced A-B in both directions** (`--cont-from a`, then `--cont-from b`, 8+ prompts × 256 tokens). The KL
+   per position and the top-1 agreement on a shared continuation show the real per-step distance, without compounding.
+2. **A third, independent reference.** The DeepSeek reference implementation does not fit the full model on four 96 GB
+   GPUs (476 GB), so: (a) the same truncated checkpoint served by both engines and run by `tools/ref/ref_runner.py`
+   (`ref_to_fidelity.py` → `--reference`), which measures each engine's numerical error per layer stack; and/or (b) a
+   third endpoint with a different numeric path (e.g. vLLM with the model's native KV format, or this server with
+   `--deterministic`) as `--reference URL`.
+3. **Human-written continuations** (prompt items with `"continuation"`): the per-endpoint NLL on real text is the
+   practical "who models the text better" number. On the full model a clearly lower NLL settles the question;
+   differences below ~0.01 nats/token are numerics noise.
+4. The quality set (`quality_check.py`) stays the end-to-end check: equal scores mean the differences do not matter
+   for answers.
+
+### Verified on the RTX 5090 (plumbing, 3-layer `ckpt3`)
+
+A = this server with `--deterministic` (torch MoE, eager), B = default (b12x MoE, CUDA graphs), reference = DeepSeek's
+reference implementation on the same checkpoint (`ref_runner.py` dump, 17 continuation positions), top-20, 64 tokens:
+
+| continuation | pair | positions | top-1 agreement | KL mean | KL p99 (worst prompt) |
+|---|---|---|---|---|---|
+| reference greedy | ref-A / ref-B / A-B | 17 | 0.941 / 1.000 / 0.941 | 0.031 / 0.025 / 0.026 | 0.077 / 0.069 / 0.048 |
+| A greedy, 8 prompts | A-B | 512 | 0.910 | 0.048 | 0.397 |
+| B greedy, 8 prompts | A-B | 512 | 0.897 | 0.049 | 0.295 |
+| 4 human-written texts | A-B | 98 | 0.587 | 0.143 | 0.422 |
+
+On this chaotic 3-layer model the two MoE paths are about as far from each other as each is from the reference, and
+the verdict tool reports B marginally closer. The per-endpoint NLL of human text is 5.25 (A) vs 5.24 (B); the 3-layer
+model does not model text at all, so only the full model makes those numbers meaningful.
 
 ## Verified results (RTX 5090, 3-layer test checkpoint `ckpt3`, two server instances one after the other)
 

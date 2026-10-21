@@ -3,6 +3,22 @@
 All notable changes to this project are documented here. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0 any minor release may change interfaces.
 
+## [Unreleased]
+
+### Fixed
+- `chat_template_kwargs` in chat requests was ignored. `{"thinking": true}` (and `enable_thinking`), `reasoning_effort`
+  and `drop_thinking` are now honoured; top-level `thinking` / `reasoning_effort` win. Non-boolean `thinking` values
+  are rejected with 400 instead of being coerced.
+
+### Added
+- `eval/compare_endpoints.py --teacher-forced`: both endpoints (and an optional third reference: a file or an
+  endpoint) score the same continuation position by position: top-1 agreement, KL per position, forced-token
+  logprob delta, NLL per endpoint, and which endpoint is closer to the reference. Continuations from either endpoint,
+  the reference, or human-written text. `tools/ref/ref_to_fidelity.py` turns reference-implementation dumps into
+  reference files.
+- docs/EVAL.md: KV-cache precision of the reference, DeepInfer and an FP8-KV vLLM deployment, and how to tell which
+  engine is numerically right on the full model.
+
 ## [0.2.0] - 2026-10-21
 
 ### Added

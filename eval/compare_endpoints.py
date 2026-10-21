@@ -17,12 +17,30 @@ Per prompt:
 - before the divergence: |logprob_A - logprob_B| of the chosen token, top-K set overlap, |delta| on shared top-K tokens;
 - at the divergence: both sides' top-1/top-2 margin. A divergence at a near-tie (margin < --tie, default 0.1 nats) is
   expected numerics, not a bug.
+
+--teacher-forced (numerical fidelity over long continuations; implied by --reference): free-running greedy outputs
+stop being comparable at the first divergence. Here every endpoint scores the SAME continuation instead: the greedy
+output of --cont-from (a, b or ref; default ref if given, else a), or a prompt item's own "continuation" text. Each
+position j is scored with a 1-token request on prompt + continuation[:j], asking for the top-K logprobs (prefix caches
+make that cheap; --parallel requests in flight). --reference is a third source both endpoints are measured against:
+a file (DeepSeek's reference implementation via tools/ref/ref_to_fidelity.py, or a --save-a/--save-b recording) or
+an endpoint URL; the summary then says which of A and B is closer to it. Per pair (A-B, ref-A, ref-B) and prompt:
+- top-1 agreement (same argmax at a position);
+- KL(P||Q) on the union of both top-K sets (a token missing on one side gets that side's K-th logprob; both sides
+  renormalised over the union);
+- |delta logprob| of the forced continuation token;
+and per endpoint the mean NLL of the forced continuation.
+Files: --save-a / --save-b write the scored positions in the reference format; --a / --b file:PATH replay them, so
+endpoints that cannot run at the same time (same GPUs) are compared later. Reference format (JSON):
+  {"model": str, "top_k": int, "runs": [{"ids": [prompt ids], "cont": [token ids], "top": [{token_id: logprob}, ...]}]}
 """
 
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import http.client
+import math
 import importlib.util
 import json
 import os
@@ -177,9 +195,18 @@ def main() -> int:
     ap.add_argument("--tie", type=float, default=0.1, help="top1-top2 logprob margin below which a divergence is a near-tie")
     ap.add_argument("--timeout", type=float, default=1800)
     ap.add_argument("--json")
+    ap.add_argument("--teacher-forced", action="store_true", help="score a fixed continuation position by position")
+    ap.add_argument("--reference", help="teacher-forced: a third source both endpoints are measured against: a reference "
+                    "file (tools/ref/ref_to_fidelity.py, or a --save-a/--save-b recording) or an endpoint URL")
+    ap.add_argument("--cont-from", choices=("a", "b", "ref"), default=None,
+                    help="teacher-forced: whose greedy output is the continuation (default: ref if given, else a); "
+                         "prompt items with a \"continuation\" text use that instead")
+    ap.add_argument("--parallel", type=int, default=8, help="teacher-forced: requests in flight per endpoint")
     args = ap.parse_args()
 
     render, tok = load_codec(args.tokenizer_dir)
+    if args.teacher_forced or args.reference:
+        return teacher_forced(args, render, tok)
     items = [json.loads(l) for l in open(args.prompts) if l.strip()] if args.prompts else DEFAULT_PROMPTS
     def make(spec, model):
         return Recorded(spec[5:]) if spec.startswith("file:") else Endpoint(spec, model, args.timeout)
@@ -235,6 +262,168 @@ def main() -> int:
                   open(args.json, "w"), indent=1)
     return 0
 
+
+# ------------------------------------------------------------------------------------------------ teacher-forced fidelity
+def load_fidelity(path: str) -> dict:
+    d = json.load(open(path))
+    for r in d["runs"]:
+        r["top"] = [{int(k): v for k, v in t.items()} for t in r["top"]]
+    return d
+
+
+def score_positions(ep, ids, cont, k, parallel):
+    """Top-K logprobs of every continuation position j given prompt + cont[:j] (1-token requests)."""
+    def one(j):
+        toks, _, tops = parse(ep.complete(list(ids) + list(cont[:j]), 1, k))
+        return tops[0] if tops else {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as pool:
+        return list(pool.map(one, range(len(cont))))
+
+
+def _f4(x):
+    return "-" if x is None else f"{x:.4f}"
+
+
+def forced_nll(tops, cont):
+    """Mean -log p of the forced tokens (a token outside the top-K counts with the K-th logprob, an upper bound)."""
+    vals = [-(t.get(c, min(t.values()))) for t, c in zip(tops, cont) if t]
+    return statistics.fmean(vals) if vals else None
+
+
+def kl_topk(p: dict, q: dict):
+    """KL(P||Q) on the union of both top-K sets: a token missing on one side gets that side's K-th logprob (an upper
+    bound of its true value), then both are renormalised over the union. Always >= 0."""
+    if not p or not q:
+        return None
+    toks = set(p) | set(q)
+    fp, fq = min(p.values()), min(q.values())
+    lp = {t: p.get(t, fp) for t in toks}
+    lq = {t: q.get(t, fq) for t in toks}
+    zp = math.log(sum(math.exp(v) for v in lp.values()))
+    zq = math.log(sum(math.exp(v) for v in lq.values()))
+    return max(0.0, sum(math.exp(lp[t] - zp) * ((lp[t] - zp) - (lq[t] - zq)) for t in toks))
+
+
+def fidelity_pair(name, P, Q, cont):
+    n = min(len(P), len(Q))
+    top1 = [max(P[j], key=P[j].get) == max(Q[j], key=Q[j].get) for j in range(n) if P[j] and Q[j]]
+    kls = [x for x in (kl_topk(P[j], Q[j]) for j in range(n)) if x is not None]
+    dlp = [abs(P[j][cont[j]] - Q[j][cont[j]]) for j in range(n) if cont[j] in P[j] and cont[j] in Q[j]]
+    srt = sorted(kls)
+    return dict(pair=name, positions=n, top1_agreement=statistics.fmean(top1) if top1 else None,
+                kl_mean=statistics.fmean(kls) if kls else None, kl_p99=srt[int(0.99 * (len(srt) - 1))] if srt else None,
+                kl_max=srt[-1] if srt else None, forced_lp_delta_mean=statistics.fmean(dlp) if dlp else None)
+
+
+def teacher_forced(args, render, tok) -> int:
+    """Score fixed continuations on A, B and an optional reference (see the module docstring)."""
+    def source(spec, model):
+        if spec is None:
+            return None
+        return ("file", load_fidelity(spec[5:] if spec.startswith("file:") else spec)) \
+            if spec.startswith("file:") or not spec.startswith(("http://", "https://")) \
+            else ("live", Endpoint(spec, model, args.timeout))
+
+    A, B, R = source(args.a, args.model_a), source(args.b, args.model_b), source(args.reference, None)
+    if args.prompts:
+        items = [json.loads(l) for l in open(args.prompts) if l.strip()]
+    elif R and R[0] == "file":
+        items = [{"ids": r["ids"]} for r in R[1]["runs"]]
+    else:
+        items = DEFAULT_PROMPTS
+    cont_from = args.cont_from or ("ref" if R else "a")
+    srcs = {"a": A, "b": B, "ref": R}
+    if srcs.get(cont_from) is None:
+        raise SystemExit(f"--cont-from {cont_from}: that source is not given")
+
+    def file_run(src, ids, cont=None):
+        run = next((x for x in src[1]["runs"] if x["ids"] == list(ids)
+                    and (cont is None or x["cont"][:len(cont)] == list(cont))), None)
+        return run
+
+    rows, rec = [], {"a": [], "b": [], "ref": []}
+    for i, it in enumerate(items):
+        ids = render(it)
+        if it.get("continuation"):  # a fixed (e.g. human-written) continuation
+            cont = tok.encode(it["continuation"], add_special_tokens=False).ids[:args.max_tokens]
+        else:
+            src = srcs[cont_from]
+            if src[0] == "file":
+                run = file_run(src, ids)
+                if run is None:
+                    raise SystemExit(f"prompt {i}: no run in {cont_from} file")
+                cont = run["cont"][:args.max_tokens]
+            else:
+                cont = parse(src[1].complete(ids, args.max_tokens, 1))[0]
+        tops = {}
+        for key, src in srcs.items():
+            if src is None:
+                continue
+            if src[0] == "file":
+                run = file_run(src, ids, cont)
+                if run is None or len(run["top"]) < len(cont):
+                    raise SystemExit(f"prompt {i}: {key} file has no run with this prompt and continuation")
+                tops[key] = run["top"][:len(cont)]
+            else:
+                tops[key] = score_positions(src[1], ids, cont, args.top_logprobs, args.parallel)
+            rec[key].append(dict(ids=list(ids), cont=list(cont), top=tops[key]))
+        row = dict(prompt=i, prompt_tokens=len(ids), positions=len(cont), cont_from=cont_from, pairs=[],
+                   nll={k: forced_nll(t, cont) for k, t in tops.items()})
+        if "a" in tops and "b" in tops:
+            row["pairs"].append(fidelity_pair("A-B", tops["a"], tops["b"], cont))
+        if "ref" in tops:
+            for key in ("a", "b"):
+                if key in tops:
+                    row["pairs"].append(fidelity_pair(f"ref-{key.upper()}", tops["ref"], tops[key], cont))
+        rows.append(row)
+        print(f"[{i}] {len(ids):5d} prompt tok, {len(cont)} positions | " + " | ".join(
+            f"{p['pair']}: top1 {p['top1_agreement']:.3f} KL mean {p['kl_mean']:.4f} p99 {p['kl_p99']:.4f}"
+            for p in row["pairs"] if p["top1_agreement"] is not None) + " | NLL " + " ".join(
+            f"{k} {v:.3f}" for k, v in row["nll"].items() if v is not None), flush=True)
+    for key, path in (("a", args.save_a), ("b", args.save_b)):
+        src = srcs[key]
+        if path and src is not None and rec[key]:
+            json.dump(dict(model=src[1].model if src[0] == "live" else src[1].get("model"), top_k=args.top_logprobs,
+                           runs=[dict(ids=x["ids"], cont=x["cont"], top=[{str(t): v for t, v in d.items()} for d in x["top"]])
+                                 for x in rec[key]]), open(path, "w"))
+            print(f"recorded {key.upper()} -> {path}")
+    summary = []
+    for name in sorted({p["pair"] for r in rows for p in r["pairs"]}):
+        ps = [p for r in rows for p in r["pairs"] if p["pair"] == name and p["top1_agreement"] is not None]
+        if ps:
+            summary.append(dict(pair=name, prompts=len(ps), positions=sum(p["positions"] for p in ps),
+                                top1_agreement=statistics.fmean(p["top1_agreement"] for p in ps),
+                                kl_mean=statistics.fmean(p["kl_mean"] for p in ps), kl_p99_max=max(p["kl_p99"] for p in ps),
+                                forced_lp_delta_mean=(statistics.fmean(d) if (d := [p["forced_lp_delta_mean"] for p in ps
+                                                      if p["forced_lp_delta_mean"] is not None]) else None)))
+    nll = {k: statistics.fmean([r["nll"][k] for r in rows if r["nll"].get(k) is not None] or [float("nan")])
+           for k in ("a", "b", "ref") if any(k in r["nll"] for r in rows)}
+    md = [f"Continuation from: {cont_from}" + (" (prompts' own continuations where given)" if args.prompts else ""), "",
+          "| pair | prompts | positions | top-1 agreement | KL mean | KL p99 (worst prompt) | forced-token lp delta |",
+          "|---|---|---|---|---|---|---|"]
+    md += [f"| {s['pair']} | {s['prompts']} | {s['positions']} | {s['top1_agreement']:.4f} | {s['kl_mean']:.5f} | "
+           f"{s['kl_p99_max']:.4f} | {_f4(s['forced_lp_delta_mean'])} |" for s in summary]
+    md += ["", "Mean NLL of the forced continuation (nats/token, lower = the endpoint finds it more likely): " +
+           ", ".join(f"{k.upper()} {v:.4f}" for k, v in nll.items())]
+    verdict = None
+    by = {s["pair"]: s for s in summary}
+    if "ref-A" in by and "ref-B" in by:
+        a_, b_ = by["ref-A"], by["ref-B"]
+        closer = "A" if a_["kl_mean"] < b_["kl_mean"] else "B"
+        top1_closer = "A" if a_["top1_agreement"] > b_["top1_agreement"] else \
+            "B" if b_["top1_agreement"] > a_["top1_agreement"] else closer
+        if top1_closer != closer:
+            closer = f"inconclusive (KL favours {closer}, top-1 agreement favours {top1_closer})"
+        verdict = dict(closer_to_reference=closer, kl_ref_a=a_["kl_mean"], kl_ref_b=b_["kl_mean"],
+                       top1_ref_a=a_["top1_agreement"], top1_ref_b=b_["top1_agreement"])
+        md += ["", f"**Closer to the reference: {closer}** (KL mean ref-A {a_['kl_mean']:.5f} vs ref-B {b_['kl_mean']:.5f}; "
+               f"top-1 agreement {a_['top1_agreement']:.4f} vs {b_['top1_agreement']:.4f})"]
+    print("\n" + "\n".join(md))
+    if args.json:
+        json.dump(dict(a=args.a, b=args.b, reference=args.reference, args=vars(args), summary=summary, nll=nll,
+                       verdict=verdict, rows=rows), open(args.json, "w"), indent=1)
+        open(os.path.splitext(args.json)[0] + ".md", "w").write("\n".join(md) + "\n")
+    return 0
 
 if __name__ == "__main__":
     sys.exit(main())

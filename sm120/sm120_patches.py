@@ -17,10 +17,12 @@ Every patch is listed and justified in patches/PATCHES.md.
                                      patches/b12x-tiny-decode-swiglu.patch (clamp fix), else still off.
     SM120_REMAP_SMEM_BYTES=<int>     shared-memory budget of the patched sampler.remap_draft_topk kernel (P8)
     SM120_CACHE_ROOT=/cache          persistent cache root: B12X_COMPILE_CACHE_DIR, TRITON_CACHE_DIR defaults
+    SM120_RETAIN_GRAPH_PROGRAMS=1|0  keep the b12x programs launched by graph warm-up/capture loaded (P9, default 1)
 """
 
 from __future__ import annotations
 
+import contextlib
 import importlib
 import importlib.abc
 import importlib.util
@@ -410,6 +412,31 @@ def _patch_remap_reexport(mod):
         mod.remap_draft_topk_tl = fn
 
 
+_RETAINED_B12X: list = []
+
+
+@contextlib.contextmanager
+def _retain_b12x_programs():
+    """Keep every b12x program launched by the warm-up + capture loaded for the life of the process.
+
+    Every later lazy b12x preparation (a prefill / indexer shape first seen while serving) ends with
+    evict_unretained(), which drops each program that is neither in that session's plans nor retained,
+    and the collected CuTe executable unloads its CUDA library. A captured graph that launches such a
+    program then fails on replay with "illegal instruction". b12x's retain_compiled_programs() records
+    the programs launched inside it; the record only counts while the object is alive, so it is kept."""
+    if os.environ.get("SM120_RETAIN_GRAPH_PROGRAMS", "1") == "0":
+        yield
+        return
+    try:
+        from b12x._lib.compile_plan import retain_compiled_programs
+    except Exception:  # noqa: BLE001 - no b12x / no such API: nothing to retain
+        yield
+        return
+    with retain_compiled_programs() as retained:
+        _RETAINED_B12X.append(retained)
+        yield
+
+
 def _wrap_graph_capture(cls, label: str) -> None:
     orig = cls.capture
     if getattr(orig, "_sm120", False):
@@ -428,7 +455,8 @@ def _wrap_graph_capture(cls, label: str) -> None:
         t0 = time.time()
         print(f"[sm120_patches] {label} capture start: sizes={sizes} moe={m0} gemm={g0}", flush=True)
         try:
-            return orig(self, *args, **kwargs)
+            with _retain_b12x_programs():
+                return orig(self, *args, **kwargs)
         except Exception as exc:
             print(f"[sm120_patches] {label} capture FAILED ({type(exc).__name__}: {exc}). Every shim op inside "
                   "the forward must be capturable: b12x MoE/linears are (plans are warmed by DeepInfer's "

@@ -3,7 +3,16 @@
 All notable changes to this project are documented here. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0 any minor release may change interfaces.
 
-## [0.1.0] - unreleased
+## [Unreleased]
+
+### Changed
+- Multi-GPU runbook: Hugging Face hub caches must be mounted at their root (snapshot files are symlinks into
+  `blobs/`); realistic image size (about 7 GB); building when the host cannot reach the repository; host-RAM
+  budgeting for the engram modes (per-rank memory, page cache vs. pinned memory, baseline stopped).
+- `eval/quality_check.py`: items can be marked `known_fail` (reported as KFAIL/KPASS, not counted). `math-reason`
+  is marked: the model answers 2 without thinking mode, independent of the engine.
+
+## [0.1.0] - 2026-10-21
 
 First release. Experimental.
 

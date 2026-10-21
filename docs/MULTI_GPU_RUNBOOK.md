@@ -15,7 +15,7 @@ maintenance window, stop the baseline container (do not remove it or its image),
 ```bash
 nvidia-smi                       # driver >= 595 (CUDA 13.2) for the cu132 image
 nvidia-smi topo -m               # PCIe P2P paths
-free -g; nproc; df -h            # host RAM decides the engram mode (§3); ~25 GB disk for the image
+free -g; nproc; df -h            # host RAM decides the engram mode (§3); ~10 GB disk for the image + build cache
 ```
 
 If a baseline container is running, `docker inspect <baseline> --format '{{json .Mounts}} {{json .HostConfig.PortBindings}}'`
@@ -23,14 +23,17 @@ shows its checkpoint path and port.
 
 ## 1. Image
 
-Build on the host (pulls about 20 GB of CUDA and torch layers):
+Build on the host (about 6 minutes with a warm network; the finished image is about 7 GB):
 
 ```bash
 git clone <this repo> somora_deep_sm120 && cd somora_deep_sm120
 docker build -t somora_deep_sm120:0.1.0 -f docker/Dockerfile .
 ```
 
-or build elsewhere and transfer it: `docker save somora_deep_sm120:0.1.0 | ssh <host> docker load`.
+If the host has no access to the repository (e.g. no GitHub credentials for a private checkout), clone the tag on
+another machine and copy the tree over, or build elsewhere and transfer the image:
+`docker save somora_deep_sm120:0.1.0 | ssh <host> docker load`. The build itself only needs network access to
+PyPI, the PyTorch wheel index and GitHub (for the pinned DeepInfer commit).
 
 ## 2. Checkpoint and mounts
 
@@ -38,6 +41,12 @@ or build elsewhere and transfer it: `docker save somora_deep_sm120:0.1.0 | ssh <
   engram tables 00047/00048 at 203 GB). If a baseline already uses it, mount the same host path.
 - `-v /models/DeepSeek-V4.1-Flash:/models/ds41:ro`, `-v /srv/sm120/cache:/cache` (JIT, autotune and TileLang caches;
   the first start compiles a lot), `-v /srv/work:/work` (eval outputs).
+- **Hugging Face hub cache:** if the checkpoint lives in an HF hub cache (`.../hub/models--.../snapshots/<rev>/`), the
+  files in the snapshot dir are symlinks into `.../hub/models--.../blobs/`. Mounting only the snapshot dir leaves
+  dangling links (`No such file or directory` for `tokenizer.json` or the shards). Mount the whole cache root
+  read-only **at the same path** and pass the snapshot path to `--model`, e.g.
+  `-v /data/hf-cache:/data/hf-cache:ro ... --model /data/hf-cache/hub/models--<org>--<name>/snapshots/<rev>`.
+  The same applies to `--tokenizer-dir` of the eval tools.
 - No conversion step: DeepInfer loads the HF shards directly, and the engram tables are mmapped, not loaded.
 
 ## 3. Engram mode (by free host RAM; see [ENGRAM.md](ENGRAM.md) §7)
@@ -49,6 +58,13 @@ or build elsewhere and transfer it: `docker save somora_deep_sm120:0.1.0 | ssh <
 | < 203 GB | `host` (page cache as LRU, NVMe serves misses) or `uring` (O_DIRECT, no cache pollution; needs io_uring allowed by seccomp) | `-e SM120_ENGRAM_MODE=host` (default) or `=uring`, plus `-e SM120_ENGRAM_THREADS=16` |
 
 All 4 rank processes map the same files, so the page cache holds one copy.
+
+- Count free RAM **with the baseline stopped**: a running baseline may pin its own copy of the engram tables.
+- The 4 rank processes also need host memory of their own (CUDA contexts, pinned staging buffers, the loader).
+  Budget roughly 5-10 GB per rank and check `free -g` after start-up.
+- Prefaulted pages are ordinary page cache, not locked memory: under memory pressure the kernel evicts them and
+  misses are read from NVMe again (slower, but no OOM). This also holds without swap. `uva` instead page-locks the
+  whole 203 GB and needs that much RAM on top of everything else.
 
 ## 4. Validate the multi-GPU path first
 

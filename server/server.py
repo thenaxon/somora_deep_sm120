@@ -172,6 +172,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._generate(body, chat=False)
             if self.path == "/v1/chat/completions":
                 return self._generate(body, chat=True)
+            if self.path == "/internal/engram_cache_policy" and self.app.args.dp_rank is not None:
+                # --dp rank (listens on 127.0.0.1 only): sent by the dp proxy once all ranks are up
+                return self._json(200, {"result": _engram_cache_policy(self.app.args.ckpt)})
             self._error(404, f"no route {self.path}")
         except BadRequest as exc:
             self._error(400, str(exc))
@@ -441,6 +444,7 @@ Handler._logprobs_obj = _logprobs_obj
 
 class App:
     def __init__(self, args):
+        self.args = args
         self.model_name = args.model_name or os.path.basename(os.path.normpath(args.ckpt))
         self.created = int(time.time())
         self.request_timeout = args.request_timeout
@@ -455,12 +459,32 @@ class App:
                                  nextn=args.nextn, graphs=args.graphs, zos=args.zos,
                                  prefill_interval=args.prefill_interval, deterministic=args.deterministic,
                                  dp_size=args.dp, dp_rank=args.dp_rank or 0, ep_size=args.ep,
-                                 prefix_cache=dict(grain=args.prefix_cache_grain, max_entries=args.prefix_cache_entries,
+                                 prefix_cache=dict(grain=args.prefix_cache_grain, checkpoint_stride=args.prefix_cache_checkpoint_stride,
+                                                   max_entries=args.prefix_cache_entries,
                                                    max_block_frac=args.prefix_cache_max_block_frac)
                                  if args.prefix_cache else None)
 
 
 _MAIN_PID = os.getpid()
+
+
+_CACHE_POLICY: dict = {}
+
+
+def _engram_cache_policy(ckpt: str) -> dict | None:
+    """sm120_engram.post_load_cache_policy once per process (host work only: page-cache advice, prefault reads,
+    residency), before the server accepts requests: a prefault running while serving starves the prefill's own
+    engram reads. None if it already ran or Engram is not loaded."""
+    eng = sys.modules.get("sm120_engram")
+    if eng is None or not getattr(eng, "_TABLES", None) or _CACHE_POLICY:
+        return None
+    _CACHE_POLICY["started"] = time.time()
+    try:
+        _CACHE_POLICY.update(eng.post_load_cache_policy(ckpt))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("engram page-cache policy failed: %r", exc)
+        _CACHE_POLICY["error"] = repr(exc)
+    return dict(_CACHE_POLICY)
 
 
 def _sigterm(signum, frame):
@@ -497,7 +521,12 @@ def main() -> int:
                     help="reuse computed prompt prefixes (prefix_cache; needs the patched _C: "
                          "PYTHONPATH=/opt/sm120/sm120:/work/deepinfer_pc DEEPINFER_ROOT=/work/deepinfer_pc)")
     ap.add_argument("--prefix-cache-grain", type=int, default=512,
-                    help="snapshot every N prompt tokens (multiple of 128) plus at every prompt end")
+                    help="snapshot granularity: prefixes are recorded at chunk ends that are multiples of N (multiple "
+                         "of 128), plus at every prompt end")
+    ap.add_argument("--prefix-cache-checkpoint-stride", type=int, default=0,
+                    help="split prefills at multiples of N for snapshots (rounded up to the grain). 0 (default): "
+                         "max(grain, --max-num-batched-tokens), i.e. no extra engine steps; a smaller stride gives "
+                         "finer prefix hits but costs one prefill step per checkpoint")
     ap.add_argument("--prefix-cache-entries", type=int, default=64, help="max cached prefix snapshots (state slots)")
     ap.add_argument("--prefix-cache-max-block-frac", type=float, default=0.5,
                     help="max fraction of KV blocks the cache may keep pinned")
@@ -525,6 +554,8 @@ def main() -> int:
 
         banner.print_banner(f"v{banner.version()}  ·  {os.path.basename(os.path.normpath(args.ckpt))}"
                             f"  ·  dp {args.dp}  ·  :{args.port}")
+    # Engram prefault (SM120_ENGRAM_PREFAULT=1) only after every rank has loaded its weights: see _engram_cache_policy
+    os.environ.setdefault("SM120_ENGRAM_PREFAULT_AT", "ready")
     if args.dp_rank is None and (args.dp > 1 or args.force_proxy):
         import dp_proxy
 
@@ -542,6 +573,8 @@ def main() -> int:
         return dp_proxy.run(rest, args.dp, args.host, args.port)
     app = App(args)
     app.engine.start()
+    if args.dp_rank is None:  # single process: weights are loaded now; with --dp the proxy calls it on rank 0
+        _engram_cache_policy(args.ckpt)
     Handler.app = app
     ThreadingHTTPServer.request_queue_size = 1024  # listen backlog (socketserver default 5)
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)

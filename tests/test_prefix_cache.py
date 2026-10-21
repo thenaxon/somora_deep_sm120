@@ -71,7 +71,8 @@ def main() -> int:
                      lookahead_tokens=min(1, args.nextn), disable_log_stats=True)
     eng = llm.llm_engine
     spe = None if args.snapshot_prompt_end == "auto" else args.snapshot_prompt_end == "1"
-    pc = prefix_cache.install(eng, grain=args.grain, max_entries=64, nextn=args.nextn, snapshot_prompt_end=spe)
+    pc = prefix_cache.install(eng, grain=args.grain, checkpoint_stride=args.grain, max_entries=64, nextn=args.nextn,
+                              snapshot_prompt_end=spe)
     rng = np.random.default_rng(7)
     P = rng.integers(1000, 100000, size=8192).tolist()
 

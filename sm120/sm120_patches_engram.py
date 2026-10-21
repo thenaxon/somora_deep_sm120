@@ -173,6 +173,27 @@ def _patch_runtime(mod):
             e.release_storage()
         desc = ", ".join(f"{t.name}:{t.kind}:{t.rows}rows" for t in tables)
         _note(f"E3 EngramRuntime.initialize: attached {desc}")
+        if os.environ.get("SM120_ENGRAM_RESIDENCY", "1") != "0":
+            _log_residency(sm120_engram, tables)
+
+    def _log_residency(sm120_engram, tables) -> None:
+        """How much of the host-mode tables the page cache holds: rows that are not resident are random NVMe reads in
+        every prefill (about 0.5 s per 4k-token prompt on the RTX 5090 test machine with a cold cache)."""
+        host = [t for t in tables if t.kind == "host" and getattr(t, "_uring", None) is None and t.source is not None]
+        if not host:
+            return
+        res = [t.resident() for t in host]
+        if any(r is None for r in res):
+            return
+        size = sum(t.nbytes for t in host)
+        avail = sm120_engram._mem_available()
+        msg = (f"engram tables resident in the page cache: {sum(res) / 2**30:.1f} / {size / 2**30:.1f} GiB "
+               f"({100 * sum(res) / max(size, 1):.0f} %); MemAvailable "
+               f"{'?' if avail is None else f'{avail / 2**30:.1f} GiB'}")
+        if sum(res) < 0.9 * size:
+            msg += (" - lookups of non-resident rows read from disk in every prefill (SM120_ENGRAM_PREFAULT=1 if RAM "
+                    "holds the tables, else SM120_ENGRAM_MODE=uring; docs/ENGRAM.md)")
+        print(f"[sm120_engram] {msg}", flush=True)
 
     initialize._sm120_engram = True
     NgramEmbedding.__init__ = __init__

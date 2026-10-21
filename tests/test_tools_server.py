@@ -341,7 +341,8 @@ def run(cl, args) -> None:
             st, r = cl.post("/v1/chat/completions", hist_body)
         pc1 = cl.get("/health")[1].get("prefix_cache") or {}
         check("prefix cache: repeated tools prompt hits", st == 200 and pc1.get("hits", 0) > pc0.get("hits", 0),
-              f"hits {pc0.get('hits')} -> {pc1.get('hits')}, hit_tokens {pc1.get('hit_tokens')}")
+              f"hits {pc0.get('hits')} -> {pc1.get('hits')}, hit_tokens {pc1.get('hit_tokens')}" + ("" if pc1.get("hits", 0) > pc0.get("hits", 0) else f" (server checkpoint stride {pc1.get('checkpoint_stride')}: "
+                                                              "in-prompt hits need --prefix-cache-checkpoint-stride <= 512)"))
         ok = 0
         for _ in range(2):
             st, r = cl.post("/v1/chat/completions", dict(hist_body, tool_choice="required", max_tokens=args.max_tokens))

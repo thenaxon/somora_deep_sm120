@@ -1,4 +1,4 @@
-"""DP-wide decode graph-size max-sync (sm120_ep.dp_sync) with 2 gloo processes on ONE GPU.
+"""DP-wide max-sync of the decode graph size and of the prefill row count (sm120_ep.dp_sync), 2 gloo processes on ONE GPU.
 
     PYTHONPATH=/opt/sm120/sm120:/opt/deepinfer python3 /opt/sm120/tests/test_ep_dp_sync.py
 
@@ -6,8 +6,10 @@ Each process patches DeepInfer's real CudaGraphRunner.select plus a minimal work
 follows DeepInfer's order: select() for the ZOS correction, select() again in input preparation (padding the
 batch with dummy tokens up to the graph size), then one EP MoE layer (sm120_ep.EPRoutedExperts over b12x local
 experts, gloo transport) on graph-size rows with is_prompt=False. Ranks get different batch sizes, including
-placeholder steps. Checks: both ranks pick the same graph size every step (= select(max of local sizes)),
-both selects inside a step agree, and the EP output of the real rows matches a full-expert run.
+placeholder steps. Prefill steps (real or placeholder, one dummy token) run the EP layer PREFILL_LAYERS times
+with is_prompt=True. Checks: both ranks pick the same graph size every decode step (= select(max of local
+sizes)), both selects inside a step agree, every prefill layer pads to the step's DP-max token count without a
+per-layer count exchange, one all-reduce per step, and the EP output of the real rows matches a full-expert run.
 """
 
 from __future__ import annotations
@@ -24,12 +26,20 @@ sys.path.insert(0, HERE)
 os.environ.setdefault("B12X_AUTOTUNE", "0")
 os.environ.setdefault("B12X_W4A8_TINY_DECODE", "0")
 
-STEPS = {0: [1, 5, None, 3, 8, 16], 1: [7, 2, 4, None, 8, 1]}  # None = placeholder step
+# (kind, n): kind "d" decode with n tokens, "p" prefill with seqlen_q list n; n None = placeholder step
+STEPS = {0: [("d", 1), ("d", 5), ("d", None), ("p", [300, 20]), ("d", 3), ("p", None), ("d", 8), ("d", 16)],
+         1: [("d", 7), ("d", 2), ("d", 4), ("p", None), ("d", None), ("p", [50]), ("d", 8), ("d", 1)]}
+PREFILL_LAYERS = 3
 
 
 class _SchedOut:
     def __init__(self, n):
         self.num_batched_tokens = n
+
+
+class _Seq:
+    def __init__(self, n):
+        self.seqlen_q = n
 
 
 def _worker(rank: int, world: int, init_file: str, q):
@@ -57,13 +67,33 @@ def _worker(rank: int, world: int, init_file: str, q):
         nl = T.E // world
         local = sm120_moe.B12xRoutedExperts(T.make_moe(wts, range(rank * nl, (rank + 1) * nl), dev))
         full = sm120_moe.B12xRoutedExperts(T.make_moe(wts, range(0, T.E), dev))
+        tr = GlooTransport(group)
+        seen = {"rows": [], "counts": 0}
+        ag, agc = tr.all_gather, tr.all_gather_counts
+
+        def all_gather(out, inp):
+            seen["rows"].append(inp.shape[0])
+            return ag(out, inp)
+
+        def all_gather_counts(n, device):
+            seen["counts"] += 1
+            return agc(n, device)
+
+        tr.all_gather, tr.all_gather_counts = all_gather, all_gather_counts
         ep = EPRoutedExperts(local, group=None, num_local_experts=nl, ep_rank=rank, hidden=T.K, topk=T.TOPK,
-                             decode_rows=10 ** 6, transport=GlooTransport(group))  # fixed capacity would be huge
+                             decode_rows=10 ** 6, transport=tr)  # fixed capacity would be huge
 
         class Worker:
             model_runner = Runner()
 
             def execute_model_step(self, is_prompt, is_placeholder, seq_metadata_list=None, scheduler_outputs=None):
+                if is_prompt:
+                    n = 1 if is_placeholder else sum(sq.seqlen_q for sq in seq_metadata_list)
+                    x, ids, w = T.make_tokens(n, 91 * rank + n, dev)
+                    ref = full(x, ids, w)
+                    seen["rows"].clear()
+                    cs = [T.cos(ep(x, ids, w, is_prompt=True), ref) for _ in range(PREFILL_LAYERS)]
+                    return None, None, min(cs), tuple(seen["rows"])
                 n = 1 if is_placeholder else scheduler_outputs.num_batched_tokens  # placeholder = 1 dummy token
                 g_zos = None if is_placeholder else self.model_runner.cuda_graph_runner.select(n)[0]
                 g, _ = self.model_runner.cuda_graph_runner.select(n)
@@ -78,12 +108,15 @@ def _worker(rank: int, world: int, init_file: str, q):
         dp_sync._STATE["active"] = True
         wk = Worker()
         res = []
-        for n in STEPS[rank]:
+        for kind, n in STEPS[rank]:
+            prompt = kind == "p"
             if n is None:
-                res.append((None,) + wk.execute_model_step(False, True, None, None))
+                res.append((None,) + wk.execute_model_step(prompt, True, None, None))
+            elif prompt:
+                res.append((n,) + wk.execute_model_step(True, False, [_Seq(m) for m in n], _SchedOut(sum(n))))
             else:
                 res.append((n,) + wk.execute_model_step(False, False, None, _SchedOut(n)))
-        q.put((rank, "ok", res, runner.batch_sizes, dp_sync._STATE["n_sync"]))
+        q.put((rank, "ok", res, runner.batch_sizes, (dp_sync._STATE["n_sync"], seen["counts"])))
         dist.barrier()
     except Exception:  # noqa: BLE001
         import traceback
@@ -111,16 +144,28 @@ def main():
     if not ok:
         sys.exit(1)
     bs = results[0][2]
+    def tokens(r, i):
+        n = STEPS[r][i][1]
+        return 1 if n is None else (sum(n) if isinstance(n, list) else n)
+
     for i in range(len(STEPS[0])):
-        need = max(1 if STEPS[r][i] is None else STEPS[r][i] for r in range(world))
-        want = bs[bisect_left(bs, need)]
+        need = max(tokens(r, i) for r in range(world))
         row = [results[r][1][i] for r in range(world)]
-        line = "  ".join(f"rank{r}: local={n} graph={g} zos_graph={gz} ep_rows={rows} cos={c:.6f}"
-                         for r, (n, g, gz, c, rows) in enumerate(row))
-        good = all(g == want and rows == want and (gz is None or gz == g) and c > 0.9999 for _n, g, gz, c, rows in row)
-        print(f"step {i}: expected graph {want}: {line}  {'OK' if good else 'MISMATCH'}")
+        if STEPS[0][i][0] == "p":
+            line = "  ".join(f"rank{r}: local={tokens(r, i)} ep_rows/layer={rows} cos={c:.6f}"
+                             for r, (_n, _g, _gz, c, rows) in enumerate(row))
+            good = all(rows == (need,) * PREFILL_LAYERS and c > 0.9999 for _n, _g, _gz, c, rows in row)
+            print(f"step {i} (prefill, {PREFILL_LAYERS} layers): expected rows {need}: {line}  {'OK' if good else 'MISMATCH'}")
+        else:
+            want = bs[bisect_left(bs, need)]
+            line = "  ".join(f"rank{r}: local={n} graph={g} zos_graph={gz} ep_rows={rows} cos={c:.6f}"
+                             for r, (n, g, gz, c, rows) in enumerate(row))
+            good = all(g == want and rows == want and (gz is None or gz == g) and c > 0.9999 for _n, g, gz, c, rows in row)
+            print(f"step {i}: expected graph {want}: {line}  {'OK' if good else 'MISMATCH'}")
         ok &= good
-    print(f"gloo all-reduces per rank: {results[0][3]} (one per decode step)")
+    n_sync, n_counts = results[0][3]
+    print(f"all-reduces per rank: {n_sync} (one per step, {len(STEPS[0])} steps); per-layer count exchanges: {n_counts}")
+    ok &= n_sync == len(STEPS[0]) and n_counts == 0
     print("ALL OK" if ok else "FAILED")
     sys.exit(0 if ok else 1)
 

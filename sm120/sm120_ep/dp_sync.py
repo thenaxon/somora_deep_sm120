@@ -18,6 +18,12 @@ Mechanism (one gloo all-reduce MAX per decode step on DeepInfer's cpu_data_paral
 Capture is unaffected (all ranks capture the same batch-size list in the same order); replay picks the synced
 size. The extra cost is one localhost gloo all-reduce of an int (~tens of us) per decode step (+1 with MTP).
 
+Prefill steps (eager) are synced the same way: the step's token count (sum of seqlen_q, 1 for a placeholder
+step, whose forward runs DeepInfer's one-token placeholder sequence) is all-gathered once per step, and every
+EP layer of the step pads to the maximum and skips the other ranks' padding rows (EPRoutedExperts, moe.py)
+instead of exchanging its row count per layer (40 host syncs per step, each draining the GPU and waiting for
+the slowest rank).
+
 install() is called by sm120_ep.wrap() when the EP group has > 1 rank (SM120_EP_DP_SYNC=0 disables it; the
 EP layer then falls back to the fixed decode capacity).
 """
@@ -29,7 +35,8 @@ import os
 import torch
 import torch.distributed as dist
 
-_STATE = {"active": False, "synced": None, "group": None, "n_sync": 0}
+_STATE = {"active": False, "synced": None, "prefill_rows": None, "prefill_counts": None, "group": None,
+          "n_sync": 0}
 
 
 def enabled_by_env() -> bool:
@@ -47,6 +54,15 @@ def dp_max(value: int, group) -> int:
     return int(t.item())
 
 
+def dp_counts(value: int, group) -> list[int]:
+    """All ranks' values (one gloo all-gather of an int)."""
+    world = dist.get_world_size(group)
+    parts = [torch.zeros((1,), dtype=torch.int64) for _ in range(world)]
+    dist.all_gather(parts, torch.tensor([int(value)], dtype=torch.int64), group=group)
+    _STATE["n_sync"] += 1
+    return [int(p.item()) for p in parts]
+
+
 def patch_worker(cls, group) -> None:
     orig = cls.execute_model_step
     if getattr(orig, "_sm120_dp_sync", False):
@@ -54,13 +70,16 @@ def patch_worker(cls, group) -> None:
 
     def execute_model_step(self, is_prompt, is_placeholder, seq_metadata_list=None, scheduler_outputs=None):
         mr = getattr(self, "model_runner", None)
-        if not is_prompt and getattr(mr, "use_cuda_graph", False):
+        _STATE["synced"] = _STATE["prefill_rows"] = _STATE["prefill_counts"] = None
+        if is_prompt:
+            local = 1 if is_placeholder or not seq_metadata_list else sum(int(s.seqlen_q) for s in seq_metadata_list)
+            counts = dp_counts(local, group)
+            _STATE["prefill_counts"], _STATE["prefill_rows"] = counts, max(counts)
+        elif getattr(mr, "use_cuda_graph", False):
             local = 0
             if not is_placeholder and scheduler_outputs is not None:
                 local = int(scheduler_outputs.num_batched_tokens)
             _STATE["synced"] = dp_max(local, group)
-        else:
-            _STATE["synced"] = None
         return orig(self, is_prompt, is_placeholder, seq_metadata_list, scheduler_outputs)
 
     execute_model_step._sm120_dp_sync = True

@@ -9,6 +9,11 @@ SM120_ROOT=${SM120_ROOT:-/opt/sm120}; SDK_PY=${SDK_PY:-python3}
 set -u
 CKPT=$1; PORT=$2; LOG=$3; shift 3
 SARGS=(); while [ $# -gt 0 ] && [ "$1" != "--" ]; do SARGS+=("$1"); shift; done; [ $# -gt 0 ] && shift
+# the in-prompt prefix-cache checks repeat a ~550 / 1500-token prompt: they need checkpoints inside it (the server
+# default stride is --max-num-batched-tokens, docs/PREFIX_CACHE.md)
+if [[ " ${SARGS[*]} " == *" --prefix-cache "* && " ${SARGS[*]} " != *" --prefix-cache-checkpoint-stride"* ]]; then
+    SARGS+=(--prefix-cache-checkpoint-stride ${PREFIX_CACHE_TEST_STRIDE:-512})
+fi
 RC=0
 echo "== unit tests (CPU)"
 python3 $SM120_ROOT/tests/test_tools.py --encoding "$CKPT/encoding/encoding.py" || RC=1

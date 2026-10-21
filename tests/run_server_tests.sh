@@ -7,6 +7,11 @@ SM120_ROOT=${SM120_ROOT:-/opt/sm120}; WORK=${WORK:-/work}; HF_CKPT=${HF_CKPT:-/c
 set -u
 CKPT=$1; PORT=$2; LOG=$3; shift 3
 SARGS=(); while [ $# -gt 0 ] && [ "$1" != "--" ]; do SARGS+=("$1"); shift; done; [ $# -gt 0 ] && shift
+# the in-prompt prefix-cache checks repeat a ~550 / 1500-token prompt: they need checkpoints inside it (the server
+# default stride is --max-num-batched-tokens, docs/PREFIX_CACHE.md)
+if [[ " ${SARGS[*]} " == *" --prefix-cache "* && " ${SARGS[*]} " != *" --prefix-cache-checkpoint-stride"* ]]; then
+    SARGS+=(--prefix-cache-checkpoint-stride ${PREFIX_CACHE_TEST_STRIDE:-512})
+fi
 # own process group (engine + multimodal workers): stopped as a whole at the end, see stop_server
 setsid python3 $SM120_ROOT/server/server.py --ckpt "$CKPT" --port "$PORT" "${SARGS[@]}" > "$LOG" 2>&1 &
 SPID=$!

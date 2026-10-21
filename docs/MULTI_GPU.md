@@ -39,10 +39,10 @@ Implementation: `sm120/sm120_ep/` (`moe.py`: `EPRoutedExperts`, `wrap(moe)`; `tr
 | **Expert sharding at load** | DeepInfer's own: `hugging_face/weights.py:_local_expert_ids` loads only this rank's physical experts, and `DeepseekMoE.num_local_physical_experts = physical // ep_size`. `sm120_moe` builds the b12x layer over exactly those weights. The gate emits global physical ids (EPLB `logical_to_physical_map`), so the local id is `id - ep_rank*n_local` when in range, else -1. EPLB redundant slots work unchanged. |
 | **Where the hook sits** | At the MoE layer, not in DeepEP: `sm120_moe.setup` sets `moe.sm120_routed = sm120_ep.wrap(moe)` (a no-op for EP=1 or `SM120_EP_IMPL=off`), and `sm120_moe.forward` passes `is_prompt=input_metadata.is_prompt`. DeepEP `dispatch`/`combine` are never called. The `deep_ep.EPBuffer` shim is an inert object for `world_size > 1` under `SM120_EP_IMPL=allgather`. |
 | **Step type across DP ranks** | Already uniform: DeepInfer's C++ scheduler (`csrc/engine/scheduler.hpp`) votes over the DP group on whether all ranks prefill or decode. Idle ranks run a placeholder step, so every rank enters every MoE layer in lockstep. |
-| **Different token counts per rank** | Collectives need equal row counts. **Prefill** (eager): per-rank counts are all-gathered first (one host sync per layer) and every rank pads to the maximum with masked rows. **Decode** (CUDA graphs): see the DP sync below; without it, a fixed capacity of `SM120_EP_DECODE_ROWS` (default: the layer's `max_num_decoding_tokens`) rows per rank, padding rows masked, no host sync. |
+| **Different token counts per rank** | Collectives need equal row counts. **Prefill** (eager): the step's per-rank token counts are all-gathered once per step by the DP sync (below; without it once per layer, a host sync each), every rank pads to the maximum, and the local experts run only on the ranks' real rows (padding rows are dropped before the expert call and scattered back as zeros). **Decode** (CUDA graphs): see the DP sync below; without it, a fixed capacity of `SM120_EP_DECODE_ROWS` (default: the layer's `max_num_decoding_tokens`) rows per rank, padding rows masked, no host sync. |
 | **DP-wide decode graph-size sync** (`dp_sync.py`, default on) | `Worker.execute_model_step` is wrapped: at the top of every decode step (real or placeholder) the local decode token count is all-reduced with MAX on DeepInfer's CPU DP group (one gloo all-reduce of an int, tens of us). `CudaGraphRunner.select(total_q)` then selects for the synced size, so every rank replays the same graph and the EP rows are simply that graph size. `DFlashCudaGraphRunner.select` (MTP draft graph) is synced the same way. `SM120_EP_DP_SYNC=0` falls back to the fixed capacity. |
 | **CUDA graphs** | NCCL collectives are capturable, and DeepInfer captures the same batch-size list in the same order on every rank. The decode path allocates only from the graph pool. |
-| **Transport** | `SM120_EP_TRANSPORT=nccl` (default): `all_gather_into_tensor` / `reduce_scatter_tensor` on DeepInfer's EP group (already NCCL). `gloo`: CPU staging, eager only, for single-GPU multi-process tests. |
+| **Transport** | `SM120_EP_TRANSPORT=nccl` (default): `all_gather_into_tensor` / `reduce_scatter_tensor` on DeepInfer's EP group (already NCCL). `b12x`: eager prefill collectives through b12x `PCIeTwoShotBF16` (CUDA-IPC peer writes, independent of NCCL's P2P decision), NCCL for decode graphs and everything else; see §4a. `gloo`: CPU staging, eager only, for single-GPU multi-process tests. |
 | **Serving** | `server/server.py --dp N [--ep M]` spawns N engine processes (engine_rank r, `data_parallel_size` N, `expert_parallel_size` M, default N), one GPU each, behind `server/dp_proxy.py`, which routes each request to the least-loaded rank. See [SERVER.md](SERVER.md). |
 
 ## 3. Tests on one GPU
@@ -78,19 +78,52 @@ These are estimates, not measurements.
   `PCIeTwoShotBF16` (`reduce_scatter` / `all_gather` / `all_reduce`, world size 4 only, fp32 accumulation with one
   bf16 rounding) and `OneshotAllReduce` for small messages. Both need PCIe peer access between the GPUs, a one-time IPC
   setup per process group, and graph capture inside `runtime.capture(plan=...)`. `tests/bench_ep_comm.py` compares
-  NCCL and `PCIeTwoShotBF16` (and with `--moe` a full EP MoE layer) on a 4-GPU host. A `b12x` transport in
-  `sm120_ep/transport.py` is not wired yet; it needs 4 distinct GPUs to test.
+  NCCL and `PCIeTwoShotBF16` (and with `--moe` a full EP MoE layer) on a 4-GPU host. The `b12x` transport
+  (§4a) uses it for prefill; decode under CUDA graphs would additionally need `runtime.capture(plan=...)` around
+  DeepInfer's capture and stays on NCCL.
 - **Halving the all-gather:** an FP8 all-gather of the hidden state would halve that traffic, but needs a b12x entry
   that accepts pre-quantized activations (not found in 1.5.1).
 - **Compute side:** each rank streams only 1/W of the expert weights. Attention, mHC, dense GEMMs and lm_head stay
   replicated per rank (DP attention).
+
+## 4a. NCCL P2P and the b12x prefill transport
+
+**Measured on the 4x RTX PRO 6000 host (v0.2.0, NCCL 2.29.7):** every channel between the 4 GPUs ran "via SHM" (host
+memory), not P2P, although all pairs report peer access (topology NODE). NCCL's default P2P level only accepts paths
+up to PXB (a common PCIe switch), so GPUs behind different root ports of one CPU fall back to SHM. With the
+`--prefix-cache-grain 4096` workaround a 4096-token prefill step still took about 4 s there vs about 0.9 s on one
+RTX 5090. With `NCCL_P2P_LEVEL=SYS` all 128 channels ran via P2P/CUMEM, but TTFT was identical (4k 4.2-4.5 s, 32k
+32.6 s): prefill is not bound by the collectives there (all-gather + reduce-scatter of 2048 rows: about 2 ms each).
+`tests/bench_ep_comm.py` on that host: b12x `PCIeTwoShotBF16` beats NCCL only at 1 row per rank (all-gather 13.7 vs
+25.0 us) and is 2-12x slower from 4 rows on, so the b12x transport is not a prefill speed-up there either; it stays
+opt-in for hosts where NCCL cannot use P2P at all.
+
+* **`NCCL_P2P_LEVEL`** (`server/dp_proxy.py`, `--dp > 1`): before the ranks start, the proxy runs a peer-copy
+  self-test on all GPU pairs in a subprocess (`can_device_access_peer` plus a verified 16 MB copy, 60 s timeout). If
+  it passes, the ranks get `NCCL_P2P_LEVEL=SYS`, otherwise NCCL keeps its default. An explicit `NCCL_P2P_LEVEL` or
+  `NCCL_P2P_DISABLE` always wins; `SM120_NCCL_P2P_LEVEL=<LOC|NVL|PIX|PXB|PHB|SYS>` forces a level and
+  `SM120_NCCL_P2P_LEVEL=default` skips the test. Check with `NCCL_DEBUG=INFO`: the channel lines should read
+  "via P2P/CUMEM" (or P2P/IPC) instead of "via SHM". The self-test proves peer copies are correct, not that P2P is
+  faster through the root complex on every platform; compare `tests/bench_ep_comm.py` with and without it.
+* **`SM120_EP_TRANSPORT=b12x`** (`sm120_ep/transport.py` `B12xTransport`): the prefill all-gather and reduce-scatter
+  go through `PCIeTwoShotBF16` (CUDA-IPC, fp32-accumulating reduce-scatter with one bf16 rounding; world size 4 only).
+  Prefill rows per rank are padded to multiples of 256 (one prepared plan per size, built on first use); the
+  experts skip the padding rows. Everything else stays on NCCL: decode under CUDA graphs, row counts, sizes above
+  `SM120_EP_B12X_MAX_ROWS` (default 4096, set it to `--max-num-batched-tokens`), other world sizes. Each switch
+  between b12x and NCCL depends only on values that are equal on all ranks, and runtime / plan creation all-reduce
+  a success flag, so the ranks never mix transports in one collective. Extra GPU memory: about 1 GB per rank
+  (staging plus owned max-size buffers). **Not yet run on 4 GPUs**: validate with
+  `torchrun --nproc_per_node 4 /opt/sm120/tests/test_ep_b12x_transport.py` (b12x vs NCCL vs full experts, per-layer
+  times) before serving with it.
 
 ## 5. Switches
 
 | env | values | meaning |
 |---|---|---|
 | `SM120_EP_IMPL` | `allgather` (default if EP > 1) \| `off` | Option-B wrapper on/off |
-| `SM120_EP_TRANSPORT` | `nccl` (default) \| `gloo` | collectives backend; gloo for single-GPU tests only |
+| `SM120_EP_TRANSPORT` | `nccl` (default) \| `b12x` \| `gloo` | collectives backend: b12x = PCIe two-shot for prefill (§4a); gloo for single-GPU tests only |
+| `SM120_EP_B12X_MAX_ROWS` | int (default 4096) | b12x transport: max prefill rows per rank (= `--max-num-batched-tokens`) |
+| `SM120_NCCL_P2P_LEVEL` | unset (self-test, then SYS) \| `default` \| NCCL level | `NCCL_P2P_LEVEL` for the `--dp` ranks (§4a) |
 | `SM120_EP_DP_SYNC` | 1 (default) \| 0 | DP-wide MAX sync of the decode graph size |
 | `SM120_EP_DECODE_ROWS` | int (default `max_num_decoding_tokens`) | fixed per-rank decode row capacity when the DP sync is off |
 | `SM120_EP_FUSED_PACK` | 1 (default) \| 0 | Triton kernel that packs hidden/ids/weights into the all-gather rows |
@@ -105,7 +138,8 @@ These are estimates, not measurements.
    of the same 16 requests (where the model fits). `SM120_MOE_IMPL=torch` gives a deterministic comparison; its
    reference MoE must then accept -1 ids or have non-local weights zeroed.
 4. **CUDA graphs on 4 ranks:** DP sync on/off, MTP verify batches (rows = B*(1+nextn)).
-5. **Transport:** end-to-end TPOT at B = 1/8/32, NCCL vs (once wired) b12x `PCIeTwoShotBF16`.
+5. **Transport:** `tests/test_ep_b12x_transport.py` (4 ranks), then end-to-end prefill TTFT and TPOT at B = 1/8/32 with
+   NCCL (with and without `NCCL_P2P_LEVEL=SYS`) vs `SM120_EP_TRANSPORT=b12x`.
 6. Engram (`engram_parallel_size`) and prefix-cache interplay.
 
 The operational side (image, mounts, memory budget, engram mode by host RAM, evaluation against a baseline) is in

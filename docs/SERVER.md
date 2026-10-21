@@ -32,7 +32,9 @@ python3 /opt/sm120/server/server.py --ckpt /work/ckpt3 --port 8000 --max-num-seq
 python3 /opt/sm120/server/server.py --ckpt /work/ckpt3 --port 8000 --deterministic      # reproducible outputs
 # options: --max-model-len 16384 --max-num-batched-tokens 4096 --gpu-memory-utilization 0.9 --max-blocks 256
 #          --nextn N (MTP, needs mtp.* layers) --graphs (CUDA graphs) --zos 0|1 --prefill-interval 1 --model-name ID
-#          --prefix-cache [--prefix-cache-grain 512 --prefix-cache-entries 64 --prefix-cache-max-block-frac 0.5]
+#          --prefix-cache [--prefix-cache-grain 512 --prefix-cache-checkpoint-stride 0 (= --max-num-batched-tokens)
+#                          --prefix-cache-entries 64 --prefix-cache-max-block-frac 0.5]
+#          (tool-calling workloads with short shared system prompts: --prefix-cache-checkpoint-stride 1024 or 2048, see PREFIX_CACHE.md)
 
 curl -s localhost:8000/v1/models
 curl -s localhost:8000/v1/completions -H 'Content-Type: application/json' \
@@ -174,10 +176,10 @@ and `BadRequestError`.
 |---|---|---|---|
 | `ckpt3`, eager, b12x MoE | 35/35 | 10/10 | `test_server.py` (v0.1 plumbing) 12/12 hard checks |
 | `ckpt3`, eager, `--deterministic` | 36/36 | n/a | incl. greedy tool-call stream == non-stream; `test_server.py` 17/17 |
-| `ckpt3`, eager, `--prefix-cache` (grain 128) | 36/36 | 10/10 | repeated tool prompts hit the cache, constrained requests bypass it |
+| `ckpt3`, eager, `--prefix-cache` (grain and checkpoint stride 128) | 36/36 | 10/10 | repeated tool prompts hit the cache, constrained requests bypass it |
 | `ckpt3_mtp`, eager, `--nextn 3` | 34/34 | 10/10 | constrained decoding works with MTP draft verification |
 | `ckpt3`, `--graphs` (v0.1.1) | 35/35 | 11/11 | images 18/18; `test_server.py` 14/14 |
-| `ckpt3`, `--graphs --prefix-cache` | 36/36 | 11/11 | images 18/18 |
+| `ckpt3`, `--graphs --prefix-cache` (grain and checkpoint stride 128) | 36/36 | 11/11 | images 18/18 |
 | `ckpt3_mtp`, `--graphs --nextn 3` | 34/34 | 11/11 | images 19/19 |
 | `ckpt3_vision`, `--graphs` (real ViT weights) | 35/35 | 11/11 | images 18/18 (different pictures change the logits) |
 | `ckpt3`, `--graphs`, 19 requests of 469 tokens, then 9 concurrent constrained requests | 9/9 valid | | server healthy; this crashed before v0.1.1 |
@@ -290,7 +292,7 @@ that into different tokens. `--deterministic` sets `SM120_MOE_IMPL=torch`; then 
 - Seeded sampling is reproducible, and a different seed gives a different output.
 - Bad requests get 400.
 
-`--deterministic --prefix-cache`: **22/22 passed** (adds prefix-cache hit checks; a repeated 1503-token prompt hits 1024 tokens,
+`--deterministic --prefix-cache --prefix-cache-checkpoint-stride 512`: **22/22 passed** (adds prefix-cache hit checks; a repeated 1503-token prompt hits 1024 tokens,
 TTFT 1.82 s → 0.56 s, identical tokens).
 
 Default b12x mode: **12/12 hard checks passed**. The 6 repeatability checks (greedy repeat, stream == non-stream, stop strings derived

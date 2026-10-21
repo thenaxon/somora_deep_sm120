@@ -49,6 +49,7 @@ class GenRequest:
     seed: int | None = None
     ignore_eos: bool = False
     logprobs: int = 0  # top-K raw-logit logprobs per output token (logprob_tap.py), 0 = off
+    so_args: dict | None = None  # structured output (DeepInfer SamplingParams.so_args; tools.py builds it)
     request_id: str = ""
     # filled by the engine thread: ("token", token_id, finished, finish_reason, (top_ids, top_logprobs) | None)
     #                              | ("error", message)
@@ -98,6 +99,9 @@ class EngineLoop:
 
     def submit(self, req: GenRequest) -> GenRequest:
         req.request_id = str(next(self._ids))  # numeric strings: LLM._run_engine sorts ids with int()
+        if not self.alive:  # crashed engine: fail now instead of after --request-timeout
+            req.out.put(("error", f"engine is not running: {self._error!r}"))
+            return req
         self._inbox.put(("add", req))
         return req
 
@@ -227,8 +231,9 @@ class EngineLoop:
         import numpy as np
 
         try:
+            extra = {"so_args": r.so_args} if r.so_args is not None else {}
             sp = self._SamplingParams(temperature=r.temperature, top_p=r.top_p, top_k=r.top_k, max_tokens=r.max_tokens,
-                                      ignore_eos=r.ignore_eos, seq_seed=r.seed)
+                                      ignore_eos=r.ignore_eos, seq_seed=r.seed, **extra)
             seq = self.engine.add_request(user_id="0", request_id=r.request_id, sampling_params=sp,
                                           prompt_token_ids=np.asarray(r.prompt_ids, dtype=np.int32))
         except Exception as exc:  # noqa: BLE001  (bad sampling params, empty prompt, ...)

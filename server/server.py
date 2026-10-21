@@ -6,8 +6,10 @@
 Endpoints: GET /health, GET /v1/models, POST /v1/completions, POST /v1/chat/completions (the checkpoint's
 encoding/encoding.py chat template; "thinking": true or reasoning_effort -> thinking mode), streaming (SSE,
 "stream": true) and non-streaming. Sampling: temperature, top_p, top_k, max_tokens, stop (str | list), seed,
-ignore_eos; extension "return_token_ids": true (non-streaming). Concurrent requests share one continuously-batched DeepInfer engine (engine.py). A client that
-disconnects from a stream aborts its request in the engine. See README.md.
+ignore_eos; extension "return_token_ids": true (non-streaming). Chat: tools / tool_choice / parallel_tool_calls (DSML tool
+calls, tools.py) and response_format text / json_object / json_schema (grammar-constrained, DeepInfer structured output).
+Concurrent requests share one continuously-batched DeepInfer engine (engine.py). A client that disconnects from a stream
+aborts its request in the engine. See docs/SERVER.md.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+import tools  # noqa: E402
 from engine import EngineLoop, GenRequest  # noqa: E402
 
 log = logging.getLogger("di_server")
@@ -177,7 +180,7 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
     # ---- generation
-    def _params(self, body: dict, prompt_len: int) -> dict:
+    def _params(self, body: dict, prompt_len: int, extra_stop: list[str] = ()) -> dict:
         app = self.app
         if int(body.get("n", 1)) != 1:
             raise BadRequest("only n=1 is supported")
@@ -212,23 +215,38 @@ class Handler(BaseHTTPRequestHandler):
         self._lp = (lp, top_n, bool(body.get("return_tokens_as_token_ids", False)), chat_mode)
         return dict(max_tokens=min(max_tokens, room), temperature=temperature, top_p=top_p,
                     top_k=int(body.get("top_k", -1) or -1), seed=None if seed is None else int(seed) % (2 ** 63),
-                    ignore_eos=bool(body.get("ignore_eos", False)), stop=stop, logprobs=lp)
+                    ignore_eos=bool(body.get("ignore_eos", False)), stop=stop + list(extra_stop), logprobs=lp)
 
     def _generate(self, body: dict, chat: bool) -> None:
         app = self.app
         thinking = False
+        plan, so, extra_stop = tools.ToolPlan(), None, []
         if chat:
             msgs = body.get("messages")
             if not isinstance(msgs, list) or not msgs:
                 raise BadRequest("messages must be a non-empty list")
             effort = body.get("reasoning_effort")
             thinking = bool(body.get("thinking", effort is not None))
+            enc = app.codec.enc
+            try:
+                plan = tools.plan_from_body(body)
+                if enc is None and (plan.tools or plan.rf_kind):
+                    raise tools.ToolError("tools / response_format need the checkpoint's encoding/encoding.py")
+                if plan.tools or plan.rf_kind:
+                    msgs = tools.prepare_messages(msgs, plan)
+                    so = tools.so_args(enc, plan, thinking, app.codec.encode(enc.thinking_end_token))
+            except tools.ToolError as exc:
+                raise BadRequest(str(exc)) from None
+            if plan.tools and plan.choice == "none":
+                extra_stop = [tools.Dsml(enc).calls_open]  # the tools are shown to the model but must not be called
             try:
                 prompt = app.codec.render_chat(msgs, thinking, effort)
             except Exception as exc:  # noqa: BLE001  (encoding.py validates roles / content)
                 raise BadRequest(f"cannot render messages: {exc}") from None
             ids = app.codec.encode(prompt)
         else:
+            if body.get("tools") or (body.get("response_format") or {}).get("type", "text") != "text":
+                raise BadRequest("tools and response_format are supported on /v1/chat/completions only")
             p = body.get("prompt")
             if isinstance(p, list) and len(p) == 1:
                 p = p[0]
@@ -240,21 +258,24 @@ class Handler(BaseHTTPRequestHandler):
                 raise BadRequest("prompt must be a string, a one-element list of strings, or a list of token ids")
         if not ids:
             raise BadRequest("empty prompt")
-        prm = self._params(body, len(ids))
+        prm = self._params(body, len(ids), extra_stop)
         stop = prm.pop("stop")
-        req = app.engine.submit(GenRequest(prompt_ids=ids, **prm))
+        req = app.engine.submit(GenRequest(prompt_ids=ids, so_args=so, **prm))
         rid = ("chatcmpl-" if chat else "cmpl-") + uuid.uuid4().hex[:24]
         created = int(time.time())
         detok = Detok(app.codec, stop)
         stream = bool(body.get("stream", False))
         include_usage = bool((body.get("stream_options") or {}).get("include_usage", False))
         obj = "chat.completion" if chat else "text_completion"
-        log.info("%s engine-id %s prompt %d tok max_tokens %d stream %s", rid, req.request_id, len(ids),
-                 prm["max_tokens"], stream)
+        log.info("%s engine-id %s prompt %d tok max_tokens %d stream %s tools %s/%d response_format %s grammar %s",
+                 rid, req.request_id, len(ids), prm["max_tokens"], stream, plan.choice, len(plan.tools), plan.rf_kind,
+                 so is not None)
+        # chat output -> reasoning_content / content / tool_calls deltas (tools.py); plain text without encoding.py
+        parser = tools.StreamParser(app.codec.enc, thinking, plan) if chat and app.codec.enc is not None else None
 
-        def chunk(delta_text: str | None, finish: str | None, role: bool = False, usage=None) -> dict:
+        def chunk(delta_text: str | None, finish: str | None, role: bool = False, usage=None, delta=None) -> dict:
             if chat:
-                delta = {}
+                delta = dict(delta or {})
                 if role:
                     delta["role"] = "assistant"
                 if delta_text:
@@ -305,7 +326,10 @@ class Handler(BaseHTTPRequestHandler):
                     finished, reason = True, "stop"
                 if stream:
                     piece = detok.emit(final=finished)
-                    if piece:
+                    if piece and parser is not None:
+                        for d in parser.feed(piece):
+                            send(chunk(None, None, delta=d))
+                    elif piece:
                         send(chunk(piece, None))
                 if finished:
                     finish = _finish_reason(reason, detok.stopped)
@@ -326,6 +350,11 @@ class Handler(BaseHTTPRequestHandler):
         log.info("%s done: %d tokens, finish %s, ttft %.3fs, total %.3fs", rid, n_tok, finish,
                  (t - req.submitted) if t else -1, time.perf_counter() - req.submitted)
         if stream:
+            if parser is not None:
+                for d in parser.finish():
+                    send(chunk(None, None, delta=d))
+                if parser.calls and finish == "stop":
+                    finish = "tool_calls"
             send(chunk(None, finish))
             if include_usage:
                 d = chunk(None, None, usage=usage)
@@ -336,10 +365,18 @@ class Handler(BaseHTTPRequestHandler):
             return
         text = detok.text
         if chat:
-            content, reasoning = app.codec.split_reasoning(text, thinking)
+            calls = []
+            if app.codec.enc is not None:
+                content, reasoning, calls = tools.parse_final(app.codec.enc, text, thinking, plan)
+            else:
+                content, reasoning = app.codec.split_reasoning(text, thinking)
             message = {"role": "assistant", "content": content}
             if reasoning is not None:
                 message["reasoning_content"] = reasoning
+            if calls:
+                message["tool_calls"] = calls
+                if finish == "stop":
+                    finish = "tool_calls"
             choice = {"index": 0, "message": message, "finish_reason": finish}
         else:
             choice = {"index": 0, "text": text, "logprobs": None, "finish_reason": finish}

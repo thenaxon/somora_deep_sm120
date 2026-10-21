@@ -27,6 +27,11 @@ Environment (all optional):
     SM120_ENGRAM_PREFAULT=0|1               read the whole table into the page cache ("ram mode"): at attach, or
                                             with SM120_ENGRAM_PREFAULT_AT=ready (server default) once all ranks
                                             have loaded their weights (post_load_cache_policy)
+    SM120_ENGRAM_PREFAULT_HEADROOM_GB=<g>   prefault only if the tables fit into MemAvailable minus g GiB (default
+                                            4); SM120_ENGRAM_PREFAULT=force prefaults regardless
+    SM120_ENGRAM_RESIDENCY_INTERVAL=<s>     log the tables' page-cache residency every s seconds (default 0 = off)
+    SM120_ENGRAM_PIN=0|mlock                after load: prefault and mlock the tables once (shared by all ranks);
+                                            start-up fails unless they fit with SM120_ENGRAM_PIN_HEADROOM_GB (8)
     SM120_ENGRAM_DROP_WEIGHT_PAGES=1|0      server: drop the other shards' page-cache pages after load
     SM120_ENGRAM_STATS=0|1                  print fetch / gather / wait statistics at exit and every
                                             SM120_ENGRAM_STATS_INTERVAL seconds (default 60) while they change
@@ -236,6 +241,97 @@ def resident_bytes(path: str, offset: int = 0, length: int | None = None, chunk:
 _TABLES: list = []  # every checkpoint-backed table opened in this process (post_load_cache_policy)
 
 
+class EngramResidencyError(RuntimeError):
+    """The tables cannot be kept resident as configured (SM120_ENGRAM_PIN): the server aborts its start-up."""
+
+
+def pin_tables(tables: list) -> dict:
+    """SM120_ENGRAM_PIN=mlock: mlock(2) both planes of every table in this process.
+
+    The pages are the shared page cache of the shard files: locked once, they stay resident for every process that
+    maps them (the other ranks need no lock of their own, and memory is counted once). The kernel can then never
+    evict them. That is the guarantee the baseline engine has by pinning its copy, without a second copy. Called
+    after the prefault, so mlock only marks resident pages."""
+    import ctypes
+    import resource
+
+    size = sum(t.nbytes for t in tables)
+    soft, _ = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+    if soft != resource.RLIM_INFINITY and soft < size:
+        raise EngramResidencyError(
+            f"SM120_ENGRAM_PIN=mlock: RLIMIT_MEMLOCK is {soft / 2**30:.1f} GiB, the tables need {size / 2**30:.1f} GiB; "
+            f"start the container with --ulimit memlock=-1")
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    libc.mlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    t0 = time.time()
+    for t in tables:
+        for loc in t.source:
+            if loc is None:
+                continue
+            mm = _mmap_file(loc.path)
+            base = np.frombuffer(mm, dtype=np.uint8, count=1).ctypes.data
+            start = loc.offset // mmap.PAGESIZE * mmap.PAGESIZE
+            end = min(len(mm), _align(loc.offset + loc.nbytes, mmap.PAGESIZE))
+            if libc.mlock(base + start, end - start) != 0:
+                err = ctypes.get_errno()
+                raise EngramResidencyError(f"SM120_ENGRAM_PIN=mlock: mlock of {loc.name} ({(end - start) / 2**30:.1f} "
+                                           f"GiB) failed: {os.strerror(err)}")
+    dt = time.time() - t0
+    print(f"[sm120_engram] pinned {size / 2**30:.1f} GiB of engram tables in the page cache (mlock, one copy for all "
+          f"ranks) in {dt:.0f} s; MemAvailable now {(_mem_available() or 0) / 2**30:.1f} GiB", flush=True)
+    return {"pinned_gib": round(size / 2**30, 1), "pin_s": round(dt, 1)}
+
+
+def _pin_policy(tables: list) -> dict:
+    """SM120_ENGRAM_PIN=mlock: refuse to start unless the tables fit with SM120_ENGRAM_PIN_HEADROOM_GB (default 8) of
+    MemAvailable to spare, then prefault and lock them. Locked memory is not reclaimable and there is no swap: without
+    the headroom a growing process would be OOM-killed instead of just evicting table pages."""
+    size, avail = sum(t.nbytes for t in tables), _mem_available()
+    headroom = float(_env("SM120_ENGRAM_PIN_HEADROOM_GB", "8")) * 2**30
+    if avail is not None and size > avail - headroom:
+        raise EngramResidencyError(
+            f"SM120_ENGRAM_PIN=mlock: engram tables {size / 2**30:.1f} GiB + headroom {headroom / 2**30:.0f} GiB "
+            f"(SM120_ENGRAM_PIN_HEADROOM_GB) > MemAvailable {avail / 2**30:.1f} GiB after load; locking them could "
+            f"OOM the host without swap. Free host memory (docs/MULTI_GPU_RUNBOOK.md section 3) or run without the pin")
+    t0 = time.time()
+    for t in tables:
+        t.prefault()
+    res = {"prefault_s": round(time.time() - t0, 1)}
+    print(f"[sm120_engram] prefaulted the whole tables after load in {res['prefault_s']:.0f} s", flush=True)
+    res.update(pin_tables(tables))
+    return res
+
+
+def _prefault_policy(tables: list, force: bool) -> dict:
+    """Prefault after load: the whole tables when they fit into MemAvailable minus SM120_ENGRAM_PREFAULT_HEADROOM_GB
+    (default 4), otherwise nothing (the scale planes are resident anyway). `force` reads everything.
+
+    Page-cache pages are clean and reclaimable: a prefault never causes an OOM, the kernel evicts table pages when
+    processes need memory (then those rows are read from the NVMe again). What is not reclaimable without swap:
+    anonymous memory, /dev/shm (the multimodal pools) and page-locked memory (uva, pinned staging)."""
+    size, avail = sum(t.nbytes for t in tables), _mem_available()
+    headroom = float(_env("SM120_ENGRAM_PREFAULT_HEADROOM_GB", "4")) * 2**30
+    # MemAvailable counts reclaimable page cache, the table pages already resident included: the tables can hold at
+    # most MemAvailable minus the headroom
+    budget = None if avail is None else avail - headroom
+    t0 = time.time()
+    if force or budget is None or size <= budget:
+        for t in tables:
+            t.prefault()
+        what = "the whole tables"
+    else:
+        # a partial prefault fills the page cache without holding the tables: on the RTX 5090 test machine (25 % of
+        # every weight plane) the page-cache pressure made cold prefills 20 % slower, and the second table's pages
+        # evicted the first's
+        print(f"[sm120_engram] prefault skipped: tables {size / 2**30:.0f} GiB > MemAvailable {avail / 2**30:.0f} GiB - "
+              f"{headroom / 2**30:.0f} GiB headroom (SM120_ENGRAM_PREFAULT_HEADROOM_GB); the page cache serves as an "
+              f"LRU instead (docs/ENGRAM.md §7)", flush=True)
+        return {"prefault_s": None}
+    dt = time.time() - t0
+    print(f"[sm120_engram] prefaulted {what} after load in {dt:.0f} s", flush=True)
+    return {"prefault_s": round(dt, 1)}
+
+
 def post_load_cache_policy(ckpt_dir: str | None) -> dict:
     """Page-cache policy after the weights of every rank are loaded (server: once, on one process per host).
 
@@ -265,18 +361,14 @@ def post_load_cache_policy(ckpt_dir: str | None) -> dict:
         res["dropped_shards"], res["dropped_gib"] = dropped, round(nbytes / 2**30, 1)
         print(f"[sm120_engram] page cache: dropped clean pages of {dropped} weight shards ({nbytes / 2**30:.0f} GiB of "
               f"files) after load (SM120_ENGRAM_DROP_WEIGHT_PAGES=0 keeps them)", flush=True)
-    if (_env("SM120_ENGRAM_PREFAULT", "0") in ("1", "true", "yes") and _env("SM120_ENGRAM_PREFAULT_AT", "attach") == "ready"
-            and tables):
-        size, avail = sum(t.nbytes for t in tables), _mem_available()
-        if avail is not None and size > 0.95 * avail:
-            # reading tables that do not fit only churns the cache (and the disk) for minutes while serving
-            res["prefault_s"] = None
-            print(f"[sm120_engram] prefault skipped: tables {size / 2**30:.0f} GiB > MemAvailable {avail / 2**30:.0f} "
-                  f"GiB; use SM120_ENGRAM_MODE=uring on this host (docs/ENGRAM.md)", flush=True)
-        else:
-            dt = sum(t.prefault() for t in tables)
-            res["prefault_s"] = round(dt, 1)
-            print(f"[sm120_engram] prefaulted {len(tables)} tables after load in {dt:.0f} s", flush=True)
+    pf = _env("SM120_ENGRAM_PREFAULT", "0")
+    if _env("SM120_ENGRAM_PIN", "0") in ("mlock", "1", "true", "yes") and tables:
+        res.update(_pin_policy(tables))  # raises EngramResidencyError: the server aborts its start-up
+        if _PREFETCH is not None:  # every lookup hits locked pages: nothing to read ahead
+            _PREFETCH.close()
+            globals()["_PREFETCH"] = None
+    elif pf in ("1", "true", "yes", "force") and _env("SM120_ENGRAM_PREFAULT_AT", "attach") == "ready" and tables:
+        res.update(_prefault_policy(tables, force=pf == "force"))
     resident = [t.resident() for t in tables]
     if tables and all(r is not None for r in resident):
         size = sum(t.nbytes for t in tables)
@@ -286,7 +378,43 @@ def post_load_cache_policy(ckpt_dir: str | None) -> dict:
               f"{size / 2**30:.1f} GiB ({100 * sum(resident) / max(size, 1):.0f} %); MemAvailable "
               f"{'?' if avail is None else f'{avail / 2**30:.1f} GiB'}", flush=True)
     res["seconds"] = round(time.time() - t0, 1)
+    res.update(_host_footprint())
+    iv = float(_env("SM120_ENGRAM_RESIDENCY_INTERVAL", "0"))
+    if iv > 0 and tables:  # watch the residency while serving (mincore over the tables: ~1 s per 200 GiB)
+        threading.Thread(target=_residency_loop, args=(tables, iv), name="sm120-engram-residency", daemon=True).start()
     return res
+
+
+def _host_footprint() -> dict:
+    """This process' host memory after load (anon, shmem, page tables, torch's pinned host cache), for the budget."""
+    out = {}
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                k, _, v = line.partition(":")
+                if k in ("RssAnon", "RssShmem", "VmPTE", "VmLck"):
+                    out[k] = round(int(v.split()[0]) / 2**20, 2)
+        hs = getattr(torch.cuda, "host_memory_stats", None)
+        if hs is not None and torch.cuda.is_initialized():
+            st = hs()
+            out["torch_pinned_reserved_gib"] = round(st.get("reserved_bytes.current", st.get("allocated_bytes.current", 0)) / 2**30, 2)
+        print(f"[sm120_engram] host footprint of this rank (GiB): {out}", flush=True)
+    except Exception:  # noqa: BLE001 - diagnostics only
+        pass
+    return {"footprint_gib": out}
+
+
+def _residency_loop(tables: list, interval: float) -> None:
+    size = sum(t.nbytes for t in tables)
+    while True:
+        time.sleep(interval)
+        try:
+            r, avail = sum(t.resident() or 0 for t in tables), _mem_available()
+            print(f"[sm120_engram] residency: {r / 2**30:.1f} / {size / 2**30:.1f} GiB ({100 * r / max(size, 1):.0f} %) "
+                  f"of the engram tables in the page cache; MemAvailable "
+                  f"{'?' if avail is None else f'{avail / 2**30:.1f} GiB'}", flush=True)
+        except Exception:  # noqa: BLE001 - diagnostics only
+            pass
 
 
 # ------------------------------------------------------------------------------------------------ table

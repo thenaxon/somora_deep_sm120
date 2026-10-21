@@ -3,7 +3,7 @@
 All notable changes to this project are documented here. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0 any minor release may change interfaces.
 
-## [Unreleased]
+## [0.2.2] - unreleased
 
 ### Fixed
 - `eval/scenarios.py realistic`: `tokens_per_step` divided by every engine step, and behind the `--dp` proxy by the
@@ -13,10 +13,29 @@ before 1.0 any minor release may change interfaces.
   `draft_acceptance_est` = (tokens_per_step - 1) / nextn. The `--dp` proxy reports `steps` / `flushes` per rank
   instead of summing them.
 
+### Added
+- `SM120_ENGRAM_PIN=mlock`: after load, rank 0 prefaults the engram tables and locks them. All ranks share that one
+  locked page-cache copy (memory counted once), so the tables stay fully in RAM like the baseline's pinned copy.
+  - The server refuses to start, with a message naming the numbers, if the tables plus
+    `SM120_ENGRAM_PIN_HEADROOM_GB` (default 8) do not fit into MemAvailable, or if `RLIMIT_MEMLOCK` is too low.
+  - With `--dp` the proxy then stops all ranks.
+- `SM120_PROFILE_PREFILL=N`: every engine process profiles the prefill of its N-th request (torch profiler) and
+  writes a trace plus a table to `SM120_PROFILE_DIR`: GPU time per kernel category (incl. NCCL and EP pack), host time
+  per named range (engine step, engram fetch/wait, DP step sync, prefix cache, DeepInfer's forward/sample ranges),
+  blocking CUDA calls and the engine thread's timeline.
+- Diagnostic switches, defaults unchanged: `SM120_ATTN_PREFILL_SYNC=0` (prefill attention without the per-layer
+  width read-back; about 2× more attention work on one GPU) and `SM120_EP_COMPACT=0` (EP prefill without the row
+  compaction).
+- `SM120_ENGRAM_RESIDENCY_INTERVAL`: periodic page-cache residency log of the engram tables while serving.
+- The server logs each rank's host footprint after load (anon, shmem, page tables, torch's pinned cache).
+
 ### Changed
 - `eval/scenarios.py capacity`: a `missed` column names the limit a level broke (ttft, tpot, errors).
 - `eval/compare_endpoints.py --teacher-forced`: the error for a recording that lacks the requested continuation says
   how to record it.
+- Engram prefault after load (`SM120_ENGRAM_PREFAULT=1`) runs when the tables fit into MemAvailable minus
+  `SM120_ENGRAM_PREFAULT_HEADROOM_GB` (default 4). The old rule wanted 5 % above the tables and skipped hosts with
+  210 GB available for 203 GB of tables. `SM120_ENGRAM_PREFAULT=force` prefaults regardless.
 
 ## [0.2.1] - 2026-10-21
 

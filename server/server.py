@@ -505,6 +505,9 @@ def _engram_cache_policy(ckpt: str) -> dict | None:
     _CACHE_POLICY["started"] = time.time()
     try:
         _CACHE_POLICY.update(eng.post_load_cache_policy(ckpt))
+    except eng.EngramResidencyError as exc:  # SM120_ENGRAM_PIN cannot be honoured: abort the start-up
+        log.error("engram tables cannot be pinned: %s", exc)
+        _CACHE_POLICY["fatal"] = str(exc)
     except Exception as exc:  # noqa: BLE001
         log.warning("engram page-cache policy failed: %r", exc)
         _CACHE_POLICY["error"] = repr(exc)
@@ -598,7 +601,9 @@ def main() -> int:
     app = App(args)
     app.engine.start()
     if args.dp_rank is None:  # single process: weights are loaded now; with --dp the proxy calls it on rank 0
-        _engram_cache_policy(args.ckpt)
+        if (_engram_cache_policy(args.ckpt) or {}).get("fatal"):
+            app.engine.shutdown()
+            return 2
     Handler.app = app
     ThreadingHTTPServer.request_queue_size = 1024  # listen backlog (socketserver default 5)
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)

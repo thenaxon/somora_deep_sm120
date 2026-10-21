@@ -1,6 +1,6 @@
 # Compatibility
 
-Version 0.2.1 is built and tested with exactly these versions (pinned in `docker/Dockerfile`):
+Version 0.2.2 is built and tested with exactly these versions (pinned in `docker/Dockerfile`):
 
 | component | version |
 |---|---|

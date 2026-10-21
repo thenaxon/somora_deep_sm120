@@ -440,6 +440,7 @@ original shard directory must be visible at the same absolute path wherever the 
      - What helps there is a page cache that holds most of the tables. With about 190 GB available after start-up,
        about 90 % of the 189 GiB fits. It fills by use: the start-up prefault is skipped below tables + 10 %, see
        MULTI_GPU_RUNBOOK.md §3. The Zipf-like reuse of real text helps on top.
-     - Otherwise the tables belong on their own NVMe, or on two in RAID 0, apart from the weight shards.
+     - With the tables fully in RAM (pinned, one copy for all ranks, `SM120_ENGRAM_PIN`, MULTI_GPU_RUNBOOK.md §3)
+       the shared NVMe stops mattering.
 7. Prefetch cannot help a lone request's first chunk, whose gather starts right after admission. For that chunk only the
    resident scales help.

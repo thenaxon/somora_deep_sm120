@@ -256,7 +256,15 @@ def main() -> int:
         check("prefix cache: multi-turn extension hits the prompt-end snapshot", st == 200 and h2["hits"] > h1["hits"],
               f"{h2}")
 
-    # 9. bad requests
+    # 9. a one-token token-id prompt is a token-id prompt (not a one-element list of strings)
+    st, r = cl.post("/v1/completions", dict(model=model, prompt=[1000], max_tokens=4, temperature=0, ignore_eos=True,
+                                            return_token_ids=True))
+    check("one-token token-id prompt", st == 200 and r["usage"]["prompt_tokens"] == 1
+          and r["choices"][0]["prompt_token_ids"] == [1000], json.dumps(r)[:120])
+    st, r = cl.post("/v1/completions", dict(model=model, prompt=["Hello"], max_tokens=4, temperature=0))
+    check("one-element string-list prompt", st == 200 and r["usage"]["prompt_tokens"] >= 1, json.dumps(r)[:120])
+
+    # 10. bad requests
     st, _ = cl.post("/v1/completions", dict(model=model, prompt="x", top_p=0))
     st2, _ = cl.post("/v1/chat/completions", dict(model=model, messages=[]))
     st3, _ = cl.post("/v1/completions", dict(model=model, prompt="x", n=2))

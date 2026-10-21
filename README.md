@@ -120,7 +120,7 @@ Details and more tables: [docs/VALIDATION.md](docs/VALIDATION.md), [docs/ATTENTI
 
 - **Speed on the 4-GPU target is behind a tuned vLLM TP=4 deployment** (decode about 2-3×, prefill about 15× as of
   v0.2.0). DP attention runs each request's prefill on one GPU; tensor parallelism is tracked in
-  [#1](https://github.com/thenaxon/somora_deep_sm120/issues/1). The full model needs more than one GPU.
+  [#1](../../issues/1). The full model needs more than one GPU.
 - **Layer 0 deviates from the reference** beyond the noise floor (about 12-20× noise, not at other layers). This is a
   known rounding property of DeepInfer's `fused_transform` path, not a port bug ([docs/VALIDATION.md](docs/VALIDATION.md)).
 - **b12x `fused_moe` (the default MoE) is not run-to-run deterministic.** The same prompt can decode different tokens

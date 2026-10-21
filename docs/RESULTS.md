@@ -2,7 +2,7 @@
 
 Measured results of the full DeepSeek-V4.1-Flash model on the multi-GPU target, next to a tuned vLLM deployment of the
 same checkpoint on the same machine. Single-GPU results with truncated test checkpoints are in
-[VALIDATION.md](VALIDATION.md) and the README. Discussion: [issue #2](https://github.com/thenaxon/somora_deep_sm120/issues/2).
+[VALIDATION.md](VALIDATION.md) and the README. Discussion: [issue #2](../../../issues/2).
 
 ## v0.2.0
 

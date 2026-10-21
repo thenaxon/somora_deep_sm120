@@ -1,5 +1,7 @@
 # somora_deep_sm120
 
+Part of the [somora](https://somora.ai) family.
+
 Run DeepSeek's [DeepInfer](https://github.com/deepseek-ai/DeepInfer) inference engine on NVIDIA **SM120** GPUs
 (GeForce RTX 5090, RTX PRO 6000 Blackwell). DeepInfer itself targets SM100 (B200/GB200): its hot path depends on
 FlashMLA, DeepGEMM, DeepEP and DeepSelect, which do not run on SM120. This repo replaces those four libraries with
@@ -156,4 +158,4 @@ Tests that need checkpoints (server, prefix cache, end-to-end, validation) are d
   [FlashInfer](https://github.com/flashinfer-ai/flashinfer).
 - DeepSeek-V4.1-Flash and its reference implementation by DeepSeek: used for validation. They are not included here.
 
-See [NOTICE](NOTICE). Licensed under the [Apache License 2.0](LICENSE).
+A community project of [somora](https://somora.ai). See [NOTICE](NOTICE). Licensed under the [Apache License 2.0](LICENSE).

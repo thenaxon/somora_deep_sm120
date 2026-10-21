@@ -29,7 +29,7 @@ RUN pip install --no-cache-dir \
 
 RUN pip install --no-cache-dir b12x==1.5.1
 
-RUN apt-get update && apt-get install -y --no-install-recommends liburing-dev pkg-config patch \
+RUN apt-get update && apt-get install -y --no-install-recommends liburing-dev pkg-config patch libnuma1 \
     && rm -rf /var/lib/apt/lists/*
 
 # DeepInfer at the pinned commit; host extension (_C: scheduler, block manager, cuda_utils), pure C++, arch-agnostic.

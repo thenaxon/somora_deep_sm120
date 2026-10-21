@@ -3,6 +3,18 @@
 All notable changes to this project are documented here. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0 any minor release may change interfaces.
 
+## [0.1.1] - unreleased
+
+### Fixed
+- `libnuma1` in both images; DeepInfer's NUMA binding no longer logs tracebacks. On single-node hosts the binding is skipped
+  (new runtime patch P10): with libnuma present, `bind_numa(-1)` would segfault.
+- The serving image sets `DEEPINFER_MULTIMODAL_POOL_SIZE_GB=2` (DeepInfer default 8): 2 GB instead of 8 GB pinned host
+  memory per rank for image inputs. Sizing and the `/dev/shm/psm_*` leftovers after a crash are in
+  `docs/MULTI_GPU_RUNBOOK.md` §3.
+
+### Added
+- `tests/mm_pool_check.py`: text+image requests through DeepInfer's own API, with and without the multimodal pool.
+
 ## [0.1.0] - unreleased
 
 First release. Experimental.

@@ -230,7 +230,7 @@ class Handler(BaseHTTPRequestHandler):
             ids = app.codec.encode(prompt)
         else:
             p = body.get("prompt")
-            if isinstance(p, list) and len(p) == 1:
+            if isinstance(p, list) and len(p) == 1 and isinstance(p[0], str):
                 p = p[0]
             if isinstance(p, str):
                 ids = app.codec.encode(p)

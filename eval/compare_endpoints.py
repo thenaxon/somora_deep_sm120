@@ -362,7 +362,12 @@ def teacher_forced(args, render, tok) -> int:
             if src[0] == "file":
                 run = file_run(src, ids, cont)
                 if run is None or len(run["top"]) < len(cont):
-                    raise SystemExit(f"prompt {i}: {key} file has no run with this prompt and continuation")
+                    raise SystemExit(
+                        f"prompt {i}: the {key} file has no scoring of this continuation. A recording only holds the "
+                        f"continuations it was made with (its own greedy output with --cont-from {key}, or the one "
+                        f"given then). To compare on another endpoint's continuation, score {key} live, or record it "
+                        f"with the same --cont-from source (e.g. --a <url> --b file:<other.json> --cont-from b "
+                        f"--save-a ...).")
                 tops[key] = run["top"][:len(cont)]
             else:
                 tops[key] = score_positions(src[1], ids, cont, args.top_logprobs, args.parallel)

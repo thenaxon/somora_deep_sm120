@@ -182,6 +182,7 @@ class Handler(BaseHTTPRequestHandler):
             ok = self.app.engine.alive
             pc = self.app.engine.prefix_cache
             return self._json(200 if ok else 503, {"status": "ok" if ok else "dead", "stats": self.app.engine.stats,
+                                                   "config": {"nextn": getattr(self.app.engine, "nextn", None)},
                                                    "prefix_cache": pc.summary() if pc is not None else None})
         if self.path == "/v1/models":
             return self._json(200, {"object": "list", "data": [

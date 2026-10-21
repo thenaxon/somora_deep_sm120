@@ -103,7 +103,12 @@ class EngineLoop:
         self._ready = threading.Event()
         self._stop = threading.Event()
         self._error: BaseException | None = None
-        self.stats = dict(steps=0, flushes=0, added=0, aborted=0, finished=0, max_running=0, busy_s=0.0)
+        # tokens: generated tokens routed to requests (with MTP several per step); emit_steps: summed over requests, the
+        # engine steps in which a request received tokens, so (tokens - requests) / (emit_steps - requests) is the
+        # tokens per decode step of a sequence (1 + accepted drafts). steps: engine.step() calls, which with DP > 1
+        # every rank makes in lockstep (idle ranks run placeholder steps): a per-rank count, not per request
+        self.stats = dict(steps=0, flushes=0, added=0, aborted=0, finished=0, max_running=0, busy_s=0.0, tokens=0,
+                          emit_steps=0)
         self.eos_id: int | None = None
         self._thread = threading.Thread(target=self._run, name="deepinfer-engine", daemon=True)
 
@@ -390,6 +395,7 @@ class EngineLoop:
                     print(f"    +{(t - t_first) / 1000.0:9.2f}  {d:9.2f}  {n}")
 
     def _route(self, outs) -> None:
+        seen = set()  # one call = the outputs of one engine step (ZOS: of the previous one)
         for ptr in outs:
             o = self._RequestOutput.clone(ptr)  # the pool slot is recycled by the next step
             r = self._live.get(o.request_id)
@@ -400,6 +406,10 @@ class EngineLoop:
                 if self._prof is not None and self._prof[0] == r.request_id:
                     self._profile_stop(r)
             r.n_out += 1
+            self.stats["tokens"] += 1
+            if o.request_id not in seen:  # steps in which this request got tokens (speculative decoding: >= 1 each)
+                seen.add(o.request_id)
+                self.stats["emit_steps"] += 1
             row = self.tap.pop_row(o.request_id) if r.logprobs else None
             r.out.put(("token", int(o.token_id), bool(o.finished), str(o.finish_reason or ""), row))
             if o.finished:

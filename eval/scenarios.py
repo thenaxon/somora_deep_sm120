@@ -105,6 +105,14 @@ class Endpoint:
                 for k, v in (h.get("prefix_cache") or {}).items():
                     if isinstance(v, (int, float)):
                         out[f"prefix_cache.{k}"] = v
+                if isinstance((h.get("config") or {}).get("nextn"), int):
+                    out["config.nextn"] = h["config"]["nextn"]
+                # behind the --dp proxy: per-rank counters. All ranks step in lockstep (idle ranks run placeholder
+                # steps), so the step count of a request's rank is the step count of any rank, not the sum.
+                for i, r in enumerate(h.get("ranks") or []):
+                    for k in ("steps", "added", "tokens", "emit_steps"):
+                        if isinstance((r.get("stats") or {}).get(k), (int, float)):
+                            out[f"rank{i}.{k}"] = r["stats"][k]
         except Exception:  # noqa: BLE001
             pass
         try:
@@ -172,7 +180,16 @@ def stats_delta(before: dict, after: dict) -> dict:
     d = {k: after[k] - before.get(k, 0) for k in after if isinstance(after[k], (int, float))}
     out = {}
     if "engine.steps" in d:
-        out["engine_steps"] = d["engine.steps"]
+        rank_steps = [v for k, v in d.items() if k.startswith("rank") and k.endswith(".steps")]
+        out["engine_steps"] = max(rank_steps) if rank_steps else d["engine.steps"]  # per rank (lockstep), not summed
+        if "engine.tokens" in d:
+            out["engine_tokens"] = d["engine.tokens"]
+        if "engine.added" in d:
+            out["engine_requests"] = d["engine.added"]
+        if "engine.emit_steps" in d:
+            out["engine_emit_steps"] = d["engine.emit_steps"]
+    if "config.nextn" in after:
+        out["nextn"] = after["config.nextn"]
     for k in ("prefix_cache.hits", "prefix_cache.lookups", "prefix_cache.hit_tokens", "prefix_cache.prompt_tokens"):
         if k in d:
             out[k.replace(".", "_")] = d[k]
@@ -323,11 +340,20 @@ def sc_realistic(ep, a):
             res, err, wall = run_pool(jobs, conc)
             row = dict(set=name, concurrency=conc, requests=n, errors=len(err), error_samples=err[:2],
                        **summarize(res, wall), **stats_delta(s0, ep.stats()))
-            if row.get("engine_steps") and conc == 1:  # one sequence at a time: tokens per engine step (MTP: >1)
-                row["tokens_per_step"] = sum(r["out"] or 0 for r in res) / row["engine_steps"]
+            if row.get("engine_emit_steps"):
+                # generated tokens per DECODE step of a sequence (1 without speculative decoding, up to 1 + nextn
+                # with MTP): each request's first token comes from its prefill step, the rest from decode steps.
+                # emit_steps counts, per request, only the steps in which it got tokens, so idle / placeholder / DP
+                # lockstep steps and the batch size do not distort it (needs the emit_steps counter in /health).
+                toks, nreq = row.get("engine_tokens", 0), row.get("engine_requests") or len(res)
+                if row["engine_emit_steps"] > nreq:
+                    row["tokens_per_step"] = (toks - nreq) / (row["engine_emit_steps"] - nreq)
+                    if row.get("nextn"):
+                        row["draft_acceptance_est"] = (row["tokens_per_step"] - 1) / row["nextn"]
             rows.append(row)
             show(row, ["set", "concurrency", "requests", "errors", "output_tok_s", "output_tokens_mean", "tpot_p50_ms",
-                       "tpot_p99_ms", "ttft_p50", "ttft_p99", "tokens_per_step", "spec_acceptance"])
+                       "tpot_p99_ms", "ttft_p50", "ttft_p99", "tokens_per_step", "draft_acceptance_est",
+                       "spec_acceptance"])
     return rows
 
 
@@ -494,10 +520,12 @@ def sc_capacity(ep, a):
         jobs = [lambda m=m: ep.chat(m, a.max_tokens, a.temperature, True, seed=a.seed) for m in msgs]
         res, err, wall = run_pool(jobs, conc)
         s = summarize(res, wall)
-        ok = not err and s["ttft_p99"] is not None and s["ttft_p99"] <= a.slo_ttft and s["tpot_p99_ms"] <= a.slo_tpot
-        row = dict(concurrency=conc, requests=n, errors=len(err), meets_slo=ok, **s)
+        miss = [x for x, bad in (("errors", bool(err)), ("ttft", s["ttft_p99"] is None or s["ttft_p99"] > a.slo_ttft),
+                                 ("tpot", s["tpot_p99_ms"] > a.slo_tpot)) if bad]
+        ok = not miss
+        row = dict(concurrency=conc, requests=n, errors=len(err), meets_slo=ok, missed="+".join(miss) or "-", **s)
         rows.append(row)
-        show(row, ["concurrency", "requests", "errors", "meets_slo", "output_tok_s", "ttft_p50", "ttft_p99",
+        show(row, ["concurrency", "requests", "errors", "meets_slo", "missed", "output_tok_s", "ttft_p50", "ttft_p99",
                    "tpot_p50_ms", "tpot_p99_ms"])
         if ok:
             best = row
@@ -514,14 +542,14 @@ def sc_capacity(ep, a):
 
 MD_COLUMNS = {
     "realistic": ["set", "concurrency", "requests", "errors", "output_tok_s", "output_tokens_mean", "tpot_p50_ms",
-                  "tpot_p99_ms", "ttft_p50", "ttft_p99", "tokens_per_step", "spec_acceptance"],
+                  "tpot_p99_ms", "ttft_p50", "ttft_p99", "tokens_per_step", "draft_acceptance_est", "spec_acceptance"],
     "prefill": ["prompt_len", "concurrency", "errors", "prompt_tokens_mean", "ttft_p50", "ttft_p99", "ttft_max",
                 "time_to_last_s", "prefill_tok_s", "total_tok_s"],
     "shared-prefix": ["variant", "turn", "requests", "errors", "prompt_tokens_mean", "ttft_p50", "ttft_p99", "tpot_p50_ms",
                       "wall_s", "prefix_cache_token_hit_rate", "prefix_cache_hits"],
     "mixed": ["phase", "short_requests", "long_requests", "errors", "short_ttft_p50", "short_ttft_p99", "short_tpot_p50_ms",
               "short_tpot_p99_ms", "short_max_gap_p99_ms", "short_max_gap_max_ms", "long_prompt_tokens", "long_ttft_p50"],
-    "capacity": ["concurrency", "requests", "errors", "meets_slo", "output_tok_s", "ttft_p50", "ttft_p99", "tpot_p50_ms",
+    "capacity": ["concurrency", "requests", "errors", "meets_slo", "missed", "output_tok_s", "ttft_p50", "ttft_p99", "tpot_p50_ms",
                  "tpot_p99_ms", "max_users"],
 }
 

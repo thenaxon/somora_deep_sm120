@@ -282,6 +282,56 @@ class EngineLoop:
         if r.logprobs:
             self.tap.add(r.request_id, r.logprobs)
         self.stats["added"] += 1
+        self._profile_maybe_start(r)
+
+    # ------------------------------------------------------------------ SM120_PROFILE_PREFILL (diagnostics)
+    _prof = None
+
+    def _profile_maybe_start(self, r) -> None:
+        """SM120_PROFILE_PREFILL=N: profile (torch profiler, CPU + CUDA) from the N-th request this engine process
+        admits until its first token, i.e. its whole prefill, and write a trace plus a per-category table to
+        SM120_PROFILE_DIR (default /work). One shot per process; with --dp every rank counts its own requests."""
+        n = int(os.environ.get("SM120_PROFILE_PREFILL", "0") or 0)
+        if n <= 0 or self.stats["added"] != n or self._prof is not None:
+            return
+        try:
+            import torch
+            from torch.profiler import ProfilerActivity, profile
+            torch.cuda.synchronize()
+            p = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=False)
+            p.__enter__()
+            self._prof = (r.request_id, p, time.perf_counter(), self.stats["steps"], len(r.prompt_ids))
+            log.info("SM120_PROFILE_PREFILL: profiling request %d (%s, %d prompt tokens)", n, r.request_id,
+                     len(r.prompt_ids))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("SM120_PROFILE_PREFILL: could not start the profiler: %r", exc)
+            self._prof = ("", None, 0.0, 0, 0)
+
+    def _profile_stop(self, r) -> None:
+        rid, p, t0, s0, plen = self._prof
+        self._prof = ("", None, 0.0, 0, 0)  # one shot
+        try:
+            import torch
+            torch.cuda.synchronize()
+            wall = (time.perf_counter() - t0) * 1000
+            p.__exit__(None, None, None)
+            out = os.environ.get("SM120_PROFILE_DIR", "/work")
+            tag = f"prefill_r{self.cfg.get('dp_rank', 0)}_p{os.getpid()}"
+            path = os.path.join(out, tag)
+            p.export_chrome_trace(path + ".trace.json")
+            sys.path.insert(0, os.path.join(ROOT, "tests"))
+            import contextlib
+            import io
+            import prof_e2e
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                prof_e2e.summarize(f"prefill of {plen} tokens ({rid})", prof_e2e.kernels(p), wall,
+                                   self.stats["steps"] - s0)
+            open(path + ".txt", "w").write(buf.getvalue())
+            log.info("SM120_PROFILE_PREFILL: wrote %s.trace.json and %s.txt (wall %.0f ms)\n%s", path, path, wall,
+                     buf.getvalue())
+        except Exception as exc:  # noqa: BLE001
+            log.warning("SM120_PROFILE_PREFILL: could not write the profile: %r", exc)
 
     def _route(self, outs) -> None:
         for ptr in outs:
@@ -291,6 +341,8 @@ class EngineLoop:
                 continue
             if r.first_token_t is None:
                 r.first_token_t = time.perf_counter()
+                if self._prof is not None and self._prof[0] == r.request_id:
+                    self._profile_stop(r)
             r.n_out += 1
             row = self.tap.pop_row(o.request_id) if r.logprobs else None
             r.out.put(("token", int(o.token_id), bool(o.finished), str(o.finish_reason or ""), row))

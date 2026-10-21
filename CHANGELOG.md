@@ -19,6 +19,11 @@ before 1.0 any minor release may change interfaces.
 - `eval/quality_set.jsonl`: 8 tool-calling and 3 structured-output items; `eval/quality_check.py` scores them.
 
 ### Changed
+- Multi-GPU runbook: Hugging Face hub caches must be mounted at their root (snapshot files are symlinks into
+  `blobs/`); realistic image size (about 7 GB); building when the host cannot reach the repository; host-RAM
+  budgeting for the engram modes (per-rank memory, page cache vs. pinned memory, baseline stopped).
+- `eval/quality_check.py`: items can be marked `known_fail` (reported as KFAIL/KPASS, not counted). `math-reason`
+  is marked: the model answers 2 without thinking mode, independent of the engine.
 - Thinking-mode streaming sends the reasoning as `delta.reasoning_content` (it was sent as `content`).
 - Requests submitted after an engine crash now fail at once instead of waiting for `--request-timeout`.
 
@@ -33,7 +38,7 @@ before 1.0 any minor release may change interfaces.
   prefill of a new size (illegal instruction / illegal memory access in the decode graph replay). This also happens without
   tools. Eager mode is not affected. Details and a partial workaround: [docs/SERVER.md](docs/SERVER.md#tool-calling-and-structured-output).
 
-## [0.1.0] - unreleased
+## [0.1.0] - 2026-10-21
 
 First release. Experimental.
 

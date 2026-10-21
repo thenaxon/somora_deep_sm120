@@ -14,7 +14,11 @@ json_schema, field checks). A value-spec is a literal (strings compare case-inse
 {"len": n}. With --exec-code, the code check takes the first ```python block of the answer and runs it plus the
 asserts in a separate `python3 -I` process (10 s timeout, temp dir). Without --exec-code it only checks that a
 block was returned. Only use --exec-code against a model you trust.
+Scores are also reported per category (an item's "category", else "tool" / "json" / "image" by id prefix, else
+"core" for the general items).
 "needle": true builds a long-context retrieval prompt: a passkey 7319 hidden in --needle-tokens of filler.
+"known_fail": "<reason>" marks an item that the model itself is known to fail (not an engine problem). It is reported
+as KFAIL / KPASS and left out of the pass count and the exit status, so it cannot mask real regressions.
 
 Run it against both endpoints (DeepInfer and vLLM): on the real model both should pass (nearly) everything. A
 truncated test checkpoint is expected to fail; that only checks the plumbing.
@@ -168,6 +172,16 @@ def check(answer: str, expect: dict, exec_code: bool, message=None, request=None
     raise ValueError(f"unknown expectation {expect}")
 
 
+def category(it: dict) -> str:
+    """Scoring group: an item's "category", else tool / json by id prefix, else core (the original general set)."""
+    if it.get("category"):
+        return it["category"]
+    for c in ("tool", "json", "image"):
+        if it["id"].startswith(c + "-"):
+            return c
+    return "core"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--url", required=True)
@@ -184,7 +198,7 @@ def main() -> int:
     c.request("GET", u.path.rstrip("/").removesuffix("/v1") + "/v1/models")
     model = args.model or json.loads(c.getresponse().read())["data"][0]["id"]
     items = [json.loads(l) for l in open(args.set) if l.strip()]
-    rows, n_ok = [], 0
+    rows, n_ok, n_known = [], 0, 0
     for it in items:
         msgs = needle_messages(args.needle_tokens) if it.get("needle") else it["messages"]
         t0 = time.perf_counter()
@@ -199,14 +213,34 @@ def main() -> int:
         except Exception as exc:  # noqa: BLE001
             ans, usage, ok, note = "", {}, False, f"error: {exc!r}"[:200]
         dt = time.perf_counter() - t0
-        n_ok += ok
-        rows.append(dict(id=it["id"], ok=ok, note=note, seconds=dt, usage=usage, answer=ans[:2000]))
-        print(f"[{'PASS' if ok else 'FAIL'}] {it['id']:16s} {dt:6.1f}s {usage.get('prompt_tokens', '?'):>6} prompt tok"
+        known = it.get("known_fail")
+        if known:
+            n_known += 1
+            note = f"known fail: {known}" + (f"; {note}" if note else "")
+        else:
+            n_ok += ok
+        rows.append(dict(id=it["id"], category=category(it), ok=ok, known_fail=bool(known), note=note, seconds=dt,
+                         usage=usage, answer=ans[:2000]))
+        tag = ("KPASS" if ok else "KFAIL") if known else ("PASS" if ok else "FAIL")
+        print(f"[{tag}] {it['id']:16s} {dt:6.1f}s {usage.get('prompt_tokens', '?'):>6} prompt tok"
               f"{'  ' + note if note else ''}\n        {ans.strip()[:160]!r}", flush=True)
-    print(f"{n_ok}/{len(items)} passed ({model} @ {args.url})")
+    total = len(items) - n_known
+    cats: dict = {}
+    for r in rows:
+        c = cats.setdefault(r["category"], dict(passed=0, total=0, known_fail=0))
+        if r["known_fail"]:
+            c["known_fail"] += 1
+        else:
+            c["total"] += 1
+            c["passed"] += r["ok"]
+    for name, c in cats.items():
+        print(f"  {name:6s} {c['passed']}/{c['total']}" + (f" (+{c['known_fail']} known-fail)" if c["known_fail"] else ""))
+    print(f"{n_ok}/{total} passed" + (f" (+{n_known} known-fail item(s) not counted)" if n_known else "")
+          + f" ({model} @ {args.url})")
     if args.json:
-        json.dump(dict(url=args.url, model=model, passed=n_ok, total=len(items), rows=rows), open(args.json, "w"), indent=1)
-    return 0 if n_ok == len(items) else 1
+        json.dump(dict(url=args.url, model=model, passed=n_ok, total=total, known_fail=n_known, categories=cats, rows=rows),
+                  open(args.json, "w"), indent=1)
+    return 0 if n_ok == total else 1
 
 
 if __name__ == "__main__":

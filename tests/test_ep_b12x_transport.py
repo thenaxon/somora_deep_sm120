@@ -31,6 +31,11 @@ def main() -> int:
     from sm120_ep.moe import EPRoutedExperts
     dist.init_process_group("nccl")
     rank, world = dist.get_rank(), dist.get_world_size()
+    if world != 4:  # the b12x PCIe transport supports exactly 4 ranks
+        if rank == 0:
+            print(f"SKIP: b12x PCIe transport needs 4 ranks (got {world})", flush=True)
+        dist.destroy_process_group()
+        return 0
     local_rank = int(os.environ.get("LOCAL_RANK", rank))
     torch.cuda.set_device(local_rank)
     dev = torch.device("cuda", local_rank)

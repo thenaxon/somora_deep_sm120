@@ -3,7 +3,7 @@
 All notable changes to this project are documented here. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0 any minor release may change interfaces.
 
-## [0.2.1] - unreleased
+## [0.2.1] - 2026-10-21
 
 ### Fixed
 - Prefill with `--prefix-cache` was split into `--prefix-cache-grain`-sized engine steps (512 tokens by default): a

@@ -212,7 +212,26 @@ in-flight request holds its resized images there until its prefill: about 5.1 MB
 about 41 MB; a 2 GB pool per GPU is plenty). Pillow's decompression-bomb guard is off in DeepInfer's worker, which is why the
 server checks `--max-image-pixels` before anything is decoded.
 
-IMAGES_RESULTS_PLACEHOLDER
+**Test results** (RTX 5090 test machine). The truncated test checkpoints normally have a vision tower of zeros (shard
+`model-00001` holds the vision weights; `make_truncated_ckpt.py` synthesises zeros without it, `truncation.json:
+vision_synthesized`). `/work/ckpt3_vision` (layers 0/2/20, 16 experts, real ViT + aligner) was built for these checks.
+
+- `tests/test_images.py` (CPU): 4/4. `tests/test_images_server.py`: 19/19 on `ckpt3_vision` (`--deterministic`,
+  `--image-fetch-private`). This includes 4000x3000 input, PNG/JPEG/WebP/GIF/BMP, two images per message, streaming,
+  images in two turns, image + `tool_choice: "required"`, 4 image and 2 text requests at once, an http URL, and the 400s.
+  The first-token logits differ between two different pictures and repeat for the same picture. On `ckpt3`
+  (zero ViT): 18/18 plus that logit check as INFO; with `--nextn 3` (`ckpt3_mtp`): 19/19, logit checks skipped (no logprobs with MTP).
+- openai SDK image message (data: URL): passes.
+- **ViT + aligner vs DeepSeek's reference `vision.py`** (`tools/ref/vit_compare.py`). Same patches, reference in fp32 =
+  truth, reference in bf16 = noise floor, 5 synthetic pictures (448², 1344x896, 1600x600 text, 300x500 noise upscaled,
+  3000x2000 capped at 977 tokens). DeepInfer's rel-L2 / noise floor for patch_embed, block 0, block 15, block 31, ViT output
+  and aligner output: 0.65 to 1.15 everywhere. Aligner output cosine vs fp32: 0.9990 / 0.9807 / 0.9982 / 0.9996 / 0.9986;
+  the bf16 reference reaches 0.9992 / 0.9794 / 0.9985 / 0.9997 / 0.9985 on the same inputs. DeepInfer's preprocessing
+  matches an independent Pillow resize/normalise at cosine 1.000 (exact layout sizes) to 0.91 (a noise image, resize filter
+  differences). The ViT runs in DeepInfer's eager prefill path (`--graphs` does not capture it).
+- Before `fix/vit-sdpa-batch` the ViT attention shim fell back to torch's math SDPA kernel: about 10 GiB for a full-size
+  image, CUDA OOM, dead engine. Now 17 MiB extra.
+- Not tested yet: whether the full model answers questions about images (the quality set's `image` items), on the 4-GPU host.
 
 ## How the engine is driven (`server/engine.py`)
 

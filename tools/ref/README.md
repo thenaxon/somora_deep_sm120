@@ -19,6 +19,7 @@ conventionally mounted at `/ds41ref/inference`; by default `<repo>/third_party/d
 | `kernel_selftest.py` | Compares tilelang and torch kernels on random inputs, on the GPU. |
 | `compare_out.py` | Compares two output files, e.g. tilelang vs torch, or the reference vs a DeepInfer dump in the same format. |
 | `st_io.py` | Dependency-free streaming safetensors reader and writer that copies raw bytes. |
+| `vit_compare.py` | ViT + aligner stage-by-stage against the reference `vision.py` (same patches; fp32 truth, bf16 noise floor); needs real vision weights |
 | `run_ref.sh` | Runs the whole pipeline (`SRC`, `WORK`, `REF_SRC`, `CKPT`, `REFMP`, `OUT`, `PROMPT_JSON`, `MAKE_ARGS`, `RUN_ARGS`). |
 
 ## How to run (inside the container)

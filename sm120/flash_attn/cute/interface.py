@@ -30,9 +30,10 @@ def _flash_attn_fwd(
     for s, e in zip(bounds[:-1], bounds[1:]):
         if e <= s:
             continue
-        # [T, H, D] -> [H, T, D]
+        # [T, H, D] -> [1, H, T, D]: SDPA's flash/efficient kernels need a batch dim; with 3-D inputs torch falls back
+        # to the math kernel, which materialises the fp32 [H, T, T] scores (~10 GiB for a full-size image, T=8748)
         o = F.scaled_dot_product_attention(
-            q[s:e].transpose(0, 1), k[s:e].transpose(0, 1), v[s:e].transpose(0, 1), scale=scale
+            q[s:e].transpose(0, 1)[None], k[s:e].transpose(0, 1)[None], v[s:e].transpose(0, 1)[None], scale=scale
         )
-        out[s:e] = o.transpose(0, 1)
+        out[s:e] = o[0].transpose(0, 1)
     return out, None

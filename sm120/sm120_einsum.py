@@ -134,14 +134,16 @@ def fp8_einsum_bhr_hdr(a_t, sfa, b_t, sfb, d, gran_k) -> bool:
             so, so_s0, so_s1 = o, 0, 0
         if T == 0:
             return True
-        BM = 16 if T <= 16 else (32 if T <= 32 else (64 if T <= 256 else 128))
-        # decode: G * N/BN CTAs must cover the SMs (the weight stream is the cost) -> narrow N tiles
-        BN = int(os.environ.get("SM120_EINSUM_BN", "0")) or (32 if T <= 32 else (64 if T <= 256 else 128))
+        # decode: G * N/BN CTAs must cover the SMs (the weight stream is the cost) -> narrow N tiles. Prefill
+        # (RTX 5090 sweep, G=8 N=1024 K=4096, bit-identical across configs): 64x64 tiles up to T=2048 (T=512 211 vs
+        # 276 us, T=2048 721 vs 893 us), 128x128 above; 4 warps everywhere (T=4096 1452 vs 1749 us with 8 warps)
+        BM = 16 if T <= 16 else (32 if T <= 32 else (64 if T <= 2048 else 128))
+        BN = int(os.environ.get("SM120_EINSUM_BN", "0")) or (32 if T <= 32 else (64 if T <= 2048 else 128))
         grid = (G, triton.cdiv(T, BM), triton.cdiv(N, BN))
         _einsum_kernel[grid](a_t, a_t.stride(0), a_t.stride(1), _u8(sfa), sfa.stride(0), sfa.stride(1), sfa.stride(2),
                              b_t, b_t.stride(0), b_t.stride(1), _u8(sfb), sfb.stride(0), sfb.stride(1), sfb.stride(2),
                              o, o_s0, o_s1, so, so_s0, so_s1, T, N, K, OUT_FP8=out_fp8, BM=BM, BN=BN, BK=64,
-                             num_warps=4 if BM <= 64 else 8, num_stages=3)
+                             num_warps=4, num_stages=3)
         return True
     except Exception as exc:  # noqa: BLE001
         if os.environ.get("SM120_ATTN_STRICT", "0") == "1":

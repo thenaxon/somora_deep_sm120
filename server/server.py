@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import queue
+import signal
 import sys
 import threading
 import time
@@ -403,6 +404,10 @@ class App:
                                  if args.prefix_cache else None)
 
 
+def _sigterm(signum, frame):
+    raise KeyboardInterrupt
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--ckpt", required=True)
@@ -438,6 +443,9 @@ def main() -> int:
     ap.add_argument("--force-proxy", action="store_true", help=argparse.SUPPRESS)  # tests: proxy even with --dp 1
     ap.add_argument("--log-level", default="INFO")
     args = ap.parse_args()
+    # docker stop / kill -TERM: run the finally blocks (engine shutdown here, rank shutdown in the dp proxy) instead
+    # of dying in place; the default SIGTERM action skips them.
+    signal.signal(signal.SIGTERM, _sigterm)
     logging.basicConfig(level=args.log_level, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     if args.dp_rank is None and (args.dp > 1 or args.force_proxy):
         import dp_proxy

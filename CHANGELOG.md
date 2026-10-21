@@ -12,6 +12,10 @@ before 1.0 any minor release may change interfaces.
   memory per rank for image inputs. Sizing and the `/dev/shm/psm_*` leftovers after a crash are in
   `docs/MULTI_GPU_RUNBOOK.md` §3.
 
+- No more `/dev/shm/psm_*` leaks (2 GB per engine and stop): runtime patch P11 unlinks the multimodal pool's name after
+  the worker fork; `server.py` turns SIGTERM into a clean shutdown (as PID 1 the default action was to ignore it until
+  `docker stop` killed it), and the `--dp` proxy forwards it to the ranks.
+
 ### Added
 - `tests/mm_pool_check.py`: text+image requests through DeepInfer's own API, with and without the multimodal pool.
 

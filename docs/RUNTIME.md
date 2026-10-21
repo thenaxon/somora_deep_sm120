@@ -2,7 +2,7 @@
 
 This document covers the engine-level parts of the port: running DeepInfer's CUDA-graph decode and its DSpark (MTP)
 speculative decoding on SM120, the instrumentation used for validation, and the offline end-to-end benchmark.
-Relevant files: `sm120/sm120_patches.py` (runtime patches P6, P8, P9, P10, see [patches/PATCHES.md](../patches/PATCHES.md)),
+Relevant files: `sm120/sm120_patches.py` (runtime patches P6, P8, P9, P10, P11, see [patches/PATCHES.md](../patches/PATCHES.md)),
 `sm120/sm120_moe.py`, `sm120/sm120_capture.py`, `sm120/deep_gemm/_b12x.py`, `tools/run_deepinfer.py`,
 `tools/bench_e2e.py`. The GEMM/MoE graph contract is in [MOE_GEMM.md](MOE_GEMM.md) section 6, the attention side in
 [ATTENTION.md](ATTENTION.md) section 5.

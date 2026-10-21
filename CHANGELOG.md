@@ -3,7 +3,7 @@
 All notable changes to this project are documented here. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0 any minor release may change interfaces.
 
-## [Unreleased]
+## [0.2.0] - unreleased
 
 ### Added
 - Tool calling in `/v1/chat/completions`: `tools`, `tool_choice` (`auto`, `none`, `required`, named function),

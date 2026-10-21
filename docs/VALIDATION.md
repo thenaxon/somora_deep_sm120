@@ -33,7 +33,7 @@ Mounts: `/ckpt` = raw HF shards (ro), `/work` = work dir, `/ds41ref` = the refer
 ```bash
 docker run --rm -it --gpus '"device=0"' --ipc=host --shm-size=16g --entrypoint bash \
   -v $CKPT_HOST:/ckpt:ro -v $WORK_HOST:/work -v $REF_HOST/inference:/ds41ref/inference:ro -v $CACHE_HOST:/cache \
-  somora_deep_sm120:0.1.1
+  somora_deep_sm120:0.2.0
 
 # 0. sanity: the shims shadow the (absent) vendor libs, the patches are active
 python3 -c "import deep_gemm, deep_ep, sm120_patches; print(deep_gemm.__version__, deep_ep.__version__, sm120_patches.enabled())"

@@ -1,6 +1,6 @@
 # Compatibility
 
-Version 0.1.1 is built and tested with exactly these versions (pinned in `docker/Dockerfile`):
+Version 0.2.0 is built and tested with exactly these versions (pinned in `docker/Dockerfile`):
 
 | component | version |
 |---|---|
@@ -14,6 +14,7 @@ Version 0.1.1 is built and tested with exactly these versions (pinned in `docker
 | tilelang | 0.1.15 |
 | tile-kernels | 2.1.0 |
 | transformers | 4.51.3 (b12x needs >= 4.51) |
+| xgrammar | 0.2.2 (structured output; two bugs worked around in `server/tools.py`, see [docs/SERVER.md](docs/SERVER.md)) |
 | triton | as shipped with torch 2.13.0 |
 
 Other Python dependencies follow DeepInfer's `requirements.txt` at the pinned commit. The exact pins are in the Dockerfile.

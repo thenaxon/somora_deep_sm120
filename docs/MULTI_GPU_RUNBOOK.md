@@ -78,7 +78,8 @@ All 4 rank processes map the same files, so the page cache holds one copy.
     images: 2 GB covers about 400 full-resolution images.
   - `DEEPINFER_USE_MULTIMODAL_POOL=0` removes the pinned buffer; images then travel through the worker queue (same
     tokens on the test model, slower copies). Text-only serving does not use the pool.
-  - The OpenAI server does not take image inputs yet (planned for v0.2.0); the engine's vision path works on SM120.
+  - The OpenAI server does not take image inputs yet (planned for v0.2.0); the engine's vision path runs on SM120
+    (plumbing and kernel shapes checked; numerics with real vision weights not verified yet).
   - No `/dev/shm/psm_*` leftovers. Patch P11 unlinks the segment's name right after DeepInfer forks its multimodal
     workers, so the memory exists only while a process maps it, also after SIGKILL, OOM or `docker kill`. The server
     handles SIGTERM (`docker stop`; the server is PID 1 through `exec` in the entrypoint) with a clean shutdown, and

@@ -24,7 +24,8 @@ before 1.0 any minor release may change interfaces.
 - Start-up banner: somora lettering with "deep sm120", version, checkpoint, DP size and port
   (`server/banner.py`, `SM120_BANNER=0` disables it).
 - `tests/graph_replay_lazy_prep.sh`: regression test for the CUDA-graph crash (new prompt lengths after a request history).
-- `tests/mm_pool_check.py`: text+image requests through DeepInfer's own API, with and without the multimodal pool.
+- `tests/mm_pool_check.py`: text+image requests through DeepInfer's own API, with and without the multimodal pool
+  (pipeline check; the truncated test checkpoints carry no real vision weights).
 
 ### Changed
 - Multi-GPU runbook: Hugging Face hub caches must be mounted at their root (snapshot files are symlinks into

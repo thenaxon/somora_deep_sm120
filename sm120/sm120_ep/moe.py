@@ -19,8 +19,9 @@ Row counts per rank must match inside a collective:
     decode) a fixed capacity C = SM120_EP_DECODE_ROWS (default: the layer's max_num_decoding_tokens) rows per
     rank, padding rows masked (ids -1, weight 0); no host sync, graph-capturable with NCCL;
   * prefill (eager; DeepInfer's scheduler makes the step type uniform across DP ranks by vote, see
-    csrc/engine/scheduler.hpp NORMAL engine): the per-rank counts are all-gathered first (host sync) and
-    every rank pads to the maximum.
+    csrc/engine/scheduler.hpp NORMAL engine): every rank pads to the DP-wide maximum token count of the step,
+    synced once per step by dp_sync.py; without it the per-rank counts are all-gathered in every layer (host
+    sync).
 The step type comes from input_metadata.is_prompt when the caller passes it (runtime hook); without it,
 calls inside CUDA graph capture use the fixed capacity and eager calls the count exchange (correct as long
 as all ranks are eager or all are captured).
@@ -183,6 +184,10 @@ class EPRoutedExperts:
                 rows = self.decode_rows
                 if T > rows:
                     raise RuntimeError(f"EP decode step has {T} rows > SM120_EP_DECODE_ROWS={rows}")
+        elif dp_sync.active() and dp_sync._STATE["prefill_rows"] is not None:
+            rows = dp_sync._STATE["prefill_rows"]
+            if T > rows:  # the step's token count bounds every layer's T (would desync the collectives otherwise)
+                raise RuntimeError(f"EP prefill layer has {T} rows > the step's DP-max token count {rows}")
         else:
             rows = max(self.transport.all_gather_counts(T, x.device))
         send = self._pack(x, topk_idx, topk_weights, rows)

@@ -92,7 +92,11 @@ These are estimates, not measurements.
 memory), not P2P, although all pairs report peer access (topology NODE). NCCL's default P2P level only accepts paths
 up to PXB (a common PCIe switch), so GPUs behind different root ports of one CPU fall back to SHM. With the
 `--prefix-cache-grain 4096` workaround a 4096-token prefill step still took about 4 s there vs about 0.9 s on one
-RTX 5090.
+RTX 5090. With `NCCL_P2P_LEVEL=SYS` all 128 channels ran via P2P/CUMEM, but TTFT was identical (4k 4.2-4.5 s, 32k
+32.6 s): prefill is not bound by the collectives there (all-gather + reduce-scatter of 2048 rows: about 2 ms each).
+`tests/bench_ep_comm.py` on that host: b12x `PCIeTwoShotBF16` beats NCCL only at 1 row per rank (all-gather 13.7 vs
+25.0 us) and is 2-12x slower from 4 rows on, so the b12x transport is not a prefill speed-up there either; it stays
+opt-in for hosts where NCCL cannot use P2P at all.
 
 * **`NCCL_P2P_LEVEL`** (`server/dp_proxy.py`, `--dp > 1`): before the ranks start, the proxy runs a peer-copy
   self-test on all GPU pairs in a subprocess (`can_device_access_peer` plus a verified 16 MB copy, 60 s timeout). If

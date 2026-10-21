@@ -79,8 +79,11 @@ All 4 rank processes map the same files, so the page cache holds one copy.
   - `DEEPINFER_USE_MULTIMODAL_POOL=0` removes the pinned buffer; images then travel through the worker queue (same
     tokens on the test model, slower copies). Text-only serving does not use the pool.
   - The OpenAI server does not take image inputs yet (planned for v0.2.0); the engine's vision path works on SM120.
-  - A killed engine (SIGKILL, OOM, `docker kill`) does not unlink its segment. With `--ipc=host` the leftover
-    `/dev/shm/psm_*` files (2 GB each) stay in the host's `/dev/shm`; delete them after a crash.
+  - No `/dev/shm/psm_*` leftovers. Patch P11 unlinks the segment's name right after DeepInfer forks its multimodal
+    workers, so the memory exists only while a process maps it, also after SIGKILL, OOM or `docker kill`. The server
+    handles SIGTERM (`docker stop`; the server is PID 1 through `exec` in the entrypoint) with a clean shutdown, and
+    the `--dp` proxy forwards it to its ranks. Before v0.1.1 every stopped engine left a 2 GB `psm_*` file in the
+    host's `/dev/shm` (with `--ipc=host`); delete leftovers from older runs by hand.
 - **NUMA:** the image has libnuma1. On a multi-socket host add `--cap-add SYS_NICE`, otherwise the memory policy part of
   DeepInfer's binding is refused (CPU affinity still applies). Single-socket hosts skip the binding (patch P10).
 

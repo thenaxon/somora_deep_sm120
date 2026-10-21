@@ -14,6 +14,11 @@ before 1.0 any minor release may change interfaces.
   `docs/MULTI_GPU_RUNBOOK.md` §3.
 - `tests/run_server_tests.sh` stops the whole server process group and waits for GPU memory; the mid-decode server
   check no longer depends on timing under CUDA graphs.
+- No more `/dev/shm/psm_*` leaks (2 GB per engine and stop): runtime patch P11 unlinks the multimodal pool's name after
+  the worker fork; `server.py` turns SIGTERM into a clean shutdown (as PID 1 the default action was to ignore it until
+  `docker stop` killed it), and the `--dp` proxy forwards it to the ranks.
+- `/v1/completions` accepts a prompt of a single token id; after an engine crash, new requests fail at once instead of
+  waiting for the per-token timeout.
 
 ### Added
 - Start-up banner: somora lettering with "deep sm120", version, checkpoint, DP size and port

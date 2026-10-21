@@ -526,6 +526,36 @@ def _patch_bind_numa(mod):
 _NUMA_LOGGED: list = []
 
 
+@when_imported("deepinfer.ve.multimodal_processor")
+def _patch_mm_pool_unlink(mod):
+    """P11: unlink the multimodal pool's /dev/shm name (multiprocessing.shared_memory, psm_*) as soon as the worker
+    processes exist. They are forked (ForkProcessWithCrashHeader) and inherit the mapping, nothing reopens the
+    segment by name, so the memory now lives exactly as long as a process maps it: no psm_* is left behind after
+    SIGTERM/SIGKILL/OOM (DeepInfer only unlinks in LLMEngine.close(), which a killed server never reaches)."""
+    cls = mod.MultimodalProcessor
+    orig = cls._start_workers
+    if getattr(orig, "_sm120", False):
+        return
+
+    def _start_workers(self, num_workers):
+        orig(self, num_workers)
+        pool = mod.get_multi_modal_pool()
+        shm = getattr(pool, "_buffer_shm", None) if pool is not None else None
+        if shm is None:
+            return
+        try:
+            shm.unlink()  # shm_unlink + resource_tracker unregister
+        except FileNotFoundError:
+            pass
+        shm.unlink = lambda: None  # SharedTorchMemoryPool.close() unlinks again
+        print(f"[sm120_patches] multimodal pool /dev/shm/{shm.name} unlinked after fork "
+              f"({pool.total_bytes >> 20} MiB stay mapped until exit)", flush=True)
+
+    _start_workers._sm120 = True
+    cls._start_workers = _start_workers
+    _note("P11 MultimodalProcessor._start_workers: multimodal pool shm name unlinked after the worker fork")
+
+
 @when_imported("deepinfer")
 def _patch_attn_agent(mod):
     """Hand-off point for the attention shim's own DeepInfer patches (optional module)."""

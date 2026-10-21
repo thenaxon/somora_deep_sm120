@@ -327,6 +327,27 @@ def run_tests(args, cfg: Cfg, ckpt: str, M, E, tokenizer, device: torch.device) 
           f"{int(text.sum())} text positions x {di_hash.shape[2]} layers x {di_hash.shape[3]} cols; "
           f"image positions -1: {img_neg}; impl={'tile_kernels' if use_di else 'torch'}")
 
+    # T7: admission-time prefetch computes the same rows as DeepInfer (vectorised windows, block-wise hashing with
+    # look-back across block boundaries), and its page ranges cover every byte of those rows
+    pf = se.EngramPrefetcher.__new__(se.EngramPrefetcher)  # hashing only, no thread
+    pf.hash = (mult.cpu(), vs.cpu(), offs.cpu())
+    ok7, nrows = True, 0
+    for b in range(B):
+        comp = np.array([token_map[t] if m else -1 for t, m in zip(ids[b].tolist(), mask[b].tolist())], dtype=np.int64)
+        ok7 &= np.array_equal(se.ngram_windows(comp, cfg.max_ngram, pad, -1),
+                              se.build_ngram_token_ids(comp.tolist(), list(range(L)), cfg.max_ngram, pad, -1).numpy())
+        blocks = [pf.hash_rows(comp, p0, min(37, L - p0), pad, -1) for p0 in range(0, L, 37)]
+        ok7 &= torch.equal(torch.cat(blocks, dim=1), di_hash[b].permute(1, 0, 2).to(torch.int32))
+        rows = di_hash[b, :, li].reshape(-1).numpy().astype(np.int64)
+        rows = rows[rows >= 0]
+        nrows += rows.size
+        for width, base in ((cfg.head_dim, 664), (cfg.head_dim // 32, 4093)):  # unaligned plane offsets
+            r = se.page_ranges(rows * width + base, width)
+            lo, hi = r[:, 0], r[:, 0] + r[:, 1]
+            k = np.searchsorted(lo, rows * width + base, side="right") - 1
+            ok7 &= bool((k >= 0).all() and (rows * width + base + width <= hi[k]).all())
+    check("T7 prefetch rows", ok7, f"{B} prompts, {nrows} rows: windows, block-wise hashes and page coverage")
+
     # T3: lookups through the EngramBuffer shim vs official ParallelEngramEmbedding on safetensors rows
     from deep_ep._engram import EngramBuffer
 
@@ -478,6 +499,13 @@ def graph_check(cfg, table, cols, device, seed, prestage: bool, Tg: int = 16, re
         ref = se.dequant_rows(de, fe, cfg.head_dim)
         torch.cuda.synchronize()
         ok &= torch.equal(out.view(torch.int16), ref.view(torch.int16))
+        if table.weight is not None and not table.weight.is_cuda:  # and both against a plain read of the mmap
+            flat = new.reshape(-1).to(torch.int64).cpu()
+            w = torch.empty((flat.numel(), table.row_bytes), dtype=torch.uint8)
+            sc = torch.empty((flat.numel(), table.groups), dtype=torch.uint8)
+            table.gather_host(flat, w, sc)
+            mm = se.dequant_rows(w.view(torch.float8_e4m3fn).view(Tg, -1), sc.view(Tg, -1), cfg.head_dim)
+            ok &= torch.equal(mm.view(torch.int16), ref.cpu().view(torch.int16))
     ok &= buf.fetcher.graph_mode == ("prestage" if prestage else "async")
     buf.fetcher.owns_tables = False  # the table is shared with the other checks
     buf.destroy()

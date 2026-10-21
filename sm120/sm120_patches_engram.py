@@ -21,6 +21,9 @@ of them; `sm120_patches_engram.APPLIED` lists what ran.
         written into the graph's input_metadata_source by _prepare_input_tensors, incl. ZOS) and calls
         EngramBuffer.prestage(), which fills the static row buffers the captured hooks read. Inside the graph
         the fetch is only a view + sf transposition of those buffers (sm120_engram.EngramFetcher._graph_hooks).
+    E7  engine/llm_engine.py LLMEngine.add_request / abort_request report every admitted prompt to the engram
+        prefetcher (sm120_engram.EngramPrefetcher; E3 starts it, E6 hands it the hash metadata): its rows are read
+        into the page cache ahead of the prefill. Advisory only: the gather is unchanged.
     E4  (only SM120_ENGRAM_TK=torch) tile_kernels.engram.{engram_hash,fused_weight,engram_gate_fwd} ->
         sm120_engram torch versions (for bisecting the TileLang kernels on SM120).
 
@@ -173,6 +176,8 @@ def _patch_runtime(mod):
             e.release_storage()
         desc = ", ".join(f"{t.name}:{t.kind}:{t.rows}rows" for t in tables)
         _note(f"E3 EngramRuntime.initialize: attached {desc}")
+        if sm120_engram.start_prefetcher(tables) is not None:
+            _note("E3 engram prefetch at request admission on (SM120_ENGRAM_PREFETCH=0 turns it off)")
         if os.environ.get("SM120_ENGRAM_RESIDENCY", "1") != "0":
             _log_residency(sm120_engram, tables)
 
@@ -286,6 +291,9 @@ def _patch_model_registry(mod):
         orig(self, *args, **kwargs)
         if getattr(self, "engram_runtime", None) is not None:
             _ENGRAM_MODELS.append(self)
+            import sm120_engram  # hash metadata for the admission-time prefetch (E7)
+
+            sm120_engram.set_hash_metadata(self.ngram_multipliers, self.ngram_vocab_sizes, self.ngram_offsets)
 
     __init__._sm120_engram = True
     cls.__init__ = __init__
@@ -333,6 +341,35 @@ def _patch_graph_replay(mod):
     _note("E6 CudaGraphRunner.replay: engram rows prestaged before every replay")
 
 
+# ------------------------------------------------------------------------------------------------ E7
+def _patch_admission(mod):
+    """E7: LLMEngine.add_request / abort_request report prompts to the Engram prefetcher (sm120_engram.EngramPrefetcher):
+    every entry point (offline LLM, server) gets the prefetch; the server also calls it earlier, at submit."""
+    cls = mod.LLMEngine
+    if getattr(cls.add_request, "_sm120_engram", False):
+        return
+    orig_add, orig_abort = cls.add_request, cls.abort_request
+
+    def add_request(self, /, user_id, request_id, sampling_params, prompt_token_ids, *args, **kwargs):
+        seq = orig_add(self, user_id, request_id, sampling_params, prompt_token_ids, *args, **kwargs)
+        if seq is not None:
+            import sm120_engram
+
+            sm120_engram.prefetch_prompt(request_id, prompt_token_ids, admitted=True)
+        return seq
+
+    def abort_request(self, request_id):
+        import sm120_engram
+
+        for rid in [request_id] if isinstance(request_id, str) else list(request_id):
+            sm120_engram.prefetch_cancel(rid)
+        return orig_abort(self, request_id)
+
+    add_request._sm120_engram = True
+    cls.add_request, cls.abort_request = add_request, abort_request
+    _note("E7 LLMEngine.add_request / abort_request: prompts reported to the engram prefetcher")
+
+
 # ------------------------------------------------------------------------------------------------ E4
 def _patch_tile_kernels(mod):
     import sm120_engram
@@ -362,5 +399,6 @@ def install() -> None:
     when("deepinfer.model_executor.models.v4_modules.engram")(_patch_runtime)
     when("deepinfer.model_executor.models.deepseek")(_patch_model_registry)
     when("deepinfer.worker.cuda_graph_runner")(_patch_graph_replay)
+    when("deepinfer.engine.llm_engine")(_patch_admission)
     if os.environ.get("SM120_ENGRAM_TK", "").strip().lower() == "torch":
         when("tile_kernels.engram")(_patch_tile_kernels)

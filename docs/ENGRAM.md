@@ -87,11 +87,20 @@ above is met exactly, so the FP8 GEMM sees the same operand as on SM100.
 |---|---|---|---|---|
 | `host` (default) | mmap of the HF shard (`MADV_RANDOM`); page cache = RAM tier | D2H of the ids + one stream sync, CPU `index_select` in worker threads (each page-faults its rows from NVMe), pinned staging, async H2D. The layer-14 gather runs while the GPU computes layers 1-13 | yes (§3.1) | none beyond page cache |
 | `uva` | the same mmap, `cudaHostRegister(Mapped\|ReadOnly)`, CUDA view | GPU `index_select` over PCIe, no host sync | yes | >= table size (pinned) |
-| `uring` | b12x `DiskRowCache` (O_DIRECT io_uring, `b12x.sequence._shared.disk_table`) | per-batch reads into mapped-host staging, then a GPU copy | yes (§3.1) | staging only; container needs io_uring allowed by seccomp and a memlock limit (§7) |
+| `uring` | b12x `DiskRowCache` (O_DIRECT io_uring, `b12x.sequence._shared.disk_table`) for the weight rows; scale rows and prefill-sized batches (>= `SM120_ENGRAM_URING_MMAP_TOKENS` tokens, default 256) through the mmap like `host` | decode: per-batch reads into mapped-host staging, then a GPU copy; prefill: as `host` | yes (§3.1) | staging only; container needs io_uring allowed by seccomp and a memlock limit (§7) |
 | (tensors) | `EngramBuffer.write` (stock path, enp=1 only), CPU or CUDA | as above | GPU: yes | as stock |
 
 `SM120_ENGRAM_PREFAULT=1` reads the whole table into the page cache at start-up. It only makes sense when free RAM
 exceeds the table size.
+
+**Resident scale planes** (`SM120_ENGRAM_SCALES=resident`, default, `host` and `uring`). A lookup reads one 256-byte
+weight row and one 8-byte E8M0 scale row, which sit on different 4 KiB pages: a cold lookup used to be two random
+NVMe reads. The scale planes are 2.9 GiB per table (5.7 GiB for both, one page-cache copy for all ranks of a host).
+`open_table` reads them sequentially at attach (about 1 s each on the RTX 5090 test machine) and
+`post_load_cache_policy` once more after all ranks have loaded (their weight streaming may have evicted them). Every
+lookup touches the scale pages, so the LRU keeps them. A cold lookup is then one read: cold 4k-token gather 0.78 s ->
+0.30 s (one process), 1.65 s -> 1.16 s (4 processes at once, NVMe-bound at about 0.8 M random reads/s). `uring` then
+reads only the weight rows with O_DIRECT. `SM120_ENGRAM_SCALES=disk` restores the old behaviour.
 
 ### 3.1 CUDA graphs
 
@@ -134,10 +143,12 @@ Device and `uva` tables gather on the GPU inside the graph directly.
   101 GB shard on a host with less RAM+swap, so the stock loader fails with "HF shard is unreadable". Only `keys()` and
   `get_slice().get_shape()/get_dtype()` are needed there; the ordinary tensors in that shard are read by DeepInfer's
   own pread-based `_TensorReader`.
-- **E6** `DeepseekModel.__init__` registers models that use engram; `CudaGraphRunner.replay` prestages rows, but only
-  in `SM120_ENGRAM_GRAPH=prestage`.
+- **E6** `DeepseekModel.__init__` registers models that use engram (and hands their hash tensors to the prefetcher);
+  `CudaGraphRunner.replay` prestages rows, but only in `SM120_ENGRAM_GRAPH=prestage`.
+- **E7** `LLMEngine.add_request` / `abort_request` report admitted prompts (in admission order) to the prefetcher and
+  cancel aborted ones (§3.3). E3 starts the prefetcher.
 
-`SM120_ENGRAM_PATCHES=0` disables all of them. Hashing, the gate (tile_kernels), the wkv GEMM (deep_gemm shim) and the
+`SM120_ENGRAM_PATCHES=0` disables all of them (E1-E7). Hashing, the gate (tile_kernels), the wkv GEMM (deep_gemm shim) and the
 C++ windows are unchanged DeepInfer code.
 
 **Why not `b12x.sequence.engram` as the op.** Its hash has the same semantics, but it is bound to vLLM request state
@@ -150,6 +161,37 @@ wants the fp8 rows and sf. DeepInfer already computes the hash itself. b12x's O_
 read through `sm120_engram.EngramHostTable` from the mmap. `NgramHashState`, `EngramLayout` and `Engram` (wkv + gate)
 stay the official code. `tokenizer_for_engram()` adapts a raw `tokenizers.Tokenizer` to what
 `build_compressed_token_map` expects.
+
+### 3.3 Prefetch at request admission (`EngramPrefetcher`)
+
+The rows a prompt needs are fully determined by its token ids. When a request is submitted (`server/engine.py`
+`EngineLoop.submit`, and E7 for every `LLMEngine.add_request`), its prompt goes to a per-process prefetcher. A
+background thread works through the queued prompts in blocks of `SM120_ENGRAM_PREFETCH_BLOCK` tokens (4096, one
+prefill chunk):
+- It hashes the block on the CPU exactly as DeepInfer does: compressed ids (`CompressedTokenizer.encode`), n-gram
+  windows (a vectorised `fill_engram_row`, with look-back across block boundaries), `engram_hash`. That is about 1 ms
+  per 1k tokens.
+- It reads the weight rows through the mmap into a scratch buffer from `SM120_ENGRAM_PREFETCH_THREADS` threads (16).
+  This is the `touch` method, the default; `=fadvise` issues `posix_fadvise(WILLNEED)` for the page ranges, sorted and
+  coalesced, from a small C helper built with the system compiler.
+
+The NVMe reads overlap the queue wait and the GPU compute of earlier chunks. The prefill's own gather then finds the
+rows in the page cache: 17-35 ms per 4096-token chunk and layer instead of 250 ms.
+- **Exact:** the data path is unchanged (same rows, same file), so the results are bit-identical. T7 checks that the
+  prefetcher computes exactly DeepInfer's row ids and that its page ranges cover every row. A wrong or late prefetch
+  only costs I/O.
+- **Order:** E7 reports prompts in the scheduler's admission order. The server's earlier submit-time call can be out
+  of order across HTTP threads, so admitted requests are served in admission order. Without that, the second of 4
+  concurrent 32k prompts often read the wrong prompt's rows.
+- **Bounded:** at most `SM120_ENGRAM_PREFETCH_AHEAD` prompt tokens (32768, about 6 GiB of page cache for both tables)
+  are read ahead of what the prefills have consumed.
+- **Cancellation:** abort removes a queued request.
+- **Graph-safe:** host-only work outside any graph.
+- **`touch` vs `fadvise`:** `touch` maps the pages like the gathers do. `fadvise` pages are unmapped, and the kernel
+  reclaims those first under page-cache pressure, which is before they are used: `fadvise` measured 21 s against
+  `touch` 16 s total gather time over the same prompt series.
+- **Off switch:** `SM120_ENGRAM_PREFETCH=0`.
+- **Prefix cache:** a prompt prefix served from the prefix cache is prefetched anyway (wasted I/O, no harm).
 
 ## 4. Correctness notes
 
@@ -212,6 +254,45 @@ page cache dropped first):
 - `host` warm: about 15 M rows/s (3.9 GB/s gathered). `host` cold: about 0.3-0.4 M rows/s (each row costs a weight and
   a scale page fault); more threads barely help, so the NVMe or fault path is the limit.
 - `uring`: a flat 0.3 M rows/s; O_DIRECT never uses the page cache.
+- Both lines were measured with the scale planes on disk. Cold per-row costs, one process, 98k random rows:
+
+  | how | weight and scale rows from disk | weight rows only (scales resident) |
+  |---|---|---|
+  | page faults, 32 threads | 0.24 M rows/s | 0.76 M rows/s |
+  | `posix_fadvise(WILLNEED)` from a C helper, 32 threads, then the gather | — | 0.67 M rows/s |
+  | 4x the rows in one process | — | 0.68-0.80 M rows/s |
+
+  The device tops out at about 0.8 M random 4 KiB reads per second (Samsung 990 PRO behind LVM). Coalescing adjacent
+  pages saves little: 98k rows touch 97.7k ranges. Per-row cost can therefore only go down by issuing fewer reads (the
+  resident scales) and by hiding them (prefetch).
+
+**Prefill TTFT with a cold engram cache** (server on `ckpt_full`, engram on layers 1 and 14). Setup:
+- Shards 47/48 were dropped from the page cache before the server started.
+- Every request uses fresh random token ids, so every lookup is effectively cold.
+- `--max-num-batched-tokens 4096`. Repeated runs vary by about ±5 %.
+- before = `fix/prefill-throughput`; after = resident scales + prefetch + `uring` prefill through the mmap; ablation =
+  after with `SM120_ENGRAM_PREFETCH=0`.
+
+TTFT in seconds; "wall" is until the last of the concurrent requests has its first token.
+
+| case | no engram | `host` before | `host` after | `host` ablation | `uring` before | `uring` after | `uring` ablation |
+|---|---|---|---|---|---|---|---|
+| 4k x1 (second request) | 0.81 | 1.20 | 0.98 | 0.97 | 1.44 | 0.89 | 0.97 |
+| 32k x1 | 6.29 | 9.23 | 6.65 | 7.74 | 11.36 | 6.64 | 7.90 |
+| 4k x4, wall | 3.13 | 4.22 | 3.33 | 3.86 | 5.67 | 3.31 | 3.85 |
+| 32k x4, wall | 25.13 | 32.70 | 26.11 | 31.23 | 45.41 | 25.99 | 30.39 |
+| engram gather time, whole series | — | 27.5 s | 3.3 s | 19.1 s | — | 2.9 s | 18.0 s |
+
+What engram adds on top of the no-engram prefill:
+- 32k prompt: 2.94 s -> 0.36 s (`host`), 5.07 s -> 0.35 s (`uring`).
+- 4 x 32k: 7.6 s -> 1.0 s (`host`), 20.3 s -> 0.9 s (`uring`).
+- 4k prompt: 0.39 s -> 0.17 s (`host`), 0.63 s -> 0.08 s (`uring`). This case gets the resident scales but no
+  overlap.
+- `uring` prefill now runs through the mmap (prefetched rows); decode stays O_DIRECT.
+
+The 4-rank case (4 processes gathering cold 4k prefills at once, `conc4.py`) went from 1.65 s to 1.16 s per prefill.
+That is NVMe-bound; prefetch hides it as far as compute time allows. Exactness: `tests_engram.py` T0-T7 pass for
+layers 1 and 14 in `host` and `uring`.
 
 **CUDA graphs vs eager** (`tests_engram_graph.sh`, teacher-forced, 16 decode steps, decode KL over the top 50 against
 an eager run):
@@ -255,6 +336,9 @@ python3 /opt/sm120/tests/tests_engram.py --ckpt /ckpt --skip-tests --bench --ben
 SM120_ENGRAM_MODE=uring python3 /opt/sm120/tests/tests_engram.py --ckpt /ckpt --skip-tests --bench --bench-all-layers
 # DeepInfer with engram: a truncated checkpoint that keeps layer 1 + the symlinked shard 00047
 SM120_ENGRAM_MODE=host python3 /opt/sm120/tools/run_deepinfer.py --ckpt /work/ckpt_yoco_engram ...
+# prefill TTFT with a cold engram cache, one server per mode (docker host; see the script header)
+IMG=somora_deep_sm120:0.2.0 CKPT_DIR=... WORK=... CACHE_DIR=... MODEL=/work/ckpt_full \
+  MODES="host host_nopf:SM120_ENGRAM_PREFETCH=0 uring" bash tests/engram_cold_ttft.sh
 # CUDA graphs: graph vs eager (teacher forced, negative control); decode cost with vs without engram
 bash /opt/sm120/tests/tests_engram_graph.sh
 CK=/work/ckpt_full PROMPT=/work/prompt_ids.json REF=/work/full_short_ref.pt \
@@ -305,12 +389,20 @@ original shard directory must be visible at the same absolute path wherever the 
 | `SM120_ENGRAM_THREADS` | 32 | host gather threads |
 | `SM120_ENGRAM_MIN_CHUNK` | 64 | minimum rows per gather task |
 | `SM120_ENGRAM_URING_QD` | 128 | io_uring queue depth (`uring` mode) |
+| `SM120_ENGRAM_URING_MMAP_TOKENS` | 256 | `uring`: batches of at least this many tokens (prefill chunks) gather through the mmap, so prefetched rows hit the page cache; smaller ones (decode) are O_DIRECT reads |
+| `SM120_ENGRAM_SCALES` | `resident` | read the scale planes into the page cache at attach and after load (one NVMe read per cold lookup instead of two); `disk` = old behaviour |
+| `SM120_ENGRAM_PREFETCH` | 1 | read a prompt's rows into the page cache from request admission on (§3.3) |
+| `SM120_ENGRAM_PREFETCH_METHOD` | `touch` | `touch` (threads read the rows through the mmap) or `fadvise` (posix_fadvise WILLNEED from a C helper) |
+| `SM120_ENGRAM_PREFETCH_AHEAD` | 32768 | prompt tokens read ahead of the prefills' consumption (page cache: about 192 KiB per token for both tables) |
+| `SM120_ENGRAM_PREFETCH_BLOCK` | 4096 | tokens per prefetch step |
+| `SM120_ENGRAM_PREFETCH_THREADS` | 16 | prefetch I/O threads |
+| `SM120_ENGRAM_TRACE` | 0 | 1 prints one line per prefill gather and prefetch block (timing, prefetch position) |
 | `SM120_ENGRAM_SWITCH_INTERVAL` | 0.2 ms | Python GIL switch interval while the `async` service thread runs |
 | `SM120_ENGRAM_TK` | (tile_kernels) | `torch` replaces the TileLang Engram ops with torch ports (E4) |
-| `SM120_ENGRAM_PATCHES` | 1 | 0 disables E1-E6 |
+| `SM120_ENGRAM_PATCHES` | 1 | 0 disables E1-E7 |
 | `SM120_ENGRAM_LAZY` | 1 | 0 keeps the stock table loader (E1, E2, E5 off) |
 | `SM120_ENGRAM_CKPT` | HF dir | where E2 looks for the table shards |
-| `SM120_ENGRAM_STATS` | 0 | 1 prints the fetch / gather / wait statistics (`[sm120_engram] stats (pid, device) {...}`) at exit and every `SM120_ENGRAM_STATS_INTERVAL` seconds (default 60) while they change |
+| `SM120_ENGRAM_STATS` | 0 | 1 prints the fetch / gather / wait statistics (`[sm120_engram] stats (pid, device) {...}`, and `prefetch stats`) at exit and every `SM120_ENGRAM_STATS_INTERVAL` seconds (default 60) while they change |
 | `DEEPINFER_ENGRAM_FORCE_GPU_STORAGE` | 0 | stock DeepInfer: put the table slice in GPU memory |
 
 ## 9. Open points
@@ -323,3 +415,10 @@ original shard directory must be visible at the same absolute path wherever the 
 4. DeepInfer's `skip_load` (dummy weights) path still allocates the full tables (`torch.zeros`); not patched.
 5. E2 assumes table and scale live in safetensors shards under the HF dir (or `SM120_ENGRAM_CKPT`) and resolve through
    DeepInfer's `resolve_hf_name`.
+6. Prefetch, test machine (62 GB RAM): in a series of 4 x 32k-token prompt batches, every second batch is about 5 s
+   slower (31 s instead of 26 s; without engram 25 s). The gathers of its 2nd and 3rd prompt miss the page cache even
+   though their rows were read ahead. This is most likely reclaim once the page cache is full. Unmapping the consumed
+   weight pages (`MADV_DONTNEED`) made it worse: the gathers stalled behind the zap. The prefetcher does not see which
+   chunk the scheduler runs next: it assumes FIFO prefill in admission order (DeepInfer's behaviour in these tests).
+7. Prefetch cannot help a lone request's first chunk, whose gather starts right after admission. For that chunk only the
+   resident scales help.

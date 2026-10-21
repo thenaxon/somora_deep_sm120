@@ -104,10 +104,19 @@ class EngineLoop:
             req.out.put(("error", f"engine is not running: {self._error!r}"))
             return req
         self._inbox.put(("add", req))
+        eng = sys.modules.get("sm120_engram")  # Engram rows of the prompt into the page cache while it waits for a slot
+        if eng is not None and req.prompt_ids is not None:
+            try:
+                eng.prefetch_prompt(req.request_id, req.prompt_ids)
+            except Exception:  # noqa: BLE001 - advisory only
+                pass
         return req
 
     def abort(self, request_id: str) -> None:
         self._inbox.put(("abort", request_id))
+        eng = sys.modules.get("sm120_engram")
+        if eng is not None:
+            eng.prefetch_cancel(request_id)
 
     def shutdown(self) -> None:
         self._stop.set()

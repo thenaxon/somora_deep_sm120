@@ -176,20 +176,14 @@ and `BadRequestError`.
 | `ckpt3`, eager, `--deterministic` | 36/36 | n/a | incl. greedy tool-call stream == non-stream; `test_server.py` 17/17 |
 | `ckpt3`, eager, `--prefix-cache` (grain 128) | 36/36 | 10/10 | repeated tool prompts hit the cache, constrained requests bypass it |
 | `ckpt3_mtp`, eager, `--nextn 3` | 34/34 | 10/10 | constrained decoding works with MTP draft verification |
-| `ckpt3`, `--graphs` (fresh server) | constrained single and 9-way concurrent requests work | | see the CUDA-graph issue below |
-| `ckpt3` / `ckpt3_mtp`, `--graphs`, full test run | fails part-way | | the engine dies after some request history (below) |
+| `ckpt3`, `--graphs` (v0.1.1) | 35/35 | 11/11 | images 18/18; `test_server.py` 14/14 |
+| `ckpt3`, `--graphs --prefix-cache` | 36/36 | 11/11 | images 18/18 |
+| `ckpt3_mtp`, `--graphs --nextn 3` | 34/34 | 11/11 | images 19/19 |
+| `ckpt3_vision`, `--graphs` (real ViT weights) | 35/35 | 11/11 | images 18/18 (different pictures change the logits) |
+| `ckpt3`, `--graphs`, 19 requests of 469 tokens, then 9 concurrent constrained requests | 9/9 valid | | server healthy; this crashed before v0.1.1 |
 
 A random model can run out of `max_tokens` inside an unbounded JSON string (`json_object`) or never close its reasoning
 (thinking mode); the tests report those cases as INFO, not as failures.
-
-**Known issue (v0.1.0, CUDA graphs, not specific to tools).** With `--graphs`, a server that has already served some requests can
-lose its engine when a prefill of a size it has not seen before comes in: CUDA "illegal instruction" / "illegal memory access"
-in the decode graph replay, a segfault in `cuGraphLaunch`, or NaN in the MoE gate. Plain token-id completions reproduce it:
-19 requests of 469 prompt tokens, then one of 549 or 30 tokens. Eager mode is not affected. Sending one prompt of every
-power-of-two length up to `--max-num-batched-tokens` right after start-up avoids the crashes from new prompt sizes
-(`test_tools_server.py --warm-prefill`). A batch of 9 constrained requests after such a history still crashed. Until this is
-fixed, use eager mode (`--no-graphs` in the image) for tool calling and structured output. After a crash, `/health` reports
-`dead` and requests fail immediately.
 
 ## Image input
 

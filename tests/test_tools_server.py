@@ -149,10 +149,6 @@ def main() -> int:
     ap.add_argument("--nondeterministic-ok", action="store_true",
                     help="server runs b12x MoE (not --deterministic): greedy repeat comparisons are INFO")
     ap.add_argument("--prefix-cache", action="store_true", help="server runs --prefix-cache (small grain): test hits")
-    ap.add_argument("--warm-prefill", action="store_true",
-                    help="first send one prompt of every power-of-two length up to 4096 tokens (works around the "
-                         "CUDA-graph crash on the first prefill of a new prompt-length bucket after earlier requests, "
-                         "see docs/SERVER.md)")
     args = ap.parse_args()
     if args.nondeterministic_ok:
         SOFT.add("tools greedy stream == non-stream")
@@ -174,9 +170,6 @@ def run(cl, args) -> None:
         {"id": "call_1", "type": "function", "function": {"name": "get_weather",
                                                           "arguments": '{"city": "Vienna", "unit": "celsius"}'}}]},
         {"role": "tool", "tool_call_id": "call_1", "content": '{"temp": 21, "sky": "clear"}'}]
-    if args.warm_prefill:
-        for n in [2 ** k for k in range(13)] + [4000]:
-            cl.post("/v1/completions", dict(model=model, prompt=[100 + i % 1000 for i in range(n)], max_tokens=2))
 
     # 1. tool_choice required / named / parallel_tool_calls false, non-streaming
     for label, extra, allowed in [

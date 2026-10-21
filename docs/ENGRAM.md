@@ -298,7 +298,10 @@ original shard directory must be visible at the same absolute path wherever the 
 | `SM120_ENGRAM_MODE` | `auto` (= `host`) | `host`, `uva`, `uring` (see §3); the serving image sets `host` |
 | `SM120_ENGRAM_GRAPH` | `async` | CUDA-graph fetch mode: `async` or `prestage` |
 | `SM120_ENGRAM_PRESTAGE` | 1 | 0 skips prestaging (negative control only) |
-| `SM120_ENGRAM_PREFAULT` | 0 | 1 reads the whole table into the page cache at start-up |
+| `SM120_ENGRAM_PREFAULT` | 0 | 1 reads the whole tables into the page cache. The server does it once after every rank has loaded its weights, before it accepts requests (`--dp`: the proxy asks rank 0), and skips it when the tables exceed MemAvailable (use `uring` there) |
+| `SM120_ENGRAM_PREFAULT_AT` | `attach` (library), `ready` (server) | when the prefault runs |
+| `SM120_ENGRAM_DROP_WEIGHT_PAGES` | 1 | server: after load, drop the other shards' clean page-cache pages (posix_fadvise DONTNEED) so they do not compete with the tables |
+| `SM120_ENGRAM_RESIDENCY` | 1 | log the tables' page-cache residency and MemAvailable at attach and after load (mincore) |
 | `SM120_ENGRAM_THREADS` | 32 | host gather threads |
 | `SM120_ENGRAM_MIN_CHUNK` | 64 | minimum rows per gather task |
 | `SM120_ENGRAM_URING_QD` | 128 | io_uring queue depth (`uring` mode) |
@@ -307,7 +310,7 @@ original shard directory must be visible at the same absolute path wherever the 
 | `SM120_ENGRAM_PATCHES` | 1 | 0 disables E1-E6 |
 | `SM120_ENGRAM_LAZY` | 1 | 0 keeps the stock table loader (E1, E2, E5 off) |
 | `SM120_ENGRAM_CKPT` | HF dir | where E2 looks for the table shards |
-| `SM120_ENGRAM_STATS` | 0 | 1 prints a per-fetch timing summary at exit |
+| `SM120_ENGRAM_STATS` | 0 | 1 prints the fetch / gather / wait statistics (`[sm120_engram] stats (pid, device) {...}`) at exit and every `SM120_ENGRAM_STATS_INTERVAL` seconds (default 60) while they change |
 | `DEEPINFER_ENGRAM_FORCE_GPU_STORAGE` | 0 | stock DeepInfer: put the table slice in GPU memory |
 
 ## 9. Open points

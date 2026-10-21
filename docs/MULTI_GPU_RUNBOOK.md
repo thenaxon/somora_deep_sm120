@@ -51,11 +51,22 @@ PyPI, the PyTorch wheel index and GitHub (for the pinned DeepInfer commit).
 
 ## 3. Engram mode (by free host RAM; see [ENGRAM.md](ENGRAM.md) §7)
 
-| free RAM | mode | flags |
+The two engram tables are about 203 GB (189 GiB). What counts is the memory left **after** the 4 ranks have started:
+each rank holds its own CUDA context, pinned staging, the 2 GB multimodal pool and loader buffers (budget about
+10 GB per rank, about 40 GB for 4). The server logs `MemAvailable` together with the tables' page-cache residency
+at start-up and again after the post-load step (`[sm120_engram] engram tables resident in the page cache ...`).
+
+| MemAvailable after start-up | mode | flags |
 |---|---|---|
-| >= 260 GB | `uva`: one pinned copy, pure GPU gathers (untested) | `-e SM120_ENGRAM_MODE=uva --ulimit memlock=-1` |
-| 203-260 GB | `host` + prefault (page cache keeps both tables) | `-e SM120_ENGRAM_MODE=host -e SM120_ENGRAM_PREFAULT=1` |
-| < 203 GB | `host` (page cache as LRU, NVMe serves misses) or `uring` (O_DIRECT, no cache pollution; needs io_uring allowed by seccomp) | `-e SM120_ENGRAM_MODE=host` (default) or `=uring`, plus `-e SM120_ENGRAM_THREADS=16` |
+| >= tables + 10 % (about 225 GB; i.e. about 265 GB free before start-up) and room to page-lock them | `uva`: one pinned copy, pure GPU gathers (untested) | `-e SM120_ENGRAM_MODE=uva --ulimit memlock=-1` |
+| >= tables + 10 % (about 225 GB) | `host` + prefault: once all ranks have loaded their weights, rank 0 drops the weight shards' page-cache pages and reads both tables into the page cache | `-e SM120_ENGRAM_MODE=host -e SM120_ENGRAM_PREFAULT=1` |
+| below that (e.g. 246 GB total RAM: about 190 GB after start-up) | **`uring`** (O_DIRECT reads per lookup batch, no page-cache thrash, flat latency) | `-e SM120_ENGRAM_MODE=uring -e SM120_ENGRAM_THREADS=16 --security-opt seccomp=unconfined --ulimit memlock=-1` |
+
+`host` without prefault also works below the threshold (page cache as LRU, NVMe serves misses), but its latency
+depends on what else the cache holds; on the RTX 5090 test machine a 4k-token prefill with a cold cache costs
+0.4-0.7 s more than with the rows cached, `uring` the same as a cold `host` cache. `uring` needs io_uring, which
+Docker's default seccomp profile blocks ("io_uring initialization failed: Operation not permitted"), and locked
+memory for its registered buffers ("Cannot allocate memory" without `--ulimit memlock=-1`).
 
 All 4 rank processes map the same files, so the page cache holds one copy.
 

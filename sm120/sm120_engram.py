@@ -24,7 +24,12 @@ Environment (all optional):
     SM120_ENGRAM_THREADS=<n>                CPU gather threads (default 32; page faults are I/O bound)
     SM120_ENGRAM_CHUNK=<rows>               rows per gather task (default 4096)
     SM120_ENGRAM_ADVICE=random|normal       madvise for the mmap (default random: no 128 KiB readahead per row)
-    SM120_ENGRAM_PREFAULT=0|1               read the whole table into the page cache at attach ("ram mode")
+    SM120_ENGRAM_PREFAULT=0|1               read the whole table into the page cache ("ram mode"): at attach, or
+                                            with SM120_ENGRAM_PREFAULT_AT=ready (server default) once all ranks
+                                            have loaded their weights (post_load_cache_policy)
+    SM120_ENGRAM_DROP_WEIGHT_PAGES=1|0      server: drop the other shards' page-cache pages after load
+    SM120_ENGRAM_STATS=0|1                  print fetch / gather / wait statistics at exit and every
+                                            SM120_ENGRAM_STATS_INTERVAL seconds (default 60) while they change
     SM120_ENGRAM_CKPT=<dir>                 directory used to resolve shards (default: the loader's hf_dir)
     SM120_ENGRAM_URING_QD=<n>               io_uring queue depth for mode=uring (default 128)
 
@@ -221,6 +226,60 @@ def resident_bytes(path: str, offset: int = 0, length: int | None = None, chunk:
         return None
 
 
+_TABLES: list = []  # every checkpoint-backed table opened in this process (post_load_cache_policy)
+
+
+def post_load_cache_policy(ckpt_dir: str | None) -> dict:
+    """Page-cache policy after the weights of every rank are loaded (server: once, on one process per host).
+
+    1. posix_fadvise(DONTNEED) on the checkpoint's other *.safetensors shards: their pages served the weight load
+       and now only compete with the Engram tables for the page cache (clean, read-only pages; pages a process
+       still maps stay). SM120_ENGRAM_DROP_WEIGHT_PAGES=0 skips it.
+    2. If SM120_ENGRAM_PREFAULT=1 with SM120_ENGRAM_PREFAULT_AT=ready: prefault the tables now.
+    3. Log the tables' page-cache residency."""
+    t0 = time.time()
+    res = {}
+    tables = [t for t in _TABLES if t.source is not None and t._uring is None]
+    engram_files = {os.path.realpath(loc.path) for t in tables for loc in t.source if loc is not None}
+    if ckpt_dir and _env("SM120_ENGRAM_DROP_WEIGHT_PAGES", "1") not in ("0", "false", "no"):
+        dropped, nbytes = 0, 0
+        for name in sorted(os.listdir(ckpt_dir)):
+            path = os.path.realpath(os.path.join(ckpt_dir, name))
+            if not name.endswith(".safetensors") or path in engram_files or not os.path.isfile(path):
+                continue
+            try:
+                drop_page_cache(path)
+                dropped += 1
+                nbytes += os.path.getsize(path)
+            except OSError:
+                pass
+        res["dropped_shards"], res["dropped_gib"] = dropped, round(nbytes / 2**30, 1)
+        print(f"[sm120_engram] page cache: dropped clean pages of {dropped} weight shards ({nbytes / 2**30:.0f} GiB of "
+              f"files) after load (SM120_ENGRAM_DROP_WEIGHT_PAGES=0 keeps them)", flush=True)
+    if (_env("SM120_ENGRAM_PREFAULT", "0") in ("1", "true", "yes") and _env("SM120_ENGRAM_PREFAULT_AT", "attach") == "ready"
+            and tables):
+        size, avail = sum(t.nbytes for t in tables), _mem_available()
+        if avail is not None and size > 0.95 * avail:
+            # reading tables that do not fit only churns the cache (and the disk) for minutes while serving
+            res["prefault_s"] = None
+            print(f"[sm120_engram] prefault skipped: tables {size / 2**30:.0f} GiB > MemAvailable {avail / 2**30:.0f} "
+                  f"GiB; use SM120_ENGRAM_MODE=uring on this host (docs/ENGRAM.md)", flush=True)
+        else:
+            dt = sum(t.prefault() for t in tables)
+            res["prefault_s"] = round(dt, 1)
+            print(f"[sm120_engram] prefaulted {len(tables)} tables after load in {dt:.0f} s", flush=True)
+    resident = [t.resident() for t in tables]
+    if tables and all(r is not None for r in resident):
+        size = sum(t.nbytes for t in tables)
+        avail = _mem_available()
+        res["resident_gib"], res["tables_gib"] = round(sum(resident) / 2**30, 1), round(size / 2**30, 1)
+        print(f"[sm120_engram] engram tables resident in the page cache after load: {sum(resident) / 2**30:.1f} / "
+              f"{size / 2**30:.1f} GiB ({100 * sum(resident) / max(size, 1):.0f} %); MemAvailable "
+              f"{'?' if avail is None else f'{avail / 2**30:.1f} GiB'}", flush=True)
+    res["seconds"] = round(time.time() - t0, 1)
+    return res
+
+
 # ------------------------------------------------------------------------------------------------ table
 def _scale_bytes(scale: torch.Tensor, rows: int) -> torch.Tensor:
     """Any Engram scale representation -> [rows, groups] uint8 E8M0 bytes (same device)."""
@@ -292,8 +351,12 @@ class EngramHostTable:
         table = cls(w, s, rows=rows, row_bytes=row_bytes, groups=groups, name=name or wloc.name,
                     source=(wloc, sloc))
         table.advise(advice or _env("SM120_ENGRAM_ADVICE", "random"))
-        if prefault if prefault is not None else _env("SM120_ENGRAM_PREFAULT", "0") in ("1", "true", "yes"):
+        want = prefault if prefault is not None else _env("SM120_ENGRAM_PREFAULT", "0") in ("1", "true", "yes")
+        # SM120_ENGRAM_PREFAULT_AT=ready (set by server/server.py): prefault later, in post_load_cache_policy(),
+        # once every rank has loaded its weights (weight streaming through the page cache would evict the tables)
+        if want and _env("SM120_ENGRAM_PREFAULT_AT", "attach") != "ready":
             table.prefault()
+        _TABLES.append(table)
         return table
 
     @classmethod
@@ -929,9 +992,14 @@ class _AsyncGraphFetch:
 
 
 
-def _dump_stats() -> None:
+def _dump_stats(only_changed: bool = False) -> None:
     for f in _FETCHERS:
         st = dict(f.stats)
+        if only_changed:
+            seen = (st.get("fetches", 0), st.get("graph_fetches", 0), st.get("prestages", 0))
+            if getattr(f, "_stats_seen", None) == seen:
+                continue
+            f._stats_seen = seen
         if f._async is not None:
             try:
                 g = max(1, st.get("graph_fetches", 0))
@@ -942,17 +1010,31 @@ def _dump_stats() -> None:
             except Exception:  # noqa: BLE001
                 pass
         n = max(1, st["fetches"])
-        print(f"[sm120_engram] stats {st} | per fetch: sync {st['sync_s'] / n * 1e3:.3f} ms, "
+        print(f"[sm120_engram] stats (pid {os.getpid()}, {f.device}) {st} | per fetch: sync {st['sync_s'] / n * 1e3:.3f} ms, "
               f"gather {st['gather_s'] / n * 1e3:.3f} ms, hook wait {st['wait_s'] / n * 1e3:.3f} ms, "
               f"prestage {st.get('prestage_s', 0.0) / max(1, st.get('prestages', 0)) * 1e3:.3f} ms "
               f"(sync {st.get('pre_sync_s', 0.0) / max(1, st.get('prestages', 0)) * 1e3:.3f}, gather+H2D "
               f"{st.get('pre_gather_s', 0.0) / max(1, st.get('prestages', 0)) * 1e3:.3f})", flush=True)
 
 
+def _stats_loop(interval: float) -> None:
+    while True:
+        time.sleep(interval)
+        try:
+            _dump_stats(only_changed=True)
+        except Exception:  # noqa: BLE001 - diagnostics only
+            pass
+
+
 if os.environ.get("SM120_ENGRAM_STATS", "0") not in ("0", ""):
     import atexit
 
     atexit.register(_dump_stats)
+    # also every SM120_ENGRAM_STATS_INTERVAL seconds (default 60; 0 = only at exit), when something changed: a
+    # server stopped with SIGKILL (docker stop timeout) never reaches atexit
+    _iv = float(os.environ.get("SM120_ENGRAM_STATS_INTERVAL", "60"))
+    if _iv > 0:
+        threading.Thread(target=_stats_loop, args=(_iv,), name="sm120-engram-stats", daemon=True).start()
 
 
 def _done(value) -> Future:

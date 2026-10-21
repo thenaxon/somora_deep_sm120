@@ -3,6 +3,38 @@
 All notable changes to this project are documented here. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0 any minor release may change interfaces.
 
+## [Unreleased]
+
+### Added
+- Tool calling in `/v1/chat/completions`: `tools`, `tool_choice` (`auto`, `none`, `required`, named function),
+  `parallel_tool_calls`, history with assistant `tool_calls` and `role: "tool"` messages, `message.tool_calls` with
+  `finish_reason: "tool_calls"`, and streaming `tool_calls` deltas. Rendering and parsing use the checkpoint's
+  `encoding/encoding.py` (DSML format) (`server/tools.py`).
+- `response_format`: `text`, `json_object`, `json_schema` (`strict` honoured).
+- Grammar-constrained decoding through DeepInfer's structured output (xgrammar EBNF in `SamplingParams.so_args`):
+  `tool_choice` `required` or a named function only admits valid calls whose arguments follow the JSON schema;
+  `response_format` output follows the schema. In thinking mode the grammar starts after `</think>`.
+- Tests: `tests/test_tools.py` (CPU), `tests/test_tools_server.py`, `tests/test_openai_sdk.py` (official `openai`
+  SDK incl. `chat.completions.parse` with pydantic), `tests/run_tools_tests.sh`.
+- Image input in `/v1/chat/completions`: OpenAI `image_url` content parts (`data:` base64 and `http(s)` URLs), passed to
+  DeepInfer's multimodal path (`server/images.py`). Limits: `--max-images`, `--max-image-bytes`, `--max-image-pixels`,
+  `--no-image-urls`; URLs on private addresses are refused unless `--image-fetch-private`. Image tokens count in
+  `usage.prompt_tokens`. Tests: `tests/test_images.py` (CPU), `tests/test_images_server.py`, an SDK image check.
+- `eval/quality_set.jsonl`: 8 tool-calling, 3 structured-output and 3 image items; `eval/quality_check.py` scores them
+  and reports scores per category.
+
+### Changed
+- Thinking-mode streaming sends the reasoning as `delta.reasoning_content` (it was sent as `content`).
+- `eval/quality_check.py` reports scores per category (core / tool / json / image).
+
+### Fixed
+- xgrammar 0.2.2 admits raw control characters in length-bounded JSON strings; the server patches that character class.
+- xgrammar 0.2.2 builds wrong digit patterns for some integer ranges (`minimum: 0, maximum: 120` admits 121-129); ranges
+  with up to 1024 values are passed to it as an explicit `enum`.
+- Text-only prompts carry an empty `multi_modal_data` when the model has a vision processor (as DeepInfer's
+  `LLM.generate` does); a batch that mixed text and image prompts failed an assertion in `deepseek_vl`.
+- ViT attention shim: 4-D SDPA, so a full-size image no longer falls back to the math kernel (about 10 GiB, CUDA OOM).
+
 ## [0.1.1] - 2026-10-21
 
 ### Fixed

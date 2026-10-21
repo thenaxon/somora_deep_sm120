@@ -6,8 +6,11 @@
 Endpoints: GET /health, GET /v1/models, POST /v1/completions, POST /v1/chat/completions (the checkpoint's
 encoding/encoding.py chat template; "thinking": true or reasoning_effort -> thinking mode), streaming (SSE,
 "stream": true) and non-streaming. Sampling: temperature, top_p, top_k, max_tokens, stop (str | list), seed,
-ignore_eos; extension "return_token_ids": true (non-streaming). Concurrent requests share one continuously-batched DeepInfer engine (engine.py). A client that
-disconnects from a stream aborts its request in the engine. See README.md.
+ignore_eos; extension "return_token_ids": true (non-streaming). Chat: tools / tool_choice / parallel_tool_calls (DSML tool
+calls, tools.py), response_format text / json_object / json_schema (grammar-constrained, DeepInfer structured output),
+and image_url content parts (data: or http(s) URLs, images.py; DeepInfer's multimodal path).
+Concurrent requests share one continuously-batched DeepInfer engine (engine.py). A client that disconnects from a stream
+aborts its request in the engine. See docs/SERVER.md.
 """
 
 from __future__ import annotations
@@ -28,6 +31,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+import images  # noqa: E402
+import tools  # noqa: E402
 from engine import EngineLoop, GenRequest  # noqa: E402
 
 log = logging.getLogger("di_server")
@@ -59,11 +64,13 @@ class TextCodec:
     def decode(self, ids: list[int]) -> str:
         return self.tok.decode(ids, skip_special_tokens=True)
 
-    def render_chat(self, messages: list[dict], thinking: bool, reasoning_effort=None) -> str:
+    def render_chat(self, messages: list[dict], thinking: bool, reasoning_effort=None) -> tuple[str, list[dict]]:
+        """-> (prompt, image records in prompt order; one image placeholder token per image in the prompt)."""
         if self.enc is not None:
-            return self.enc.encode_messages(messages, thinking_mode="thinking" if thinking else "chat",
-                                            reasoning_effort=reasoning_effort)
-        return self.bos + "".join(f"{m.get('role')}: {m.get('content')}\n" for m in messages) + "assistant: "
+            prompt, mm = self.enc.encode_messages(messages, thinking_mode="thinking" if thinking else "chat",
+                                                  reasoning_effort=reasoning_effort, return_multi_modal_data=True)
+            return prompt, mm.get("images") or []
+        return self.bos + "".join(f"{m.get('role')}: {m.get('content')}\n" for m in messages) + "assistant: ", []
 
     def split_reasoning(self, text: str, thinking: bool) -> tuple[str, str | None]:
         if not thinking:
@@ -178,7 +185,7 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
     # ---- generation
-    def _params(self, body: dict, prompt_len: int) -> dict:
+    def _params(self, body: dict, prompt_len: int, extra_stop: list[str] = ()) -> dict:
         app = self.app
         if int(body.get("n", 1)) != 1:
             raise BadRequest("only n=1 is supported")
@@ -213,23 +220,48 @@ class Handler(BaseHTTPRequestHandler):
         self._lp = (lp, top_n, bool(body.get("return_tokens_as_token_ids", False)), chat_mode)
         return dict(max_tokens=min(max_tokens, room), temperature=temperature, top_p=top_p,
                     top_k=int(body.get("top_k", -1) or -1), seed=None if seed is None else int(seed) % (2 ** 63),
-                    ignore_eos=bool(body.get("ignore_eos", False)), stop=stop, logprobs=lp)
+                    ignore_eos=bool(body.get("ignore_eos", False)), stop=stop + list(extra_stop), logprobs=lp)
 
     def _generate(self, body: dict, chat: bool) -> None:
         app = self.app
         thinking = False
+        plan, so, extra_stop, mm, n_image_tokens, n_images = tools.ToolPlan(), None, [], None, 0, 0
         if chat:
             msgs = body.get("messages")
             if not isinstance(msgs, list) or not msgs:
                 raise BadRequest("messages must be a non-empty list")
             effort = body.get("reasoning_effort")
             thinking = bool(body.get("thinking", effort is not None))
+            enc = app.codec.enc
             try:
-                prompt = app.codec.render_chat(msgs, thinking, effort)
+                plan = tools.plan_from_body(body)
+                if enc is None and (plan.tools or plan.rf_kind):
+                    raise tools.ToolError("tools / response_format need the checkpoint's encoding/encoding.py")
+                if plan.tools or plan.rf_kind:
+                    msgs = tools.prepare_messages(msgs, plan)
+                    so = tools.so_args(enc, plan, thinking, app.codec.encode(enc.thinking_end_token))
+            except tools.ToolError as exc:
+                raise BadRequest(str(exc)) from None
+            if plan.tools and plan.choice == "none":
+                extra_stop = [tools.Dsml(enc).calls_open]  # the tools are shown to the model but must not be called
+            try:
+                prompt, image_records = app.codec.render_chat(msgs, thinking, effort)
             except Exception as exc:  # noqa: BLE001  (encoding.py validates roles / content)
                 raise BadRequest(f"cannot render messages: {exc}") from None
             ids = app.codec.encode(prompt)
+            if image_records:
+                if not app.engine.vision:
+                    raise BadRequest("this model / engine has no image input (no multimodal processor)")
+                try:
+                    mm = images.load_images(image_records, app.image_limits)
+                except images.ImageError as exc:
+                    raise BadRequest(str(exc)) from None
+                # each placeholder token becomes the image's token span inside the engine
+                n_image_tokens = sum(app.engine.image_tokens(w, h) for w, h in mm["image_sizes"]) - len(image_records)
+                n_images = len(image_records)  # (DeepInfer's add_request consumes mm's raw image keys)
         else:
+            if body.get("tools") or (body.get("response_format") or {}).get("type", "text") != "text":
+                raise BadRequest("tools and response_format are supported on /v1/chat/completions only")
             p = body.get("prompt")
             if isinstance(p, list) and len(p) == 1 and isinstance(p[0], str):
                 p = p[0]
@@ -241,21 +273,24 @@ class Handler(BaseHTTPRequestHandler):
                 raise BadRequest("prompt must be a string, a one-element list of strings, or a list of token ids")
         if not ids:
             raise BadRequest("empty prompt")
-        prm = self._params(body, len(ids))
+        prm = self._params(body, len(ids) + n_image_tokens, extra_stop)
         stop = prm.pop("stop")
-        req = app.engine.submit(GenRequest(prompt_ids=ids, **prm))
+        req = app.engine.submit(GenRequest(prompt_ids=ids, so_args=so, multi_modal_data=mm, **prm))
         rid = ("chatcmpl-" if chat else "cmpl-") + uuid.uuid4().hex[:24]
         created = int(time.time())
         detok = Detok(app.codec, stop)
         stream = bool(body.get("stream", False))
         include_usage = bool((body.get("stream_options") or {}).get("include_usage", False))
         obj = "chat.completion" if chat else "text_completion"
-        log.info("%s engine-id %s prompt %d tok max_tokens %d stream %s", rid, req.request_id, len(ids),
-                 prm["max_tokens"], stream)
+        log.info("%s engine-id %s prompt %d tok max_tokens %d stream %s tools %s/%d response_format %s grammar %s "
+                 "images %d (%d tok)", rid, req.request_id, len(ids) + n_image_tokens, prm["max_tokens"], stream,
+                 plan.choice, len(plan.tools), plan.rf_kind, so is not None, n_images, n_image_tokens)
+        # chat output -> reasoning_content / content / tool_calls deltas (tools.py); plain text without encoding.py
+        parser = tools.StreamParser(app.codec.enc, thinking, plan) if chat and app.codec.enc is not None else None
 
-        def chunk(delta_text: str | None, finish: str | None, role: bool = False, usage=None) -> dict:
+        def chunk(delta_text: str | None, finish: str | None, role: bool = False, usage=None, delta=None) -> dict:
             if chat:
-                delta = {}
+                delta = dict(delta or {})
                 if role:
                     delta["role"] = "assistant"
                 if delta_text:
@@ -306,7 +341,10 @@ class Handler(BaseHTTPRequestHandler):
                     finished, reason = True, "stop"
                 if stream:
                     piece = detok.emit(final=finished)
-                    if piece:
+                    if piece and parser is not None:
+                        for d in parser.feed(piece):
+                            send(chunk(None, None, delta=d))
+                    elif piece:
                         send(chunk(piece, None))
                 if finished:
                     finish = _finish_reason(reason, detok.stopped)
@@ -322,11 +360,17 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(b"data: [DONE]\n\n")
                 return
             return self._error(500, err, "server_error")
-        usage = {"prompt_tokens": len(ids), "completion_tokens": n_tok, "total_tokens": len(ids) + n_tok}
+        n_prompt = len(ids) + n_image_tokens
+        usage = {"prompt_tokens": n_prompt, "completion_tokens": n_tok, "total_tokens": n_prompt + n_tok}
         t = req.first_token_t
         log.info("%s done: %d tokens, finish %s, ttft %.3fs, total %.3fs", rid, n_tok, finish,
                  (t - req.submitted) if t else -1, time.perf_counter() - req.submitted)
         if stream:
+            if parser is not None:
+                for d in parser.finish():
+                    send(chunk(None, None, delta=d))
+                if parser.calls and finish == "stop":
+                    finish = "tool_calls"
             send(chunk(None, finish))
             if include_usage:
                 d = chunk(None, None, usage=usage)
@@ -337,10 +381,18 @@ class Handler(BaseHTTPRequestHandler):
             return
         text = detok.text
         if chat:
-            content, reasoning = app.codec.split_reasoning(text, thinking)
+            calls = []
+            if app.codec.enc is not None:
+                content, reasoning, calls = tools.parse_final(app.codec.enc, text, thinking, plan)
+            else:
+                content, reasoning = app.codec.split_reasoning(text, thinking)
             message = {"role": "assistant", "content": content}
             if reasoning is not None:
                 message["reasoning_content"] = reasoning
+            if calls:
+                message["tool_calls"] = calls
+                if finish == "stop":
+                    finish = "tool_calls"
             choice = {"index": 0, "message": message, "finish_reason": finish}
         else:
             choice = {"index": 0, "text": text, "logprobs": None, "finish_reason": finish}
@@ -393,6 +445,10 @@ class App:
         self.created = int(time.time())
         self.request_timeout = args.request_timeout
         self.codec = TextCodec(args.ckpt)
+        self.image_limits = images.ImageLimits(max_images=args.max_images, max_bytes=args.max_image_bytes,
+                                               max_pixels=args.max_image_pixels, fetch_urls=not args.no_image_urls,
+                                               fetch_private=args.image_fetch_private,
+                                               fetch_timeout=args.image_fetch_timeout)
         self.engine = EngineLoop(args.ckpt, max_num_seqs=args.max_num_seqs, max_model_len=args.max_model_len,
                                  max_num_batched_tokens=args.max_num_batched_tokens,
                                  gpu_memory_utilization=args.gpu_memory_utilization, max_blocks=args.max_blocks,
@@ -451,6 +507,13 @@ def main() -> int:
     ap.add_argument("--ep", type=int, default=None, help="expert-parallel size (default: --dp)")
     ap.add_argument("--dp-rank", type=int, default=None, help=argparse.SUPPRESS)  # set by the proxy for its children
     ap.add_argument("--force-proxy", action="store_true", help=argparse.SUPPRESS)  # tests: proxy even with --dp 1
+    ap.add_argument("--max-images", type=int, default=8, help="images per chat request")
+    ap.add_argument("--max-image-bytes", type=int, default=20 << 20, help="encoded size per image")
+    ap.add_argument("--max-image-pixels", type=int, default=50_000_000, help="width x height per image")
+    ap.add_argument("--no-image-urls", action="store_true", help="refuse http(s) image URLs (data: URLs only)")
+    ap.add_argument("--image-fetch-private", action="store_true",
+                    help="allow image URLs on loopback / private / link-local addresses (off: SSRF protection)")
+    ap.add_argument("--image-fetch-timeout", type=float, default=10.0, help="seconds per image URL fetch")
     ap.add_argument("--log-level", default="INFO")
     args = ap.parse_args()
     # docker stop / kill -TERM: run the finally blocks (engine shutdown here, rank shutdown in the dp proxy) instead

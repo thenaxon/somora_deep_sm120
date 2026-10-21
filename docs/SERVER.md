@@ -34,7 +34,7 @@ python3 /opt/sm120/server/server.py --ckpt /work/ckpt3 --port 8000 --determinist
 #          --nextn N (MTP, needs mtp.* layers) --graphs (CUDA graphs) --zos 0|1 --prefill-interval 1 --model-name ID
 #          --prefix-cache [--prefix-cache-grain 512 --prefix-cache-checkpoint-stride 0 (= --max-num-batched-tokens)
 #                          --prefix-cache-entries 64 --prefix-cache-max-block-frac 0.5]
-#          (agent workloads with short shared system prompts: --prefix-cache-checkpoint-stride 1024 or 2048, see PREFIX_CACHE.md)
+#          (tool-calling workloads with short shared system prompts: --prefix-cache-checkpoint-stride 1024 or 2048, see PREFIX_CACHE.md)
 
 curl -s localhost:8000/v1/models
 curl -s localhost:8000/v1/completions -H 'Content-Type: application/json' \

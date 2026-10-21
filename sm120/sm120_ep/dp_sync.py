@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import os
 
+import sm120_prof
 import torch
 import torch.distributed as dist
 
@@ -49,7 +50,8 @@ def active() -> bool:
 
 def dp_max(value: int, group) -> int:
     t = torch.tensor([int(value)], dtype=torch.int64)
-    dist.all_reduce(t, op=dist.ReduceOp.MAX, group=group)
+    with sm120_prof.rng("sm120:dp_sync.all_reduce"):
+        dist.all_reduce(t, op=dist.ReduceOp.MAX, group=group)
     _STATE["n_sync"] += 1
     return int(t.item())
 
@@ -58,7 +60,8 @@ def dp_counts(value: int, group) -> list[int]:
     """All ranks' values (one gloo all-gather of an int)."""
     world = dist.get_world_size(group)
     parts = [torch.zeros((1,), dtype=torch.int64) for _ in range(world)]
-    dist.all_gather(parts, torch.tensor([int(value)], dtype=torch.int64), group=group)
+    with sm120_prof.rng("sm120:dp_sync.all_gather"):
+        dist.all_gather(parts, torch.tensor([int(value)], dtype=torch.int64), group=group)
     _STATE["n_sync"] += 1
     return [int(p.item()) for p in parts]
 

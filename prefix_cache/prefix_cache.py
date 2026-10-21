@@ -56,6 +56,16 @@ def configure_env(max_num_seqs: int, max_entries: int) -> None:
     os.environ["DEEPINFER_NUM_STATE_SLOTS_RATIO"] = str(base + (max_entries + 1) / max(1, max_num_seqs))
 
 
+def _rng(name: str):
+    """Profiler range for SM120_PROFILE_PREFILL (sm120_prof), a no-op otherwise or without sm120 on the path."""
+    try:
+        import sm120_prof
+        return sm120_prof.rng(name)
+    except ImportError:
+        import contextlib
+        return contextlib.nullcontext()
+
+
 def _digest(ids: np.ndarray, k: int) -> bytes:
     return hashlib.blake2b(np.ascontiguousarray(ids[:k], dtype=np.int32).tobytes(), digest_size=16).digest()
 
@@ -200,7 +210,8 @@ class PrefixCache:
             ckpts = sorted(set(ckpts) | set(a["chunk_checkpoints"]))
         self.stats["lookups"] += 1
         self.stats["prompt_tokens"] += L
-        hit = self._lookup(ids) if self.lookup else None
+        with _rng("sm120:prefix_cache.lookup"):
+            hit = self._lookup(ids) if self.lookup else None
         if hit is None:
             a["chunk_checkpoints"] = ckpts
             return self._orig_add(**a)
@@ -324,9 +335,10 @@ class PrefixCache:
 
     def step(self):
         out = self._orig_step()
-        self._finished(out)
-        # the step's forward is queued on the stream; the copy is ordered after it and before the next step
-        self._take_snapshots()
+        with _rng("sm120:prefix_cache.snapshots"):
+            self._finished(out)
+            # the step's forward is queued on the stream; the copy is ordered after it and before the next step
+            self._take_snapshots()
         return out
 
     def flush_inflight_reqs(self):

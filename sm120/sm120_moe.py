@@ -174,7 +174,8 @@ class B12xRoutedExperts:
         self.layer_idx = moe.layer_idx
         _check_tiny_decode(self.swiglu_limit, n, self.layer_idx)
 
-        self.session_mode = moe_plan_mode() == "session"
+        # session plans did not give bit-identical repeats with deterministic_output (5090 test): caps path then
+        self.session_mode = moe_plan_mode() == "session" and not deterministic()
         self.graph_tokens = int(getattr(moe, "max_num_decoding_tokens", 0) or 0)
         s13 = _sf_bytes(w13.sf, K)  # [E, 2n, K/32]
         s2 = _sf_bytes(w2.sf, n)  # [E, K, n/32]

@@ -64,7 +64,7 @@ More in [docker/README.md](docker/README.md) and [docs/SERVER.md](docs/SERVER.md
 - **Exact prefix caching**: a cache hit gives the same result as a miss, bit for bit, with the deterministic MoE
   ([docs/PREFIX_CACHE.md](docs/PREFIX_CACHE.md)).
 - **Multi-GPU expert parallelism for PCIe**: DP attention + EP MoE over NCCL instead of DeepEP, with a DP proxy in front
-  of the per-GPU engines. Implemented, emulation-tested only ([docs/MULTI_GPU.md](docs/MULTI_GPU.md),
+  of the per-GPU engines. Implemented; compile-checked and tested in single-GPU emulation only ([docs/MULTI_GPU.md](docs/MULTI_GPU.md),
   [docs/MULTI_GPU_RUNBOOK.md](docs/MULTI_GPU_RUNBOOK.md)).
 - **Validation tooling** (`tools/`): a runner for DeepSeek's reference implementation, a checkpoint truncator,
   per-layer and intra-layer comparison against the ref-vs-ref noise floor ([docs/VALIDATION.md](docs/VALIDATION.md)).
@@ -83,9 +83,11 @@ more expert weights per token, so the speed numbers are **not** a prediction for
 | decode step, CUDA graphs, batch 1 / 8 / 32 (`tests/prof_e2e.py`) | 18.0 / 21.8 / 26.6 ms |
 | server, single stream, CUDA graphs (prefix cache on) | TTFT 0.34 s, TPOT 16.6 ms (60 tok/s) |
 | server, 4 concurrent streams | 147 tok/s aggregate, median TPOT 22.2 ms |
-| server, MTP/DSpark nextn 5 | TPOT 5-6 ms (optimistic: the reduced-expert model's repetitive output inflates acceptance) |
+| MTP/DSpark decode, `bench_e2e.py`, CUDA graphs, B=1 | 58 tok/s (nextn 0) -> 98 / 139 / 152 tok/s (nextn 1 / 3 / 5, acceptance 98 / 77 / 52 %): 2.6x |
+| MTP/DSpark decode, B=8 | 388 tok/s (nextn 0) -> 642 / 927 / 909 tok/s (nextn 1 / 3 / 5): 2.4x with nextn 3 |
+| deterministic MoE cost (`SM120_MOE_DETERMINISTIC=1`), TPOT B=1 / 8 / 32 | 16.1 / 20.4 / 25.6 -> 46.1 / 42.2 / 47.8 ms (2-2.9x; opt-in for tests and reproducibility) |
 | determinism | with `SM120_MOE_DETERMINISTIC=1`, eager and CUDA graphs are bit-identical (17/17 tokens, 0.0 error on every layer); nextn 0 / 1 / 5 decode identical tokens with a deterministic MoE |
-| server test suite, 3-layer test model | 21/21 with `--deterministic --prefix-cache` |
+| server test suite, 3-layer test model | 22/22 with `--deterministic --prefix-cache` |
 | prefix cache hit, 1503-token prompt | TTFT 1.82 s → 0.56 s, identical tokens |
 
 Details and more tables: [docs/VALIDATION.md](docs/VALIDATION.md), [docs/ATTENTION.md](docs/ATTENTION.md),
@@ -98,7 +100,10 @@ Details and more tables: [docs/VALIDATION.md](docs/VALIDATION.md), [docs/ATTENTI
   known rounding property of DeepInfer's `fused_transform` path, not a port bug ([docs/VALIDATION.md](docs/VALIDATION.md)).
 - **b12x `fused_moe` (the default MoE) is not run-to-run deterministic.** The same prompt can decode different tokens
   after a few steps. `--deterministic` / `SM120_MOE_IMPL=torch` is exact but slower, and `SM120_MOE_DETERMINISTIC=1`
-  gives a deterministic b12x mode, recommended when reproducibility matters ([docs/VALIDATION.md](docs/VALIDATION.md)).
+  gives a deterministic b12x mode, recommended when reproducibility matters but 2-2.9x slower in decode
+  ([docs/VALIDATION.md](docs/VALIDATION.md), [docs/RUNTIME.md](docs/RUNTIME.md)).
+- **MTP known issue:** nextn 1 together with `DEEPINFER_SAMPLER_FORCE_TOPK=1024` at batch > 1 accepts no drafts (output
+  correct, no speed-up). Other combinations are fine; the server defaults (nextn 0, no forced top-k) are not affected.
 - The b12x tiny-decode MoE kernel misses the SwiGLU clamp
   ([flashinfer-ai/flashinfer#6866](https://github.com/flashinfer-ai/flashinfer/issues/6866)). The image patches it, and
   the default uses the dynamic path anyway ([patches/PATCHES.md](patches/PATCHES.md)).

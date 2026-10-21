@@ -136,7 +136,7 @@ that into different tokens. `--deterministic` sets `SM120_MOE_IMPL=torch`; then 
 - Seeded sampling is reproducible, and a different seed gives a different output.
 - Bad requests get 400.
 
-`--deterministic --prefix-cache`: **21/21 passed** (adds prefix-cache hit checks; a repeated 1503-token prompt hits 1024 tokens,
+`--deterministic --prefix-cache`: **22/22 passed** (adds prefix-cache hit checks; a repeated 1503-token prompt hits 1024 tokens,
 TTFT 1.82 s → 0.56 s, identical tokens).
 
 Default b12x mode: **12/12 hard checks passed**. The 6 repeatability checks (greedy repeat, stream == non-stream, stop strings derived

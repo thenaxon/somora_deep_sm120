@@ -16,7 +16,7 @@ All numbers below are from one RTX 5090 with truncated test checkpoints ([VALIDA
 | `tests/test_gemm_moe_graphs.py` | 14 passed, 2 xfailed (tiny-decode on unpatched b12x, by design) |
 | P8 `test_remap_draft_topk` (DeepInfer's TileLang sampler tests) | 6/6 pass (fail on SM120 without P8) |
 | DeepInfer sampler / DFlash TileLang op tests | 74 + 124 passed |
-| b12x tiny-decode SwiGLU patch | all checks pass incl. the V4.1 shape; tiny-decode is 0.90-0.95x the dynamic path, so the default stays dynamic (`SM120_MOE_TINY_DECODE=0`) |
+| b12x tiny-decode SwiGLU patch ([flashinfer#6866](https://github.com/flashinfer-ai/flashinfer/issues/6866)) | all checks pass incl. the V4.1 shape; tiny-decode is 0.90-0.95x the dynamic path, so the default stays dynamic (`SM120_MOE_TINY_DECODE=0`) |
 | logit capture (`tools/run_deepinfer.py`, 3-layer model) | decode argmax == sampled token for all 16 steps |
 | determinism | default b12x MoE: repeats differ (atomic top-k combine). `SM120_MOE_DETERMINISTIC=1` / `--batch-invariant`: bit-identical repeats, prefill + decode logits and tokens; on the full-depth test model eager, graphs and a second graphs run are bit-identical (17/17 tokens, 0.0 error on every layer) |
 | CUDA graphs end to end | 3-layer, YOCO and full-depth test models; no b12x fallback warnings under capture |
@@ -38,6 +38,64 @@ All numbers below are from one RTX 5090 with truncated test checkpoints ([VALIDA
 Eager decode is launch-bound (TPOT about 42 ms at every B); CUDA graphs give 13x at B=1 and 7.5x at B=64. Prefill at
 small B includes host/scheduler overhead. These numbers predate the mHC/einsum Triton kernels; deeper models are in
 [ATTENTION.md](ATTENTION.md) section 9 and [VALIDATION.md](VALIDATION.md).
+
+### MTP / DSpark on the full-depth test model
+
+`tools/bench_e2e.py` on the full-depth test checkpoint (40 layers, real DSpark heads and targets, but only 16/384
+routed experts per layer and 32/128 per MTP layer), `SM120_ENGRAM_MODE=host`, CUDA graphs, random prompts of 256
+tokens, 256 generated tokens, `--max-num-batched-tokens 512`:
+
+| nextn | force_topk | B=1 decode tok/s / TPOT ms | tok/step | accept | B=8 decode tok/s / TPOT ms | tok/step | accept |
+|---|---|---|---|---|---|---|---|
+| 0 | 0 | 58.2 / 17.2 | 1.00 | - | 388.4 / 20.6 | 1.00 | - |
+| 1 | 0 | 98.4 / 10.2 | 1.98 | 97.7 % | 642.2 / 12.5 | 1.96 | 96.2 % |
+| 1 | 1024 | 97.7 / 10.2 | 1.96 | 96.2 % | **358.2 / 22.3** | **1.00** | **0.0 %** (known issue) |
+| 3 | 0 | 139.3 / 7.2 | 3.31 | 77.1 % | 927.5 / 8.6 | 3.23 | 74.3 % |
+| 3 | 1024 | 141.7 / 7.1 | 3.45 | 81.5 % | 887.1 / 9.0 | 3.07 | 69.1 % |
+| 5 | 0 | 152.3 / 6.6 | 3.59 | 51.8 % | 908.9 / 8.8 | 3.36 | 47.1 % |
+| 5 | 1024 | 141.3 / 7.1 | 3.31 | 46.2 % | 920.1 / 8.7 | 3.36 | 47.1 % |
+
+DSpark speculative decoding works on SM120: **2.6x** decode speed-up at B=1 (nextn 5) and **2.4x** at B=8 (nextn 3,
+the best setting there). These numbers come from a truncated checkpoint whose experts are cut on both the target and the
+draft side; they show that the MTP path works and what it costs, and are **not a prediction for the full model**.
+
+**Known issue:** nextn = 1 together with `DEEPINFER_SAMPLER_FORCE_TOPK=1024` (`--force-topk 1024`) at batch > 1 accepts
+0 % of the drafts. The output is still correct (rejected drafts fall back to the target token), there is just no
+speed-up. Every other combination is fine, including nextn 1 with force-topk at B=1 and nextn 3/5 with force-topk at
+B=8. Not yet investigated; likely causes are the force-top-k rejection path for 2-row requests (`remap_draft_topk` read
+rows / `mtp_info_read_rows`) or the MTP info pool with several requests. The server and the image do not set
+`DEEPINFER_SAMPLER_FORCE_TOPK` and default to nextn 0, so the default configuration is not affected.
+
+### Deterministic MoE: cost
+
+`SM120_MOE_DETERMINISTIC=1` (or `tools/run_deepinfer.py --batch-invariant`) makes b12x `fused_moe` bit-exact run to run
+([MOE_GEMM.md](MOE_GEMM.md) section 5). CUDA graphs, prompt 256, 128 generated tokens, TPOT ms default -> deterministic:
+
+| model | B=1 | B=8 | B=32 |
+|---|---|---|---|
+| 3-layer test model | 2.3 -> 4.6 | 2.6 -> 5.2 | 3.6 -> 6.7 |
+| YOCO test model | 4.3 -> 11.0 | 6.0 -> 11.9 | 8.3 -> 16.1 |
+| full-depth test model | 16.1 -> 46.1 | 20.4 -> 42.2 | 25.6 -> 47.8 |
+
+That is 2-2.9x slower decode, so it is meant for tests and reproducibility only and stays off by default. The server's
+`--deterministic` flag is a different mechanism: it switches the MoE to the exact torch reference
+(`SM120_MOE_IMPL=torch`), which is also reproducible and is what the server test suite uses.
+
+### MoE tuning levers (optional)
+
+YOCO test model, CUDA graphs, TPOT ms at B=1/8/32 (default 4.3 / 6.0 / 8.3):
+
+| variant | TPOT ms | init s |
+|---|---|---|
+| `SM120_MOE_GRAPH_BUCKETS=1` (exact MoE plan per CUDA-graph size) | 4.1 / 5.8 / 8.2 | 33 |
+| `SM120_MOE_PLAN=session` (b12x `plan_execution`, exact variants, heuristic configs) | 4.1 / 5.8 / 8.2 | 35 |
+| `SM120_MOE_PLAN=session` + `SM120_B12X_AUTOTUNE=1` (MoE + linear race) | 4.1 / 5.8 / 8.3 | 122 |
+| `SM120_B12X_AUTOTUNE=1` (linear only) | 4.2 / 5.7 / 8.3 | 24 |
+
+All are within about 5 % of the default: b12x's heuristic configs are already what the race picks for these shapes, so
+the defaults stay (caps plans, no tuning). The remaining MoE time is kernel time. `SM120_MOE_PLAN=session` is forced
+off in deterministic mode (session plans did not give bit-identical repeats with `deterministic_output`). Deterministic
+mode also forces grouped routing, working around [flashinfer-ai/flashinfer#6941](https://github.com/flashinfer-ai/flashinfer/issues/6941).
 
 `DEEPINFER_PREFILL_ATTEMPT_INTERVAL`: DeepInfer's NORMAL scheduler only attempts a prefill every 70 steps by default,
 idle steps included, which shows up as about 2.2 s of "prefill" (TTFT) for every batch size. `bench_e2e.py`, the server
@@ -170,8 +228,8 @@ Everything inside a captured decode step must follow these rules (the attention,
    source-keyed TileLang kernel cache served a stale 103 KB kernel, clear `/cache/tilelang` once.
 2. **Tiny-decode** stays off by default because it is slower on the RTX 5090, even with the clamp fix. In the
    unclamped kernel FC2 activations are packed to f16 and could also overflow on large activations.
-3. **Graph buckets:** a 6-row MTP verify batch runs a 64-token MoE plan and a 16-row linear plan. Whether exact plans
-   (`SM120_MOE_GRAPH_BUCKETS=1`, about 52 MoE plans with nextn = 5 and 64 sequences) are faster is not measured.
-4. **Autotune** exists only for `block_fp8_linear` and is opt-in; races use up to half the free memory during
-   warm-up. MoE tuning would need the b12x `plan_execution` API ([MOE_GEMM.md](MOE_GEMM.md) section 7).
+3. **MTP:** nextn 1 + force-topk 1024 at batch > 1 accepts no drafts (see above).
+4. **MoE speed:** the tuning levers above give at most about 5 %. Further gains would need changes outside the shim
+   (FP8 activations straight from DeepInfer's quantized input instead of bf16 -> MXFP8 inside b12x, or fusing the
+   shared expert into the routed call).
 5. **Long decodes:** acceptance and step-time numbers so far come from short runs (16-64 decode steps).

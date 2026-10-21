@@ -64,7 +64,7 @@ Things that need **no** patch:
 | `deepinfer-sequence-block-table.patch` | DeepInfer `csrc/engine/pybind_sequence.cpp` | Exposes `Sequence.block_table` (read-only) to Python. Needed only by the prefix cache ([docs/PREFIX_CACHE.md](../docs/PREFIX_CACHE.md)). The serving image applies it before building `_C`; `prefix_cache/build_patched_c.sh` builds a patched copy inside a dev container. |
 | `b12x-tiny-decode-swiglu.patch` | installed b12x 1.5.1 (`patch -p1 -d <site-packages>`) | Makes the `w4a8_mx` tiny-decode MoE kernel (1-4 tokens, `n % 128 == 0`) apply `swiglu_limit`. Upstream bug: [flashinfer-ai/flashinfer#6866](https://github.com/flashinfer-ai/flashinfer/issues/6866). The serving image applies it; the runtime still defaults to the dynamic path, which clamps correctly and is faster on SM120. |
 | `repro_b12x_tiny_decode_swiglu.py` | standalone, GPU + b12x only | Reproduces the tiny-decode clamp bug on random MXFP4 experts. |
-| `repro_b12x_deterministic_direct.py` | standalone, GPU + b12x only | Reproduces the `deterministic_output=True` failure (section 3, second item). |
+| `repro_b12x_deterministic_direct.py` | standalone, GPU + b12x only | Reproduces the `deterministic_output=True` failure (section 3, second item; [#6941](https://github.com/flashinfer-ai/flashinfer/issues/6941)). |
 
 Related tests: `tests/test_b12x_tiny_decode_swiglu.py` (T = 1..4 against the fp32 reference and the dynamic path,
 with and without a limit; `--shape v41 --bench` for latency) and `tests/run_runtime_unit.sh` (tiny-decode patch test,
@@ -88,7 +88,8 @@ With `quant_mode="w4a8_mx"`, `source_format="fp4_e8m0_k32"` and an intermediate 
 - Repro: `repro_b12x_tiny_decode_swiglu.py` (E=8, K=2048, N=512, top-2, T=1, x std 8 so that about a third of
   gate/up values exceed the limit). Unpatched, tiny-decode matches the unclamped reference and the dynamic path the
   clamped one.
-- Fix (`b12x-tiny-decode-swiglu.patch`, about 100 lines): `swiglu_limit` becomes a compile-time parameter of
+- Fix (`b12x-tiny-decode-swiglu.patch`, about 100 lines, also posted upstream in
+  [this comment](https://github.com/flashinfer-ai/flashinfer/issues/6866#issuecomment-6312667479)): `swiglu_limit` becomes a compile-time parameter of
   `MoETinyDecodeKernelBackend` and part of its cache key; FC2 clamps like the reference (`gate = min(gate, L)`,
   `up = clamp(up, -L, L)`, then `silu(gate) * up * w`); without a limit the generated code is unchanged. It is threaded
   through `_get_tiny_decode_kernel`, `_launch_tiny_decode_flat`, the custom op (new `float? swiglu_limit` argument),
@@ -97,7 +98,8 @@ With `quant_mode="w4a8_mx"`, `source_format="fp4_e8m0_k32"` and an intermediate 
 - Side note: under CUDA-graph replay on the RTX 5090, tiny-decode is slower than the dynamic path for the V4.1 shape
   (T=1 71.4 vs 67.6 us, T=4 305.8 vs 287.8 us).
 
-**`fused_moe` `deterministic_output=True` fails for shapes routed "direct".**
+**`fused_moe` `deterministic_output=True` fails for shapes routed "direct"**
+([flashinfer-ai/flashinfer#6941](https://github.com/flashinfer-ai/flashinfer/issues/6941)).
 `Caps(..., decode_config=None, deterministic_output=True)` for w4a8_mx raises `RuntimeError: planned dynamic direct
 routing is unsupported for this launch shape` when the heuristic selects `dynamic_route_mode="direct"`.
 `_heuristic_dynamic_route_mode()` evaluates the direct-routing candidate with `deterministic_output=False`, so it can

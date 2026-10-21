@@ -26,6 +26,7 @@ benchmark side in [RUNTIME.md](RUNTIME.md).
 | `SM120_MOE_TINY_DECODE` | `0` (default), `1`, `auto` | sets `B12X_W4A8_TINY_DECODE` unless set explicitly. `0`: dynamic path (faster, section 7). `1`/`auto`: tiny-decode only if b12x carries `patches/b12x-tiny-decode-swiglu.patch` |
 | `B12X_W4A8_TINY_DECODE` | from the above | `0` = b12x's dynamic path for T <= 4 (correct on unpatched b12x 1.5.1, whose tiny-decode ignores `swiglu_limit`) |
 | `SM120_MOE_DETERMINISTIC` | `auto` | `1`: b12x `deterministic_output` (no atomic top-k combine); `auto` = on with `DEEPINFER_BATCH_INVARIANT=1` (section 5) |
+| `SM120_MOE_PLAN` | `caps` | `session`: one b12x `plan_execution` per layer with exact variants for every CUDA-graph size, prepared by a `PreparationSession` (autotuned with `SM120_B12X_AUTOTUNE=1`). Optional, within about 5 % of `caps`; forced off in deterministic mode |
 | `SM120_MOE_GRAPH_BUCKETS` | 0 | `1`: every captured CUDA-graph token count gets its own exact MoE plan (section 6) |
 | `SM120_B12X_AUTOTUNE` | 0 | `1`: block_fp8_linear plans are prepared by a b12x `PreparationSession` (candidate race, section 7) |
 | `SM120_B12X_TUNE_CACHE` | `/cache/b12x/preparation` | tuning decisions (only with `SM120_B12X_AUTOTUNE=1`) |
@@ -134,7 +135,8 @@ rows plus a separate top-k-sum kernel, at some extra memory traffic. `SM120_MOE_
 turns it on with `DEEPINFER_BATCH_INVARIANT=1` (`tools/run_deepinfer.py --batch-invariant`). With it, repeats are
 bit-identical, and two `--batch-invariant` runs give bitwise equal prefill and decode logits and tokens. b12x 1.5.1's
 heuristic can pick `dynamic_route_mode="direct"` for a deterministic plan, which then fails with "planned dynamic
-direct routing is unsupported for this launch shape"; the shim works around this by forcing `"grouped"`
+direct routing is unsupported for this launch shape" ([flashinfer-ai/flashinfer#6941](https://github.com/flashinfer-ai/flashinfer/issues/6941)); the shim works
+around this by forcing `"grouped"`
 (`patches/repro_b12x_deterministic_direct.py` reproduces it standalone). The tiny-decode path always uses bf16 atomic
 adds and has no deterministic variant.
 
@@ -144,9 +146,11 @@ Cost (RTX 5090, CUDA graphs, prompt 256, 128 generated tokens, TPOT ms default -
 |---|---|---|---|
 | 3-layer test model | 2.3 -> 4.6 | 2.6 -> 5.2 | 3.6 -> 6.7 |
 | YOCO test model (8 layers) | 4.3 -> 11.0 | 6.0 -> 11.9 | 8.3 -> 16.1 |
+| full-depth test model (40 layers, 16/384 experts) | 16.1 -> 46.1 | 20.4 -> 42.2 | 25.6 -> 47.8 |
 
-The decode step is 2-2.6x slower, so the deterministic mode stays opt-in (reproducibility, tests,
-`server.py --deterministic` uses the torch MoE reference instead). Whether b12x `block_fp8_linear` is bit-reproducible
+The decode step is 2-2.9x slower, so the deterministic mode stays opt-in, for tests and reproducibility only
+(`server.py --deterministic` is a different switch: it uses the torch MoE reference, `SM120_MOE_IMPL=torch`).
+`SM120_MOE_PLAN=session` is forced off in deterministic mode: session plans did not give bit-identical repeats. Whether b12x `block_fp8_linear` is bit-reproducible
 (split-K configs) is not checked. Test: `tests/test_gemm_moe_graphs.py::test_moe_determinism`.
 
 ## 6. CUDA graphs (`DEEPINFER_ENFORCE_EAGER=0`)
@@ -187,7 +191,7 @@ passes `swiglu_limit`. V4.1 with full experts per GPU has n = 2304 (`n % 128 == 
 tiny-decode output had cos 0.79 against the clamped reference (dynamic path 0.998).
 
 - Workaround (default): `B12X_W4A8_TINY_DECODE=0`, set through `SM120_MOE_TINY_DECODE=0`.
-- Fix: `patches/b12x-tiny-decode-swiglu.patch` makes `swiglu_limit` a compile-time constant of the tiny-decode kernel
+- Fix ([posted upstream](https://github.com/flashinfer-ai/flashinfer/issues/6866#issuecomment-6312667479)): `patches/b12x-tiny-decode-swiglu.patch` makes `swiglu_limit` a compile-time constant of the tiny-decode kernel
   (part of the cache key) and clamps like the reference (`g = min(g, L)`, `u = clamp(u, +-L)`, then `silu(g)·u·w`);
   without a limit the generated code is unchanged. The custom op gets a `float? swiglu_limit` argument and the
   preparation prewarm resolves the same kernel. The serving image applies the patch.
@@ -205,10 +209,11 @@ and ignores `B12X_AUTOTUNE`. Tuning needs a `PreparationSession`:
   the session races the candidate configs on the real packed weight and caches the decision in
   `/cache/b12x/preparation` (keyed by device). A failure falls back to the default config. Costs start-up time,
   synchronises, and uses up to half of the free memory as race budget, so it happens in the profile run / graph
-  warm-ups. Its effect has not been benchmarked.
-- `fused_moe`: the tensor `Caps` path is heuristic-only by design. Tuning would mean moving `sm120_moe` to
+  warm-ups. Measured effect: within about 5 % of the default ([RUNTIME.md](RUNTIME.md), "MoE tuning levers").
+- `fused_moe`: the default `Caps` path is heuristic-only by design. Opt-in `SM120_MOE_PLAN=session` uses
   `plan_execution(experts, ExecutionCapacity(max_tokens, top_k, warmup_token_counts=graph sizes))` plus a session
-  request with one prepared call per token count. Not done.
+  request with one prepared call per token count (raced with `SM120_B12X_AUTOTUNE=1`). Measured: within about 5 % of
+  the default, so the default is unchanged.
 - b12x compile artifacts are cached on disk: `sm120_patches` points `B12X_COMPILE_CACHE_DIR` to `/cache/b12x/compile`,
   so repeated container runs skip most JIT.
 

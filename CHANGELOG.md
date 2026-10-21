@@ -3,6 +3,21 @@
 All notable changes to this project are documented here. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0 any minor release may change interfaces.
 
+## [Unreleased]
+
+### Fixed
+- `eval/scenarios.py realistic`: `tokens_per_step` divided by every engine step, and behind the `--dp` proxy by the
+  sum over all ranks (which step in lockstep), so speculative decoding read 0.3-0.6 instead of above 1. The server now
+  counts, per request, the steps in which it received tokens (`/health` `stats.emit_steps`, plus `stats.tokens` and
+  `config.nextn`), and the scenario reports tokens per decode step of a sequence at any concurrency, with
+  `draft_acceptance_est` = (tokens_per_step - 1) / nextn. The `--dp` proxy reports `steps` / `flushes` per rank
+  instead of summing them.
+
+### Changed
+- `eval/scenarios.py capacity`: a `missed` column names the limit a level broke (ttft, tpot, errors).
+- `eval/compare_endpoints.py --teacher-forced`: the error for a recording that lacks the requested continuation says
+  how to record it.
+
 ## [0.2.1] - 2026-10-21
 
 ### Fixed

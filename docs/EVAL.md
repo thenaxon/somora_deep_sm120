@@ -141,11 +141,11 @@ endpoint, and writes `--out NAME` → `NAME.json` (all numbers) and `NAME.md` (t
 
 | scenario | what it sends | read it as |
 |---|---|---|
-| `realistic` | the bundled prompts (`eval/prompts.json`: 24 code, 24 German and 16 English chat prompts, written for this repo) at concurrency 1/4/16, greedy, 256 tokens | decode speed on real text. Speculative decoding only helps when drafts are accepted, and acceptance depends on the text: random token ids make every MTP/EAGLE engine look slow. `tokens_per_step` (this server, concurrency 1) and `spec_acceptance` (vLLM `/metrics`) show how much the drafts contribute |
+| `realistic` | the bundled prompts (`eval/prompts.json`: 24 code, 24 German and 16 English chat prompts, written for this repo) at concurrency 1/4/16, greedy, 256 tokens | decode speed on real text. Speculative decoding only helps when drafts are accepted, and acceptance depends on the text: random token ids make every MTP/EAGLE engine look slow. `tokens_per_step` (this server: generated tokens per decode step of a sequence, 1 without speculative decoding, at most 1 + nextn; any concurrency) with `draft_acceptance_est` = (tokens_per_step - 1) / nextn, and `spec_acceptance` (vLLM `/metrics`: accepted / drafted tokens) show how much the drafts contribute |
 | `prefill` | 16/32/64 users, each with a distinct 8k/16k/32k-token document, all at once | prefill throughput and fairness: TTFT p50/p99/max, time until the last user has an answer, prompt tok/s. With DP attention every GPU prefills its own requests independently; with TP all GPUs work on one prefill at a time |
 | `shared-prefix` | 16 users × 4 turns; every user starts with the same ~6k-token system prompt (tool definitions and instructions) and continues their own conversation; run once with a shared and once with a per-user (`unique`) system prompt | what prefix caching buys: TTFT per turn for both variants, plus the endpoint's cache counters (`/health` of this server: hits and cached tokens; vLLM `/metrics`: prefix cache hits/queries). Turn 1 of `shared` and all turns of `unique` pay the full prefill on an engine without a prefix cache |
 | `mixed` | 8 short chats stream continuously; first alone, then with 16k-token requests arriving about every 4 s | head-of-line blocking: TTFT, TPOT p99 and the longest stall (`short_max_gap`) of the short streams, alone vs. with long prefills. Chunked prefill and how it is interleaved with decode decide this |
-| `capacity` | concurrency 1, 2, 4 … 128 with real prompts (or `--prompt-tokens N` synthetic documents), 256 tokens each, until an SLO is missed (default TTFT p99 ≤ 2 s, TPOT p99 ≤ 50 ms) | the number of concurrent users an endpoint serves within the SLO, and the throughput there |
+| `capacity` | concurrency 1, 2, 4 … 128 with real prompts (or `--prompt-tokens N` synthetic documents), 256 tokens each, until an SLO is missed (default TTFT p99 ≤ 2 s, TPOT p99 ≤ 50 ms) | the number of concurrent users an endpoint serves within the SLO, and the throughput there; `missed` says which limit a level broke (ttft, tpot, errors). With a slow single-request prefill even c=1 can miss the TTFT limit: then the answer is 0 users, and `--full` shows the whole ramp |
 
 **Fairness.** Run the same command with the same `--seed` against both endpoints; prompts depend only on the seed.
 Use the same `max_tokens` and temperature (default 0). `ignore_eos` only where a scenario forces it (prefill, mixed,
@@ -171,8 +171,9 @@ python3 eval/scenarios.py capacity      --url http://host:8000 --slo-ttft 2 --sl
 about the full model.
 
 - `realistic` (64 tokens): c=1 about 340 tok/s, TPOT 2.3 ms; c=4 about 1000 tok/s. On `ckpt3_mtp --nextn 3`:
-  `tokens_per_step` 0.94, half the throughput. The truncated model's MTP drafts are never accepted, so it only pays the
-  draft cost. On the full model this column shows the speculative gain.
+  `tokens_per_step` 1.00 (`draft_acceptance_est` 0.00) at c=1 and c=4, also through the DP proxy, and half the
+  throughput: the truncated model's MTP drafts are never accepted, so it only pays the draft cost. With `--nextn 0`
+  the column is exactly 1.00. On the full model it shows the speculative gain.
 - `prefill` (4k / 8k distinct prompts, 4 / 8 users at once): TTFT p99 1.0-3.6 s, 15-18k prompt tok/s on one GPU.
 - `shared-prefix` (8 users × 3 turns, 6.1k-token system prompt): turn-1 TTFT p50 0.74 s shared vs 1.59 s unique; the
   server's prefix cache served 79 % of all prompt tokens (shared) vs 63 % (unique: later turns still reuse their own

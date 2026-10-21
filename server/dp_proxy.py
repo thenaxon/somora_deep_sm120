@@ -106,11 +106,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     for k in vals[0]:
                         xs = [v.get(k) for v in vals if isinstance(v.get(k), (int, float))]
                         if xs:
-                            out[k] = max(xs) if k.startswith("max") else sum(xs)
+                            # all ranks step in lockstep: steps / flushes are a per-rank count, not a sum
+                            out[k] = max(xs) if k.startswith("max") or k in ("steps", "flushes") else sum(xs)
                     return out
 
                 body = json.dumps({"status": "ok" if ok else "degraded", "inflight": self.backends.inflight,
-                                   "stats": agg("stats"), "prefix_cache": agg("prefix_cache"), "ranks": ranks}).encode()
+                                   "stats": agg("stats"), "prefix_cache": agg("prefix_cache"),
+                                   "config": next((r.get("config") for r in ranks if r.get("config")), None),
+                                   "ranks": ranks}).encode()
                 self.send_response(200 if ok else 503)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))

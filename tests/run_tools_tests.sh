@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Tool calling / response_format tests inside the container: CPU unit tests, then start server.py on --ckpt, run
-# test_tools_server.py and (if an `openai` SDK is importable by $SDK_PY) test_openai_sdk.py, optionally the plumbing
+# Tool calling / response_format / image tests inside the container: CPU unit tests, then start server.py on --ckpt,
+# run test_tools_server.py, test_images_server.py (IMAGE_TESTS=0 skips it) and (if an `openai` SDK is importable by $SDK_PY) test_openai_sdk.py, optionally the plumbing
 # tests (SERVER_TESTS=1: test_server.py), stop the server.
 #   run_tools_tests.sh <ckpt> <port> <log> [server args...] -- [test_tools_server.py args...]
 # SDK venv, once:  python3 -m venv /work/sdkvenv && /work/sdkvenv/bin/pip install openai pydantic
@@ -12,6 +12,7 @@ SARGS=(); while [ $# -gt 0 ] && [ "$1" != "--" ]; do SARGS+=("$1"); shift; done;
 RC=0
 echo "== unit tests (CPU)"
 python3 $SM120_ROOT/tests/test_tools.py --encoding "$CKPT/encoding/encoding.py" || RC=1
+python3 $SM120_ROOT/tests/test_images.py --encoding "$CKPT/encoding/encoding.py" || RC=1
 echo "== server ${SARGS[*]}"
 setsid python3 $SM120_ROOT/server/server.py --ckpt "$CKPT" --port "$PORT" "${SARGS[@]}" > "$LOG" 2>&1 &
 SPID=$!
@@ -30,6 +31,13 @@ echo "== test_tools_server.py"
 EXTRA=(); [[ " ${SARGS[*]} " == *" --deterministic "* ]] || EXTRA+=(--nondeterministic-ok)
 [[ " ${SARGS[*]} " == *" --prefix-cache "* ]] && EXTRA+=(--prefix-cache)
 timeout 1500 python3 $SM120_ROOT/tests/test_tools_server.py --url "$URL" "${EXTRA[@]}" "$@" || RC=1
+if [ "${IMAGE_TESTS:-1}" = 1 ]; then
+    echo "== test_images_server.py"
+    IEXTRA=(); [[ " ${SARGS[*]} " == *" --deterministic "* ]] && IEXTRA+=(--deterministic)
+    [[ " ${SARGS[*]} " == *" --image-fetch-private "* ]] && IEXTRA+=(--fetch-private)
+    grep -q '"vision_synthesized": true' "$CKPT/truncation.json" 2>/dev/null && IEXTRA+=(--zero-vision)
+    timeout 900 python3 $SM120_ROOT/tests/test_images_server.py --url "$URL" "${IEXTRA[@]}" || RC=1
+fi
 if "$SDK_PY" -c "import openai, pydantic" 2>/dev/null; then
     echo "== test_openai_sdk.py"
     timeout 900 "$SDK_PY" $SM120_ROOT/tests/test_openai_sdk.py --url "$URL" || RC=1

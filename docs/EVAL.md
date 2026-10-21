@@ -8,7 +8,7 @@ All tools in `eval/` are stdlib-only clients of any OpenAI-compatible endpoint: 
 |---|---|
 | `eval/compare_endpoints.py` | greedy A/B on identical token ids: exact match, first divergence, position-wise agreement, chosen-token logprob deltas, top-K overlap and deltas, near-tie classification of the divergence. Record/replay (`--save-a`, `--a file:PATH`) for endpoints that cannot run at the same time |
 | `eval/loadgen.py` | closed-loop load at concurrency 1/4/16/64 × prompt 512/4k/32k, 256 output tokens: TTFT, TPOT, E2E p50/p99, output and total tok/s; random token-id prompts (no prefix-cache help) |
-| `eval/quality_check.py` + `eval/quality_set.jsonl` | 25 prompts with known answers: math (5), Python code with asserts (3, `--exec-code` runs them in a separate `python3 -I` process with a timeout), German (4), a fact, an 8k-token passkey needle, tool calling (8) and structured output (3), see below. Items with `known_fail` (currently `math-reason`, which the model gets wrong without thinking mode) are reported as KFAIL/KPASS and not counted. Scores are reported per category |
+| `eval/quality_check.py` + `eval/quality_set.jsonl` | 28 prompts with known answers: math (5), Python code with asserts (3, `--exec-code` runs them in a separate `python3 -I` process with a timeout), German (4), a fact, an 8k-token passkey needle, tool calling (8), structured output (3) and images (3), see below. Items with `known_fail` (currently `math-reason`, which the model gets wrong without thinking mode) are reported as KFAIL/KPASS and not counted. Scores are reported per category |
 
 ## Requirements on the endpoint
 
@@ -35,6 +35,16 @@ the structured result, greedy like the rest:
 | `json-extract-nested` | `json_schema` (strict, nested address object) | valid JSON, valid against the schema, extracted fields correct (age 34, zip 1010, city Wien/Vienna, ...) |
 | `json-enum-sentiment` | `json_schema` with enums | valid against the schema, `sentiment` = negative |
 | `json-object` | `json_object` | valid JSON, `primes` = [2, 3, 5, 7, 11] |
+
+Image items (`image` category; the pictures are small synthetic PNGs embedded as `data:` URLs):
+
+| id | picture | passes when |
+|---|---|---|
+| `image-color` | a green square on white | answer "green" |
+| `image-count` | three blue circles and a small outlined rectangle | answer 3 |
+| `image-read-number` | the number 4862 in large black digits | answer 4862 |
+
+The baseline needs a vLLM deployment with the model's vision support for these; otherwise they fail there for that reason only.
 
 Expectation keys (`quality_check.py --help`): `tool_calls` (each expected call must match a distinct returned call: name and
 argument specs, strings case-insensitive, `{"regex": ...}`, `{"len": n}`), `exact_count`, `no_tool_calls`, `json` with `schema`

@@ -159,6 +159,28 @@ def run(args) -> None:
     check("response_format json_object", ok or r.choices[0].finish_reason == "length",
           f"finish {r.choices[0].finish_reason} {r.choices[0].message.content[:80]!r}")
 
+    # image input: an image_url content part with a data: URL, as the SDK documents it
+    import base64
+    import io
+
+    try:
+        from PIL import Image
+
+        buf = io.BytesIO()
+        Image.new("RGB", (448, 448), (220, 40, 40)).save(buf, "PNG")
+        url = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+        text_only = client.chat.completions.create(model=model, max_tokens=8, temperature=0, messages=[
+            {"role": "user", "content": "What is in this picture?"}])
+        r = client.chat.completions.create(model=model, max_tokens=8, temperature=0, messages=[
+            {"role": "user", "content": [{"type": "text", "text": "What is in this picture?"},
+                                         {"type": "image_url", "image_url": {"url": url, "detail": "auto"}}]}])
+        check("image_url content part (data: URL)", r.usage.prompt_tokens > text_only.usage.prompt_tokens + 16,
+              f"prompt tokens {text_only.usage.prompt_tokens} -> {r.usage.prompt_tokens}")
+    except ImportError:
+        print("  (Pillow not installed: image check skipped)")
+    except openai.BadRequestError as exc:
+        check("image_url content part (data: URL)", False, str(exc)[:160])
+
     try:
         client.chat.completions.create(model=model, messages=msgs, tools=tools,
                                        tool_choice={"type": "function", "function": {"name": "nope"}})

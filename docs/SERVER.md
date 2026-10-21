@@ -10,6 +10,7 @@ starts this server.
 | `server/server.py` | HTTP layer, OpenAI request/response mapping, chat template, incremental detokenisation, stop strings, SSE |
 | `server/engine.py` | `EngineLoop`: owns the DeepInfer engine on one thread, continuous batching, add/abort between steps |
 | `server/tools.py` | tool calling and `response_format`: request → encoding.py messages, DSML tool-call parser (complete and streaming), output grammars |
+| `server/images.py` | image input: `image_url` parts (data: / http(s)) → validated image bytes and sizes for DeepInfer's multimodal path |
 | `server/logprob_tap.py` | raw-logit logprobs (OpenAI `logprobs` / `top_logprobs`); DeepInfer's own logprobs are post-temperature |
 | `server/dp_proxy.py` | `--dp N`: one engine process per GPU (DP attention + EP MoE) behind a least-loaded proxy |
 | `server/bench_client.py` | TTFT / TPOT client: multi-turn streaming chat (exercises the prefix cache) + concurrent burst |
@@ -18,7 +19,8 @@ starts this server.
 | `tests/run_server_tests.sh` | start the server, wait for `/health`, run the tests, stop |
 | `tests/test_tools.py` | CPU unit tests of `server/tools.py` (rendering, parsing, streaming parser, grammars) |
 | `tests/test_tools_server.py`, `tests/test_openai_sdk.py` | tool calling / `response_format` against a running server, with a stdlib client and with the official `openai` SDK |
-| `tests/run_tools_tests.sh` | unit tests, then start the server and run both of the above (optionally `test_server.py` too) |
+| `tests/test_images.py`, `tests/test_images_server.py` | image input: CPU unit tests of `server/images.py`; server tests (formats, token counts, image changes the output, limits, 400s) |
+| `tests/run_tools_tests.sh` | unit tests, then start the server and run the tool, image and SDK tests (optionally `test_server.py` too) |
 | `tools/diag_repeat.py` | determinism and per-step latency probe of the bare engine (no HTTP) |
 
 ## Run
@@ -56,7 +58,7 @@ The OpenAI Python client works with `base_url="http://host:8000/v1"` and any `ap
 | `GET /v1/models` | the one model (`--model-name`, default the checkpoint directory name) and its `max_model_len` |
 | `GET /health` | `{"status": "ok" \| "dead", "stats": {...}}`: engine steps, flushes, added, aborted, finished, max_running, busy_s (+ `prefix_cache` stats when enabled) |
 | `POST /v1/completions` | `prompt`: a string, a one-element list of strings, or a list of token ids. `max_tokens`, `temperature`, `top_p`, `top_k`, `stop` (string or up to 4 strings), `seed`, `ignore_eos`, `stream`, `stream_options.include_usage`. Extension: `return_token_ids` (non-streaming) |
-| `POST /v1/chat/completions` | `messages` rendered with the checkpoint's `encoding/encoding.py` (`encode_messages`, `thinking_mode="chat"`). `"thinking": true` or `reasoning_effort` select `thinking` mode; the text before `</think>` is returned as `message.reasoning_content` (streaming: `delta.reasoning_content`). Same sampling fields, plus `max_completion_tokens`. `tools`, `tool_choice`, `parallel_tool_calls`, `response_format`: see [Tool calling and structured output](#tool-calling-and-structured-output) |
+| `POST /v1/chat/completions` | `messages` rendered with the checkpoint's `encoding/encoding.py` (`encode_messages`, `thinking_mode="chat"`). `"thinking": true` or `reasoning_effort` select `thinking` mode; the text before `</think>` is returned as `message.reasoning_content` (streaming: `delta.reasoning_content`). Same sampling fields, plus `max_completion_tokens`. `tools`, `tool_choice`, `parallel_tool_calls`, `response_format`: see [Tool calling and structured output](#tool-calling-and-structured-output); `image_url` content parts: see [Image input](#image-input) |
 
 **Logprobs** (non-streaming, nextn 0): completions `logprobs: K` → `{tokens, token_logprobs, top_logprobs, text_offset}`;
 chat `logprobs: true, top_logprobs: K` → `{content: [{token, logprob, bytes, top_logprobs}]}`. K <= 20. These are log_softmax of the
@@ -68,7 +70,7 @@ PORT+1..PORT+N. `dp_proxy.py` serves PORT and routes each POST to the least-load
 ranks poll every 5 ms, because `has_unfinished_requests` is a DP-group all-reduce. Tested only with one rank (`--force-proxy`);
 EP with N=4 has not run on real hardware yet ([MULTI_GPU_RUNBOOK.md](MULTI_GPU_RUNBOOK.md)).
 
-**Not supported:** `n > 1`, `best_of`, streaming logprobs, `echo`, the legacy `functions` / `function_call` fields, images, and `presence`/`frequency_penalty`/`logit_bias` (DeepInfer's `SamplingParams` has none of them).
+**Not supported:** `n > 1`, `best_of`, streaming logprobs, `echo`, the legacy `functions` / `function_call` fields, audio, and `presence`/`frequency_penalty`/`logit_bias` (DeepInfer's `SamplingParams` has none of them).
 `max_tokens` defaults to the remaining context and is capped at `max_model_len - prompt - 1`.
 
 Details:
@@ -180,6 +182,37 @@ power-of-two length up to `--max-num-batched-tokens` right after start-up avoids
 (`test_tools_server.py --warm-prefill`). A batch of 9 constrained requests after such a history still crashed. Until this is
 fixed, use eager mode (`--no-graphs` in the image) for tool calling and structured output. After a crash, `/health` reports
 `dead` and requests fail immediately.
+
+## Image input
+
+Chat messages can contain OpenAI image parts: `{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}` or an
+`http(s)://` URL (`detail` is accepted and ignored). The checkpoint's encoding.py puts one `<｜deepseek_image｜>` placeholder
+per image into the prompt. The server fetches and checks every image (PNG, JPEG, WebP, GIF, BMP; full decode with Pillow)
+and passes the encoded bytes and the decoded size to DeepInfer (`add_request(multi_modal_data={"image_bytes", "image_sizes"})`).
+DeepInfer expands each placeholder to the image's token span and runs its own preprocessing and vision encoder. An image costs
+a size-dependent number of prompt tokens, at most `vision_config.max_image_tokens` (1024 for V4.1-Flash); `usage.prompt_tokens`
+and the `max_tokens` budget include them.
+
+| option | default | |
+|---|---|---|
+| `--max-images` | 8 | images per request (all messages together) |
+| `--max-image-bytes` | 20 MiB | encoded size per image |
+| `--max-image-pixels` | 50,000,000 | width × height per image, checked before decoding |
+| `--no-image-urls` | off | refuse `http(s)` URLs, accept only `data:` URLs |
+| `--image-fetch-private` | off | allow URLs whose host resolves to a loopback / private / link-local address (SSRF protection when off); redirects are never followed |
+| `--image-fetch-timeout` | 10 s | per URL |
+
+Images are accepted in user (and system) messages; image parts in assistant or tool messages, local file paths, `file:` URLs,
+unsupported formats, corrupt files and anything over a limit get a 400 with the reason. Requests with images bypass the prefix
+cache (`prefix_cache.py` does not cache multimodal prompts). The image preprocessing runs in DeepInfer's multimodal worker
+processes, which use a pinned host memory pool (`DEEPINFER_USE_MULTIMODAL_POOL`, `DEEPINFER_MULTIMODAL_POOL_SIZE_GB`). One
+in-flight request holds its resized images there until its prefill: about 5.1 MB per full-size image (1024 tokens), about
+0.9 MB at the minimum size, plus 4 bytes per prompt token. A request that does not fit the whole pool would wait until
+`DEEPINFER_MULTI_MODAL_WORKER_TIMEOUT`, so keep `--max-images` × 5.1 MB well below the pool size (the default 8 images need
+about 41 MB; a 2 GB pool per GPU is plenty). Pillow's decompression-bomb guard is off in DeepInfer's worker, which is why the
+server checks `--max-image-pixels` before anything is decoded.
+
+IMAGES_RESULTS_PLACEHOLDER
 
 ## How the engine is driven (`server/engine.py`)
 

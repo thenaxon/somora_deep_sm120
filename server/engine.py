@@ -50,6 +50,7 @@ class GenRequest:
     ignore_eos: bool = False
     logprobs: int = 0  # top-K raw-logit logprobs per output token (logprob_tap.py), 0 = off
     so_args: dict | None = None  # structured output (DeepInfer SamplingParams.so_args; tools.py builds it)
+    multi_modal_data: dict | None = None  # images: {"image_bytes": [...], "image_sizes": [(w, h)]} (images.py)
     request_id: str = ""
     # filled by the engine thread: ("token", token_id, finished, finish_reason, (top_ids, top_logprobs) | None)
     #                              | ("error", message)
@@ -112,6 +113,18 @@ class EngineLoop:
         self._stop.set()
         self._inbox.put(("noop", None))
         self._thread.join(timeout=60)
+
+    @property
+    def vision(self) -> bool:
+        """The engine has DeepInfer's multimodal (image) processor."""
+        return getattr(getattr(self, "engine", None), "multi_modal_processor", None) is not None
+
+    def image_tokens(self, width: int, height: int) -> int:
+        """Prompt tokens one image of this size expands to (DeepInfer's own estimate; pure arithmetic, any thread)."""
+        from deepinfer.ve.processor.common import ImageInput
+
+        mmp = self.engine.multi_modal_processor
+        return int(mmp.mm_processor.image_processor.estimate_num_tokens(ImageInput(width=width, height=height)))
 
     @property
     def alive(self) -> bool:
@@ -234,8 +247,14 @@ class EngineLoop:
             extra = {"so_args": r.so_args} if r.so_args is not None else {}
             sp = self._SamplingParams(temperature=r.temperature, top_p=r.top_p, top_k=r.top_k, max_tokens=r.max_tokens,
                                       ignore_eos=r.ignore_eos, seq_seed=r.seed, **extra)
+            mmd = r.multi_modal_data
+            if mmd is None and self.engine.multi_modal_processor is not None:
+                # as LLM.generate does: with a multimodal processor every prompt carries multi_modal_data, else a
+                # text-only prompt batched with image prompts breaks the batch's mm_token_type (deepseek_vl.py)
+                mmd = {"image_bytes": [], "image_sizes": []}
+            mm = {"multi_modal_data": mmd} if mmd is not None else {}
             seq = self.engine.add_request(user_id="0", request_id=r.request_id, sampling_params=sp,
-                                          prompt_token_ids=np.asarray(r.prompt_ids, dtype=np.int32))
+                                          prompt_token_ids=np.asarray(r.prompt_ids, dtype=np.int32), **mm)
         except Exception as exc:  # noqa: BLE001  (bad sampling params, empty prompt, ...)
             r.out.put(("error", f"{type(exc).__name__}: {exc}"))
             return

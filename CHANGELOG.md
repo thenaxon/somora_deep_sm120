@@ -16,7 +16,12 @@ before 1.0 any minor release may change interfaces.
   `response_format` output follows the schema. In thinking mode the grammar starts after `</think>`.
 - Tests: `tests/test_tools.py` (CPU), `tests/test_tools_server.py`, `tests/test_openai_sdk.py` (official `openai`
   SDK incl. `chat.completions.parse` with pydantic), `tests/run_tools_tests.sh`.
-- `eval/quality_set.jsonl`: 8 tool-calling and 3 structured-output items; `eval/quality_check.py` scores them.
+- Image input in `/v1/chat/completions`: OpenAI `image_url` content parts (`data:` base64 and `http(s)` URLs), passed to
+  DeepInfer's multimodal path (`server/images.py`). Limits: `--max-images`, `--max-image-bytes`, `--max-image-pixels`,
+  `--no-image-urls`; URLs on private addresses are refused unless `--image-fetch-private`. Image tokens count in
+  `usage.prompt_tokens`. Tests: `tests/test_images.py` (CPU), `tests/test_images_server.py`, an SDK image check.
+- `eval/quality_set.jsonl`: 8 tool-calling, 3 structured-output and 3 image items; `eval/quality_check.py` scores them
+  and reports scores per category.
 
 ### Changed
 - Multi-GPU runbook: Hugging Face hub caches must be mounted at their root (snapshot files are symlinks into

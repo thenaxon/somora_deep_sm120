@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Regression: decode CUDA graphs must survive b12x plans prepared lazily after capture (a first-seen longer
-# prefill). Before the fix, b12x evicted the captured programs at the end of that preparation and the next
-# graph replay died with "CUDA error: an illegal instruction was encountered".
+# Regression: decode CUDA graphs must survive b12x plans prepared lazily after capture (first-seen prompt
+# lengths after a history of 19 requests: 30, 549, 1100, 2200, 6000 tokens). Before the fix, b12x evicted
+# the captured programs at the end of such a preparation and the next graph replay died with
+# "CUDA error: an illegal instruction was encountered" (once "an illegal memory access").
 #   graph_replay_lazy_prep.sh [ckpt ...]     (default: ckpt3, ckpt_yoco_engram, ckpt_full)
 # Negative control (NEG=1): the same on the first ckpt with SM120_RETAIN_GRAPH_PROGRAMS=0, expected to FAIL.
 # Container paths (override via env): SM120_ROOT=/opt/sm120 (this repo), WORK=/work (work dir).

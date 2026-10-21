@@ -1,5 +1,7 @@
 """Client for graph_replay_lazy_prep.sh: short completions, then a longer prompt whose prefill prepares new
-b12x plans while the server runs; the decode graphs captured at start-up must keep replaying.
+b12x plans while the server runs; the decode graphs captured at start-up must keep replaying. The later
+prompts are first-seen sizes (short, medium, a chunked prefill beyond 4k), each of which used to be able to
+trigger the crash on its own after the history.
 
     python3 graph_replay_lazy_prep.py --url http://127.0.0.1:8125 [--short 19] [--long 549]
 
@@ -21,7 +23,8 @@ def main() -> int:
     ap.add_argument("--url", default="http://127.0.0.1:8125")
     ap.add_argument("--short", type=int, default=len(SHORT_MAX_TOKENS), help="number of short requests")
     ap.add_argument("--short-len", type=int, default=469)
-    ap.add_argument("--long", type=int, nargs="+", default=[549, 1100, 2200], help="longer prompts, in order")
+    ap.add_argument("--long", type=int, nargs="+", default=[30, 549, 1100, 2200, 6000],
+                    help="first-seen prompt lengths sent after the history, in order")
     args = ap.parse_args()
     u = urlparse(args.url)
 

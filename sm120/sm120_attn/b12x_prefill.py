@@ -220,16 +220,24 @@ def sparse_prefill_b12x(q: torch.Tensor, kv: torch.Tensor, indices: torch.Tensor
     if topk_length is not None:
         pos = torch.arange(topk, device=dev).view(1, -1)
         valid &= pos < topk_length.to(torch.long).view(-1, 1)
+    # Widths of the two index lists: the longest list is read back (one host sync per layer, 40 per prefill step)
+    # and the plan narrowed to it. SM120_ATTN_PREFILL_SYNC=0 uses the static bound (top-k) instead: no sync, but the
+    # extend kernel's cost follows the plan width, not the row lengths (RTX 5090, ckpt_full, 4096-token step: GPU
+    # time 2x, TTFT 0.97 -> 1.8 s), so it only pays where the host, not the GPU, bounds the step.
+    sync = os.environ.get("SM120_ATTN_PREFILL_SYNC", "1") != "0"
     if fp4_cache is not None:
         in_fp4 = is_fp4[idx.clamp(0, s_kv - 1).long()] & valid
         i1, l1 = _compact_mask(idx, valid & ~in_fp4)
         i2, l2 = _compact_mask(idx, in_fp4)
-        m1, m2 = (int(v) for v in torch.stack((l1.max(), l2.max())).tolist())
-        if m2 == 0:  # no FP4-exact token selected: single-cache plan
-            fp4_cache = None
+        if sync:
+            m1, m2 = (int(v) for v in torch.stack((l1.max(), l2.max())).tolist())
+            if m2 == 0:  # no FP4-exact token selected: single-cache plan
+                fp4_cache = None
+        else:
+            m1 = m2 = topk
     else:
         i1, l1 = _compact_mask(idx, valid)
-        m1, m2 = int(l1.max().item()), 0
+        m1, m2 = (int(l1.max().item()) if sync else topk), 0
     T1 = _width(m1, topk)
     T2 = _width(m2, topk) if fp4_cache is not None else 0
     i1 = i1[:, :T1] if T1 <= topk else torch.nn.functional.pad(i1, (0, T1 - topk), value=-1)

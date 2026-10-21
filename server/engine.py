@@ -203,6 +203,14 @@ class EngineLoop:
             for r in list(self._live.values()):
                 r.out.put(("error", f"engine crashed: {exc!r}"))
             self._live.clear()
+            return
+        # Orderly shutdown: close the engine here, on its own thread, while the interpreter is intact. Left to
+        # LLMEngine.__del__ at interpreter exit, unpinning the multimodal pool fails (ImportError: sys.meta_path
+        # is None) and the still exported pool mapping raises BufferError in SharedMemory.__del__.
+        try:
+            self.llm.close()
+        except Exception:  # noqa: BLE001
+            log.exception("engine close failed")
 
     def _drain(self, block: bool) -> None:
         """Apply queued commands; block (with a timeout, so shutdown is seen) only when the engine is idle."""

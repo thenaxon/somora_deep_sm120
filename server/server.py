@@ -404,7 +404,17 @@ class App:
                                  if args.prefix_cache else None)
 
 
+_MAIN_PID = os.getpid()
+
+
 def _sigterm(signum, frame):
+    """docker stop / kill -TERM in the server process: unwind through the finally blocks (KeyboardInterrupt).
+
+    Processes forked from it (DeepInfer's multimodal workers) inherit this handler; DeepInfer stops them with
+    terminate() and they have nothing to clean up, so they exit at once instead of printing a KeyboardInterrupt
+    traceback from inside their queue read."""
+    if os.getpid() != _MAIN_PID:
+        os._exit(0)
     raise KeyboardInterrupt
 
 

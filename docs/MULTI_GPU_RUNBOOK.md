@@ -114,6 +114,13 @@ docker logs -f sm120-serve     # 4 ranks start (one engine process per GPU, NCCL
 curl -s localhost:8100/health | python3 -m json.tool
 ```
 
+- NCCL P2P: the dp proxy self-tests peer copies and then starts the ranks with `NCCL_P2P_LEVEL=SYS` (without it,
+  NCCL 2.29 routes all EP traffic through host memory on hosts whose GPUs hang off different root ports). Add
+  `-e NCCL_DEBUG=INFO` once and check that the channel lines say "via P2P" ([MULTI_GPU.md](MULTI_GPU.md) §4a). If P2P
+  is not usable, `-e SM120_EP_TRANSPORT=b12x -e SM120_EP_B12X_MAX_ROWS=4096` moves the prefill collectives to b12x's
+  CUDA-IPC two-shot kernels (run `tests/test_ep_b12x_transport.py` with torchrun first).
+- `--prefix-cache` splits prefills only at multiples of `--max-num-batched-tokens` (v0.2.1); with v0.2.0 add
+  `--prefix-cache-grain 4096`.
 - `--dp 4` means DP attention + EP MoE (`--ep` defaults to `--dp`). It runs one engine process per GPU on ports
   8001-8004 inside the container, plus a least-loaded proxy on 8000 (`server/dp_proxy.py`). Prefix caches are per rank.
 - Memory per GPU (estimate): about 73 GB of routed experts (384/4 per layer x 40 layers) plus about 10 GB replicated

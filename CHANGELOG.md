@@ -11,7 +11,13 @@ before 1.0 any minor release may change interfaces.
   210 GB available for 203 GB of tables. `SM120_ENGRAM_PREFAULT=force` prefaults regardless.
 
 ### Added
+- `SM120_ENGRAM_PIN=mlock`: after load, rank 0 prefaults the engram tables and locks them. All ranks share that one
+  locked page-cache copy (memory counted once), so the tables stay fully in RAM like the baseline's pinned copy.
+  - The server refuses to start, with a message naming the numbers, if the tables plus
+    `SM120_ENGRAM_PIN_HEADROOM_GB` (default 8) do not fit into MemAvailable, or if `RLIMIT_MEMLOCK` is too low.
+  - With `--dp` the proxy then stops all ranks.
 - `SM120_ENGRAM_RESIDENCY_INTERVAL`: periodic page-cache residency log of the engram tables while serving.
+- The server logs each rank's host footprint after load (anon, shmem, page tables, torch's pinned cache).
 
 ## [0.2.1] - 2026-10-21
 

@@ -200,9 +200,14 @@ def run(argv: list[str], dp: int, host: str, port: int) -> int:
         try:  # every rank has loaded its weights: Engram page-cache policy (prefault etc.) once, on rank 0, before serving
             req = urllib.request.Request(f"http://127.0.0.1:{ports[0]}/internal/engram_cache_policy", data=b"{}",
                                          headers={"Content-Type": "application/json"})
-            log.info("engram page-cache policy on rank 0: %s", urllib.request.urlopen(req, timeout=3600).read().decode())
+            reply = urllib.request.urlopen(req, timeout=3600).read().decode()
+            log.info("engram page-cache policy on rank 0: %s", reply)
+            fatal = ((json.loads(reply).get("result") or {}).get("fatal"))
         except Exception as exc:  # noqa: BLE001
             log.warning("engram page-cache policy request failed: %r", exc)
+            fatal = None
+        if fatal:  # SM120_ENGRAM_PIN cannot be honoured: stop all ranks instead of serving without the guarantee
+            raise SystemExit(f"engram tables cannot be pinned: {fatal}")
         ProxyHandler.backends = Backends(ports)
         ThreadingHTTPServer.request_queue_size = 1024  # listen backlog (socketserver default 5)
         httpd = ThreadingHTTPServer((host, port), ProxyHandler)

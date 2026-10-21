@@ -58,31 +58,45 @@ at start-up and again after the post-load step (`[sm120_engram] engram tables re
 
 | MemAvailable after start-up | mode | flags |
 |---|---|---|
-| >= tables + 10 % (about 225 GB; i.e. about 265 GB free before start-up) and room to page-lock them | `uva`: one pinned copy, pure GPU gathers (untested) | `-e SM120_ENGRAM_MODE=uva --ulimit memlock=-1` |
-| >= tables + 4 GiB (about 207 GB) | **`host` + prefault**: once all ranks have loaded their weights, rank 0 drops the weight shards' page-cache pages and reads both tables into the page cache (sequential reads, about 1 min at 3.5 GB/s); afterwards lookups do no I/O at all | `-e SM120_ENGRAM_MODE=host -e SM120_ENGRAM_PREFAULT=1` (0.2.1: `=force`, its rule wanted tables + 5 %) |
-| below that | **`uring`** (O_DIRECT reads per lookup batch, no page-cache thrash, flat latency) | `-e SM120_ENGRAM_MODE=uring -e SM120_ENGRAM_THREADS=16 --security-opt seccomp=unconfined --ulimit memlock=-1` |
+| >= tables + 8 GiB (about 212 GB, tables 188.8 GiB) | **`host` + pinned tables** (recommended): once all ranks have loaded their weights, rank 0 drops the weight shards' page-cache pages, reads both tables into the page cache (sequential reads, about 1 min at 3.5 GB/s) and `mlock`s them. The locked pages are the shared page cache of the shard files, so the 4 ranks share one locked copy (measured: two processes locking the same 16 GiB raise `Mlocked` by 16 GiB, not 32). The kernel cannot evict them; lookups never do I/O. Start-up fails with a clear message if the tables plus `SM120_ENGRAM_PIN_HEADROOM_GB` (8) do not fit | `-e SM120_ENGRAM_MODE=host -e SM120_ENGRAM_PIN=mlock --ulimit memlock=-1 -e DEEPINFER_MULTIMODAL_POOL_SIZE_GB=1` |
+| >= tables + 4 GiB | `host` + prefault (best effort: page cache, no lock; process growth evicts table pages) | `-e SM120_ENGRAM_MODE=host -e SM120_ENGRAM_PREFAULT=1` (0.2.1: `=force`) |
+| below that | `uring` (O_DIRECT reads per lookup batch, flat latency) | `-e SM120_ENGRAM_MODE=uring -e SM120_ENGRAM_THREADS=16 --security-opt seccomp=unconfined --ulimit memlock=-1` |
 
-The prefault does not risk an OOM: the table pages are clean page cache, which the kernel evicts when a process needs
-memory (those rows are then read from the NVMe again). Not reclaimable without swap are anonymous memory, `/dev/shm`
-(the multimodal pools) and page-locked memory (`uva`, pinned staging); those set the real limit. To get room for the
-tables, shrink them first: `-e DEEPINFER_USE_MULTIMODAL_POOL=0` (no image requests) frees the 4 x 2 GB pinned pools.
-Do not `mlock` the tables or part of them: without swap a locked page cache plus growing processes is an OOM.
-`-e SM120_ENGRAM_RESIDENCY_INTERVAL=300` logs the residency every 5 minutes, which shows whether the tables stay.
+`uva` (pinning through `cudaHostRegister`) does not work with the shard mmaps: registering read-only file pages fails
+with `cudaErrorNotSupported` (measured on the RTX 5090 test machine), so `mlock` is the way to pin.
 
-**NVMe behind an IOMMU in translated mode.** Check `cat /sys/kernel/iommu_groups/*/type` and
-`/sys/bus/pci/devices/<nvme>/untrusted`. If the model NVMe sits in a group of type `DMA` despite `iommu=pt` (for
-example behind a USB4/Thunderbolt switch, which marks it untrusted), every NVMe completion pays an IOTLB flush under a
-global spinlock. Random 4 KiB engram reads then cost far more CPU, and concurrency makes it worse:
-- On one 4-GPU host this was about 18 % of a rank's CPU time.
+**Memory budget for `--dp 4` on a 246 GiB host without swap.** Per rank, measured on the RTX 5090 test machine after
+load and a few 4k/32k requests:
+
+| | per rank | 4 ranks |
+|---|---|---|
+| anonymous memory (CUDA runtime, torch, DeepInfer, Python; `MALLOC_ARENA_MAX=2` saves nothing) | 2.2-2.8 GiB | 9-11 GiB |
+| multimodal pool (`/dev/shm`, not reclaimable), image default 2 GB | 2.0 GiB, **1.0 GiB with `DEEPINFER_MULTIMODAL_POOL_SIZE_GB=1`** | 8 GiB -> 4 GiB |
+| page tables (VmPTE; grows while a rank maps more table pages, up to about 0.4 GiB per rank for 189 GiB) | 0.35-0.4 GiB | 1.5 GiB |
+| torch's pinned host cache | 0.07 GiB | 0.3 GiB |
+| engram staging (pinned) | 0.05 GiB | 0.2 GiB |
+| sum | 5.5 GiB, 4.5 GiB with the 1 GB pool | 22 GiB, 18 GiB |
+
+The server prints this per rank after load (`[sm120_engram] host footprint of this rank (GiB): ...`).
+- On the 4-GPU host MemAvailable after load was about 195.6 GiB. Pinning the 188.8 GiB of tables leaves about 6.8 GiB
+  free; with the 1 GB pools about 10.8 GiB.
+- The rest of the about 50 GiB in use there is the host's own (kernel, GPU driver, other services). A read-only check
+  of who holds it (`smem -tk`, `/proc/meminfo`) is worth adding to the next host report.
+- `DEEPINFER_MULTIMODAL_POOL_SIZE_GB=0.5` frees another 2 GiB: about 100 full-resolution images in flight per rank.
+- Without swap, the locked tables and `/dev/shm` are fixed. A process that grows past the remaining headroom is
+  OOM-killed instead of evicting table pages, so keep the headroom at 8 GiB or more and watch
+  `SM120_ENGRAM_RESIDENCY_INTERVAL=300` (residency and MemAvailable every 5 minutes) on the first runs.
+
+**NVMe behind a translating IOMMU** (read the facts for a report: `cat /sys/kernel/iommu_groups/*/type`,
+`/sys/bus/pci/devices/<nvme>/untrusted`).
+- If the model NVMe sits in a group of type `DMA` despite `iommu=pt`, for example behind a USB4/Thunderbolt switch,
+  every NVMe completion pays an IOTLB flush under a global spinlock.
+- On one 4-GPU host that was about 18 % of a rank's CPU time.
 - A 4k chunk's gather took 1.6 s with 16 gather threads plus prefetch, and 0.16 s with 4 threads and no prefetch.
 
-What to do, best first:
-1. Keep the tables resident (host + prefault, above), so no I/O happens while serving.
-2. Move the NVMe to a CPU-attached slot.
-3. Try `iommu.strict=0` (lazy IOTLB flushes; it may not apply to untrusted devices).
-4. Use few I/O threads: `SM120_ENGRAM_THREADS=4`, `SM120_ENGRAM_PREFETCH=0`, `OMP_NUM_THREADS=8`.
-   `SM120_ENGRAM_URING_MMAP_TOKENS=1000000000` keeps `uring` prefill on O_DIRECT (one submitter, batched
-   completions) instead of page faults from many threads.
+Pinned tables avoid it entirely, because there is no I/O while serving. Without them, use few I/O threads:
+`SM120_ENGRAM_THREADS=4`, `SM120_ENGRAM_PREFETCH=0`, `OMP_NUM_THREADS=8`. In `uring` mode,
+`SM120_ENGRAM_URING_MMAP_TOKENS=1000000000` keeps prefill on O_DIRECT (one submitter, batched completions).
 
 `host` without prefault also works below the threshold (page cache as LRU, NVMe serves misses). Two defaults make
 the cold case cheap in both modes:
@@ -103,9 +117,9 @@ All 4 rank processes map the same files, so the page cache holds one copy.
 - Count free RAM **with the baseline stopped**: a running baseline may pin its own copy of the engram tables.
 - The 4 rank processes also need host memory of their own (CUDA contexts, pinned staging buffers, the loader).
   Budget roughly 5-10 GB per rank and check `free -g` after start-up.
-- Prefaulted pages are ordinary page cache, not locked memory: under memory pressure the kernel evicts them and
-  misses are read from NVMe again (slower, but no OOM). This also holds without swap. `uva` instead page-locks the
-  whole 203 GB and needs that much RAM on top of everything else.
+- Prefaulted pages (`SM120_ENGRAM_PREFAULT=1`) are ordinary page cache: under memory pressure the kernel evicts them
+  and misses are read from NVMe again (slower, but no OOM). Pinned pages (`SM120_ENGRAM_PIN=mlock`) cannot be
+  evicted: one locked copy of 188.8 GiB, which is why the start-up checks the headroom first.
 - **Multimodal pool (pinned host RAM per rank, on top of the engram budget above).** Each engine process pins a
   `DEEPINFER_MULTIMODAL_POOL_SIZE_GB` buffer (`multiprocessing.shared_memory`, `/dev/shm/psm_*`). The multimodal
   worker processes use it to hand preprocessed images to the engine. DeepInfer's default is 8 GB, i.e. 32 GB pinned

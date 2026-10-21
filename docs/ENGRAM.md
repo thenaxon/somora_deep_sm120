@@ -358,7 +358,9 @@ original shard directory must be visible at the same absolute path wherever the 
   each rank maps the same files and the page cache holds **one shared copy** (203 GB for both tables). Nothing is
   replicated per rank and nothing is exchanged between GPUs. Row sharding plus all-to-all only pays off when shards sit
   in GPU memory, and ~51 GB per GPU next to the weights does not fit on 96 GB cards.
-- **RAM >= ~260 GB** (tables + headroom): `SM120_ENGRAM_PREFAULT=1` keeps everything cached. `SM120_ENGRAM_MODE=uva` is
+- **MemAvailable after start-up >= tables + 4 GiB (about 207 GB)**: `host` with `SM120_ENGRAM_PREFAULT=1` keeps
+  everything cached. Lookups then do no NVMe I/O, which matters most where the NVMe sits behind a translating IOMMU
+  (MULTI_GPU_RUNBOOK.md §3). The cached pages stay reclaimable, so this carries no OOM risk. `SM120_ENGRAM_MODE=uva` is
   better in principle: every process registers the same file pages (one pinned physical copy), lookups are pure GPU
   gathers over PCIe and the CPU is not involved. It needs `cudaDevAttrHostRegisterReadOnlySupported` and a raised
   locked-memory limit (`--ulimit memlock=-1`). Untested.
@@ -382,7 +384,9 @@ original shard directory must be visible at the same absolute path wherever the 
 | `SM120_ENGRAM_MODE` | `auto` (= `host`) | `host`, `uva`, `uring` (see §3); the serving image sets `host` |
 | `SM120_ENGRAM_GRAPH` | `async` | CUDA-graph fetch mode: `async` or `prestage` |
 | `SM120_ENGRAM_PRESTAGE` | 1 | 0 skips prestaging (negative control only) |
-| `SM120_ENGRAM_PREFAULT` | 0 | 1 reads the whole tables into the page cache. The server does it once after every rank has loaded its weights, before it accepts requests (`--dp`: the proxy asks rank 0), and skips it when the tables exceed MemAvailable (use `uring` there) |
+| `SM120_ENGRAM_PREFAULT` | 0 | 1 reads the whole tables into the page cache. The server does it once after every rank has loaded its weights, before it accepts requests (`--dp`: the proxy asks rank 0), and skips it when the tables do not fit into MemAvailable minus `SM120_ENGRAM_PREFAULT_HEADROOM_GB` (use `uring` there). `force` prefaults regardless |
+| `SM120_ENGRAM_PREFAULT_HEADROOM_GB` | 4 | MemAvailable that the prefault leaves free. A partial prefault is not offered: on the RTX 5090 test machine it made cold prefills 20 % slower (page-cache pressure), and the second table's pages evicted the first's |
+| `SM120_ENGRAM_RESIDENCY_INTERVAL` | 0 | seconds between residency log lines while serving (process that ran the post-load policy; mincore, about 1 s per 200 GiB) |
 | `SM120_ENGRAM_PREFAULT_AT` | `attach` (library), `ready` (server) | when the prefault runs |
 | `SM120_ENGRAM_DROP_WEIGHT_PAGES` | 1 | server: after load, drop the other shards' clean page-cache pages (posix_fadvise DONTNEED) so they do not compete with the tables |
 | `SM120_ENGRAM_RESIDENCY` | 1 | log the tables' page-cache residency and MemAvailable at attach and after load (mincore) |

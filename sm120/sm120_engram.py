@@ -27,6 +27,9 @@ Environment (all optional):
     SM120_ENGRAM_PREFAULT=0|1               read the whole table into the page cache ("ram mode"): at attach, or
                                             with SM120_ENGRAM_PREFAULT_AT=ready (server default) once all ranks
                                             have loaded their weights (post_load_cache_policy)
+    SM120_ENGRAM_PREFAULT_HEADROOM_GB=<g>   prefault only if the tables fit into MemAvailable minus g GiB (default
+                                            4); SM120_ENGRAM_PREFAULT=force prefaults regardless
+    SM120_ENGRAM_RESIDENCY_INTERVAL=<s>     log the tables' page-cache residency every s seconds (default 0 = off)
     SM120_ENGRAM_DROP_WEIGHT_PAGES=1|0      server: drop the other shards' page-cache pages after load
     SM120_ENGRAM_STATS=0|1                  print fetch / gather / wait statistics at exit and every
                                             SM120_ENGRAM_STATS_INTERVAL seconds (default 60) while they change
@@ -234,6 +237,36 @@ def resident_bytes(path: str, offset: int = 0, length: int | None = None, chunk:
 _TABLES: list = []  # every checkpoint-backed table opened in this process (post_load_cache_policy)
 
 
+def _prefault_policy(tables: list, force: bool) -> dict:
+    """Prefault after load: the whole tables when they fit into MemAvailable minus SM120_ENGRAM_PREFAULT_HEADROOM_GB
+    (default 4), otherwise nothing (the scale planes are resident anyway). `force` reads everything.
+
+    Page-cache pages are clean and reclaimable: a prefault never causes an OOM, the kernel evicts table pages when
+    processes need memory (then those rows are read from the NVMe again). What is not reclaimable without swap:
+    anonymous memory, /dev/shm (the multimodal pools) and page-locked memory (uva, pinned staging)."""
+    size, avail = sum(t.nbytes for t in tables), _mem_available()
+    headroom = float(_env("SM120_ENGRAM_PREFAULT_HEADROOM_GB", "4")) * 2**30
+    # MemAvailable counts reclaimable page cache, the table pages already resident included: the tables can hold at
+    # most MemAvailable minus the headroom
+    budget = None if avail is None else avail - headroom
+    t0 = time.time()
+    if force or budget is None or size <= budget:
+        for t in tables:
+            t.prefault()
+        what = "the whole tables"
+    else:
+        # a partial prefault fills the page cache without holding the tables: on the RTX 5090 test machine (25 % of
+        # every weight plane) the page-cache pressure made cold prefills 20 % slower, and the second table's pages
+        # evicted the first's
+        print(f"[sm120_engram] prefault skipped: tables {size / 2**30:.0f} GiB > MemAvailable {avail / 2**30:.0f} GiB - "
+              f"{headroom / 2**30:.0f} GiB headroom (SM120_ENGRAM_PREFAULT_HEADROOM_GB); the page cache serves as an "
+              f"LRU instead (docs/ENGRAM.md §7)", flush=True)
+        return {"prefault_s": None}
+    dt = time.time() - t0
+    print(f"[sm120_engram] prefaulted {what} after load in {dt:.0f} s", flush=True)
+    return {"prefault_s": round(dt, 1)}
+
+
 def post_load_cache_policy(ckpt_dir: str | None) -> dict:
     """Page-cache policy after the weights of every rank are loaded (server: once, on one process per host).
 
@@ -263,18 +296,9 @@ def post_load_cache_policy(ckpt_dir: str | None) -> dict:
         res["dropped_shards"], res["dropped_gib"] = dropped, round(nbytes / 2**30, 1)
         print(f"[sm120_engram] page cache: dropped clean pages of {dropped} weight shards ({nbytes / 2**30:.0f} GiB of "
               f"files) after load (SM120_ENGRAM_DROP_WEIGHT_PAGES=0 keeps them)", flush=True)
-    if (_env("SM120_ENGRAM_PREFAULT", "0") in ("1", "true", "yes") and _env("SM120_ENGRAM_PREFAULT_AT", "attach") == "ready"
-            and tables):
-        size, avail = sum(t.nbytes for t in tables), _mem_available()
-        if avail is not None and size > 0.95 * avail:
-            # reading tables that do not fit only churns the cache (and the disk) for minutes while serving
-            res["prefault_s"] = None
-            print(f"[sm120_engram] prefault skipped: tables {size / 2**30:.0f} GiB > MemAvailable {avail / 2**30:.0f} "
-                  f"GiB; use SM120_ENGRAM_MODE=uring on this host (docs/ENGRAM.md)", flush=True)
-        else:
-            dt = sum(t.prefault() for t in tables)
-            res["prefault_s"] = round(dt, 1)
-            print(f"[sm120_engram] prefaulted {len(tables)} tables after load in {dt:.0f} s", flush=True)
+    pf = _env("SM120_ENGRAM_PREFAULT", "0")
+    if pf in ("1", "true", "yes", "force") and _env("SM120_ENGRAM_PREFAULT_AT", "attach") == "ready" and tables:
+        res.update(_prefault_policy(tables, force=pf == "force"))
     resident = [t.resident() for t in tables]
     if tables and all(r is not None for r in resident):
         size = sum(t.nbytes for t in tables)
@@ -284,7 +308,23 @@ def post_load_cache_policy(ckpt_dir: str | None) -> dict:
               f"{size / 2**30:.1f} GiB ({100 * sum(resident) / max(size, 1):.0f} %); MemAvailable "
               f"{'?' if avail is None else f'{avail / 2**30:.1f} GiB'}", flush=True)
     res["seconds"] = round(time.time() - t0, 1)
+    iv = float(_env("SM120_ENGRAM_RESIDENCY_INTERVAL", "0"))
+    if iv > 0 and tables:  # watch the residency while serving (mincore over the tables: ~1 s per 200 GiB)
+        threading.Thread(target=_residency_loop, args=(tables, iv), name="sm120-engram-residency", daemon=True).start()
     return res
+
+
+def _residency_loop(tables: list, interval: float) -> None:
+    size = sum(t.nbytes for t in tables)
+    while True:
+        time.sleep(interval)
+        try:
+            r, avail = sum(t.resident() or 0 for t in tables), _mem_available()
+            print(f"[sm120_engram] residency: {r / 2**30:.1f} / {size / 2**30:.1f} GiB ({100 * r / max(size, 1):.0f} %) "
+                  f"of the engram tables in the page cache; MemAvailable "
+                  f"{'?' if avail is None else f'{avail / 2**30:.1f} GiB'}", flush=True)
+        except Exception:  # noqa: BLE001 - diagnostics only
+            pass
 
 
 # ------------------------------------------------------------------------------------------------ table

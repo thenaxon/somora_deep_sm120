@@ -59,8 +59,30 @@ at start-up and again after the post-load step (`[sm120_engram] engram tables re
 | MemAvailable after start-up | mode | flags |
 |---|---|---|
 | >= tables + 10 % (about 225 GB; i.e. about 265 GB free before start-up) and room to page-lock them | `uva`: one pinned copy, pure GPU gathers (untested) | `-e SM120_ENGRAM_MODE=uva --ulimit memlock=-1` |
-| >= tables + 10 % (about 225 GB) | `host` + prefault: once all ranks have loaded their weights, rank 0 drops the weight shards' page-cache pages and reads both tables into the page cache | `-e SM120_ENGRAM_MODE=host -e SM120_ENGRAM_PREFAULT=1` |
-| below that (e.g. 246 GB total RAM: about 190 GB after start-up) | **`uring`** (O_DIRECT reads per lookup batch, no page-cache thrash, flat latency) | `-e SM120_ENGRAM_MODE=uring -e SM120_ENGRAM_THREADS=16 --security-opt seccomp=unconfined --ulimit memlock=-1` |
+| >= tables + 4 GiB (about 207 GB) | **`host` + prefault**: once all ranks have loaded their weights, rank 0 drops the weight shards' page-cache pages and reads both tables into the page cache (sequential reads, about 1 min at 3.5 GB/s); afterwards lookups do no I/O at all | `-e SM120_ENGRAM_MODE=host -e SM120_ENGRAM_PREFAULT=1` (0.2.1: `=force`, its rule wanted tables + 5 %) |
+| below that | **`uring`** (O_DIRECT reads per lookup batch, no page-cache thrash, flat latency) | `-e SM120_ENGRAM_MODE=uring -e SM120_ENGRAM_THREADS=16 --security-opt seccomp=unconfined --ulimit memlock=-1` |
+
+The prefault does not risk an OOM: the table pages are clean page cache, which the kernel evicts when a process needs
+memory (those rows are then read from the NVMe again). Not reclaimable without swap are anonymous memory, `/dev/shm`
+(the multimodal pools) and page-locked memory (`uva`, pinned staging); those set the real limit. To get room for the
+tables, shrink them first: `-e DEEPINFER_USE_MULTIMODAL_POOL=0` (no image requests) frees the 4 x 2 GB pinned pools.
+Do not `mlock` the tables or part of them: without swap a locked page cache plus growing processes is an OOM.
+`-e SM120_ENGRAM_RESIDENCY_INTERVAL=300` logs the residency every 5 minutes, which shows whether the tables stay.
+
+**NVMe behind an IOMMU in translated mode.** Check `cat /sys/kernel/iommu_groups/*/type` and
+`/sys/bus/pci/devices/<nvme>/untrusted`. If the model NVMe sits in a group of type `DMA` despite `iommu=pt` (for
+example behind a USB4/Thunderbolt switch, which marks it untrusted), every NVMe completion pays an IOTLB flush under a
+global spinlock. Random 4 KiB engram reads then cost far more CPU, and concurrency makes it worse:
+- On one 4-GPU host this was about 18 % of a rank's CPU time.
+- A 4k chunk's gather took 1.6 s with 16 gather threads plus prefetch, and 0.16 s with 4 threads and no prefetch.
+
+What to do, best first:
+1. Keep the tables resident (host + prefault, above), so no I/O happens while serving.
+2. Move the NVMe to a CPU-attached slot.
+3. Try `iommu.strict=0` (lazy IOTLB flushes; it may not apply to untrusted devices).
+4. Use few I/O threads: `SM120_ENGRAM_THREADS=4`, `SM120_ENGRAM_PREFETCH=0`, `OMP_NUM_THREADS=8`.
+   `SM120_ENGRAM_URING_MMAP_TOKENS=1000000000` keeps `uring` prefill on O_DIRECT (one submitter, batched
+   completions) instead of page faults from many threads.
 
 `host` without prefault also works below the threshold (page cache as LRU, NVMe serves misses). Two defaults make
 the cold case cheap in both modes:

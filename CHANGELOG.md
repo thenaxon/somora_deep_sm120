@@ -3,6 +3,16 @@
 All notable changes to this project are documented here. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0 any minor release may change interfaces.
 
+## [Unreleased]
+
+### Changed
+- Engram prefault after load (`SM120_ENGRAM_PREFAULT=1`) runs when the tables fit into MemAvailable minus
+  `SM120_ENGRAM_PREFAULT_HEADROOM_GB` (default 4). The old rule wanted 5 % above the tables and skipped hosts with
+  210 GB available for 203 GB of tables. `SM120_ENGRAM_PREFAULT=force` prefaults regardless.
+
+### Added
+- `SM120_ENGRAM_RESIDENCY_INTERVAL`: periodic page-cache residency log of the engram tables while serving.
+
 ## [0.2.1] - 2026-10-21
 
 ### Fixed

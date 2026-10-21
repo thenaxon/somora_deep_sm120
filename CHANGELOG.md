@@ -38,3 +38,5 @@ First release. Experimental.
   `deterministic_output` fails with direct routing ([flashinfer-ai/flashinfer#6941](https://github.com/flashinfer-ai/flashinfer/issues/6941); grouped routing is forced).
 - The default b12x MoE is not run-to-run deterministic. `SM120_MOE_DETERMINISTIC=1` is bit-exact but 2-2.9x slower in decode.
 - MTP: nextn 1 with `DEEPINFER_SAMPLER_FORCE_TOPK=1024` at batch > 1 accepts no drafts (correct output, no speed-up).
+- b12x MoE programs used only by eager prefill are evicted by later lazy b12x preparations and reloaded on next use
+  (load time on some first-seen prefill shapes; graphs are not affected). See docs/RUNTIME.md, open point 6.

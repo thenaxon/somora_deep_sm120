@@ -3,18 +3,35 @@
 All notable changes to this project are documented here. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0 any minor release may change interfaces.
 
-## [Unreleased]
+## [0.1.1] - unreleased
+
+### Fixed
+- CUDA-graph server crash (`CUDA error: an illegal instruction` in decode graph replay) after a prompt that needed a b12x plan not seen before: the lazy preparation evicted and unloaded b12x programs that captured graphs still launch. The programs launched during graph warm-up and capture are now retained (`sm120_patches` P9, test `tests/graph_replay_lazy_prep.sh`).
+- `libnuma1` in both images; DeepInfer's NUMA binding no longer logs tracebacks. On single-node hosts the binding is
+  skipped (new runtime patch P10): with libnuma present, `bind_numa(-1)` would segfault.
+- The serving image sets `DEEPINFER_MULTIMODAL_POOL_SIZE_GB=2` (DeepInfer default 8): 2 GB instead of 8 GB pinned host
+  memory per rank for image inputs. Sizing and the `/dev/shm/psm_*` leftovers after a crash are in
+  `docs/MULTI_GPU_RUNBOOK.md` §3.
+- `tests/run_server_tests.sh` stops the whole server process group and waits for GPU memory; the mid-decode server
+  check no longer depends on timing under CUDA graphs.
 
 ### Added
 - Start-up banner: somora lettering with "deep sm120", version, checkpoint, DP size and port
   (`server/banner.py`, `SM120_BANNER=0` disables it).
+- `tests/graph_replay_lazy_prep.sh`: regression test for the CUDA-graph crash (new prompt lengths after a request history).
+- `tests/mm_pool_check.py`: text+image requests through DeepInfer's own API, with and without the multimodal pool.
 
 ### Changed
 - Multi-GPU runbook: Hugging Face hub caches must be mounted at their root (snapshot files are symlinks into
   `blobs/`); realistic image size (about 7 GB); building when the host cannot reach the repository; host-RAM
-  budgeting for the engram modes (per-rank memory, page cache vs. pinned memory, baseline stopped).
+  budgeting for the engram modes (per-rank memory, page cache vs. pinned memory, baseline stopped), the multimodal
+  pool and NUMA (`--cap-add SYS_NICE` on multi-socket hosts).
 - `eval/quality_check.py`: items can be marked `known_fail` (reported as KFAIL/KPASS, not counted). `math-reason`
   is marked: the model answers 2 without thinking mode, independent of the engine.
+
+### Known limitations
+- b12x MoE programs used only by eager prefill are evicted by later lazy b12x preparations and reloaded on next use
+  (load time on some first-seen prefill shapes; graphs are not affected). See docs/RUNTIME.md, open point 6.
 
 ## [0.1.0] - 2026-10-21
 
@@ -40,9 +57,6 @@ First release. Experimental.
   applies the b12x tiny-decode SwiGLU clamp fix ([flashinfer-ai/flashinfer#6866](https://github.com/flashinfer-ai/flashinfer/issues/6866), patch posted
   [upstream](https://github.com/flashinfer-ai/flashinfer/issues/6866#issuecomment-6312667479)). There is also a dev image (`docker/Dockerfile.dev`).
 
-### Fixed
-- CUDA-graph server crash (`CUDA error: an illegal instruction` in decode graph replay) after a prompt that needed a b12x plan not seen before: the lazy preparation evicted and unloaded b12x programs that captured graphs still launch. The programs launched during graph warm-up and capture are now retained (`sm120_patches` P9, test `tests/graph_replay_lazy_prep.sh`).
-
 ### Known limitations
 - Validated on one RTX 5090 with truncated checkpoints only. The full model has not been run (it needs multiple GPUs).
 - Layer 0 deviates from the reference by more than the noise floor. This is a property of DeepInfer's `fused_transform` rounding.
@@ -51,5 +65,3 @@ First release. Experimental.
   `deterministic_output` fails with direct routing ([flashinfer-ai/flashinfer#6941](https://github.com/flashinfer-ai/flashinfer/issues/6941); grouped routing is forced).
 - The default b12x MoE is not run-to-run deterministic. `SM120_MOE_DETERMINISTIC=1` is bit-exact but 2-2.9x slower in decode.
 - MTP: nextn 1 with `DEEPINFER_SAMPLER_FORCE_TOPK=1024` at batch > 1 accepts no drafts (correct output, no speed-up).
-- b12x MoE programs used only by eager prefill are evicted by later lazy b12x preparations and reloaded on next use
-  (load time on some first-seen prefill shapes; graphs are not affected). See docs/RUNTIME.md, open point 6.

@@ -485,6 +485,47 @@ def _patch_dflash_graph_runner(mod):
     _note("P9 DFlashCudaGraphRunner.capture wrapped")
 
 
+def numa_node_count() -> int:
+    """NUMA nodes the kernel reports (/sys/devices/system/node/node<N>); 1 if unknown."""
+    try:
+        return max(1, sum(1 for d in os.listdir("/sys/devices/system/node")
+                          if d.startswith("node") and d[4:].isdigit()))
+    except OSError:
+        return 1
+
+
+@when_imported("deep_cluster.topology")
+def _patch_bind_numa(mod):
+    """P10: deep_cluster.topology.bind_numa(which_numa(gpu)) segfaults when the GPU has no NUMA affinity (sysfs
+    numa_node = -1, the normal value on single-socket hosts): libnuma is called with node -1 and
+    numa_bitmask_setbit(mask, (unsigned)-1) writes out of bounds. Without libnuma it "only" logs a long traceback
+    (worker/base.py _bind_numa, ve/multimodal_processor.py). Binding is meaningless with one node, so skip it there
+    and for node < 0; multi-node hosts with a valid node keep DeepInfer's binding (needs libnuma1)."""
+    from deep_cluster.topology import bind as bind_mod
+
+    orig = mod.bind_numa
+    if getattr(orig, "_sm120", False):
+        return
+
+    def bind_numa(node: int) -> int:
+        nodes = numa_node_count()
+        if int(node) < 0 or nodes <= 1:
+            if not _NUMA_LOGGED:
+                _NUMA_LOGGED.append(True)
+                print(f"[sm120_patches] NUMA binding skipped (GPU NUMA node {int(node)}, {nodes} node(s) on this host)",
+                      flush=True)
+            return 0
+        return orig(node)
+
+    bind_numa._sm120 = True
+    mod.bind_numa = bind_numa
+    bind_mod.bind_numa = bind_numa
+    _note("P10 deep_cluster.topology.bind_numa: skipped on single-node hosts / node < 0 (libnuma segfault)")
+
+
+_NUMA_LOGGED: list = []
+
+
 @when_imported("deepinfer")
 def _patch_attn_agent(mod):
     """Hand-off point for the attention shim's own DeepInfer patches (optional module)."""

@@ -65,6 +65,24 @@ All 4 rank processes map the same files, so the page cache holds one copy.
 - Prefaulted pages are ordinary page cache, not locked memory: under memory pressure the kernel evicts them and
   misses are read from NVMe again (slower, but no OOM). This also holds without swap. `uva` instead page-locks the
   whole 203 GB and needs that much RAM on top of everything else.
+- **Multimodal pool (pinned host RAM per rank, on top of the engram budget above).** Each engine process pins a
+  `DEEPINFER_MULTIMODAL_POOL_SIZE_GB` buffer (`multiprocessing.shared_memory`, `/dev/shm/psm_*`). The multimodal
+  worker processes use it to hand preprocessed images to the engine. DeepInfer's default is 8 GB, i.e. 32 GB pinned
+  for 4 ranks. The image sets **2 GB** (8 GB for 4 ranks).
+  - What it holds: one block per in-flight request, with all of the request's resized RGB images plus 4 bytes per
+    prompt token. The block is freed once the prefill has copied it to the GPU. A full-resolution image (1024 vision
+    tokens, about 1302×1302 px) takes about 5.1 MB, the smallest (`min_pixels`, 544×544) about 0.9 MB. 1 GB is about 200
+    full-resolution images in flight.
+  - When it is full, the worker waits for space. A single request whose images exceed the whole pool waits until
+    `DEEPINFER_MULTI_MODAL_WORKER_TIMEOUT` (1800 s) aborts the process. So size it to at least your largest request's
+    images: 2 GB covers about 400 full-resolution images.
+  - `DEEPINFER_USE_MULTIMODAL_POOL=0` removes the pinned buffer; images then travel through the worker queue (same
+    tokens on the test model, slower copies). Text-only serving does not use the pool.
+  - The OpenAI server does not take image inputs yet (planned for v0.2.0); the engine's vision path works on SM120.
+  - A killed engine (SIGKILL, OOM, `docker kill`) does not unlink its segment. With `--ipc=host` the leftover
+    `/dev/shm/psm_*` files (2 GB each) stay in the host's `/dev/shm`; delete them after a crash.
+- **NUMA:** the image has libnuma1. On a multi-socket host add `--cap-add SYS_NICE`, otherwise the memory policy part of
+  DeepInfer's binding is refused (CPU affinity still applies). Single-socket hosts skip the binding (patch P10).
 
 ## 4. Validate the multi-GPU path first
 

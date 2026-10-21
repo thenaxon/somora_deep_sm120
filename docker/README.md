@@ -25,7 +25,8 @@ What the image contains:
 - Base: `nvidia/cuda:13.2.1-devel-ubuntu24.04`, Python 3.12 venv, torch 2.13.0+cu132, DeepInfer's requirements (transformers
   bumped to 4.51.3 for b12x), tilelang 0.1.15, tile-kernels 2.1.0, b12x 1.5.1. These layers are identical in `Dockerfile` and
   `Dockerfile.dev`, so building one reuses the other's cache. Versions: [../COMPATIBILITY.md](../COMPATIBILITY.md).
-- `liburing-dev`, `pkg-config` (b12x O_DIRECT io_uring row reader, engram `SM120_ENGRAM_MODE=uring`) and `patch`.
+- `liburing-dev`, `pkg-config` (b12x O_DIRECT io_uring row reader, engram `SM120_ENGRAM_MODE=uring`), `patch`, and `libnuma1`
+  (DeepInfer's NUMA binding; on single-node hosts runtime patch P10 skips the binding, which would otherwise segfault).
 - **b12x tiny-decode SwiGLU fix** applied to the installed b12x (`patches/b12x-tiny-decode-swiglu.patch`,
   upstream issue [flashinfer-ai/flashinfer#6866](https://github.com/flashinfer-ai/flashinfer/issues/6866)). The default still uses
   b12x's faster dynamic path (`SM120_MOE_TINY_DECODE=0`).
@@ -45,6 +46,7 @@ Environment defaults (override with `-e`):
 | `SM120_MOE_TINY_DECODE` | 0 | dynamic MoE path (faster on SM120, [../docs/RUNTIME.md](../docs/RUNTIME.md)) |
 | `SM120_ENGRAM_MODE` | `host` | engram tables mmapped from the checkpoint ([../docs/ENGRAM.md](../docs/ENGRAM.md)) |
 | `DEEPINFER_PREFILL_ATTEMPT_INTERVAL` | 1 | DeepInfer's default 70 costs about 2 s TTFT ([../docs/SERVER.md](../docs/SERVER.md)) |
+| `DEEPINFER_MULTIMODAL_POOL_SIZE_GB` | 2 | pinned host buffer per engine (rank) for preprocessed images, DeepInfer's default is 8; sizing in [../docs/MULTI_GPU_RUNBOOK.md](../docs/MULTI_GPU_RUNBOOK.md) §3 |
 | `DEEPINFER_DISABLE_SYNC_GUARD` | 1 | the shims do CPU syncs |
 | `HF_HUB_OFFLINE`, `TOKENIZERS_PARALLELISM` | 1, false | |
 

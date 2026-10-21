@@ -5,6 +5,7 @@
 """
 
 from .moe import EPRoutedExperts, ep_impl, wrap  # noqa: F401
-from .transport import GlooTransport, NcclTransport, make_transport  # noqa: F401
+from .transport import B12xTransport, GlooTransport, NcclTransport, make_transport  # noqa: F401
 
-__all__ = ["EPRoutedExperts", "wrap", "ep_impl", "make_transport", "NcclTransport", "GlooTransport"]
+__all__ = ["EPRoutedExperts", "wrap", "ep_impl", "make_transport", "NcclTransport", "GlooTransport",
+           "B12xTransport"]

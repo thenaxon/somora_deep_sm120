@@ -27,7 +27,7 @@ calls inside CUDA graph capture use the fixed capacity and eager calls the count
 as all ranks are eager or all are captured).
 
 Switches: SM120_EP_IMPL = allgather (default when the EP group has > 1 rank) | off;
-          SM120_EP_TRANSPORT = nccl | gloo (see transport.py); SM120_EP_DECODE_ROWS = <int>.
+          SM120_EP_TRANSPORT = nccl | gloo | b12x (see transport.py); SM120_EP_DECODE_ROWS = <int>.
 """
 
 from __future__ import annotations
@@ -193,6 +193,8 @@ class EPRoutedExperts:
         else:
             counts = self.transport.all_gather_counts(T, x.device)
             rows = max(counts)
+        if counts is not None and hasattr(self.transport, "round_rows"):
+            rows = self.transport.round_rows(rows)  # b12x: plan bucket (padding rows are skipped by the experts)
         send = self._pack(x, topk_idx, topk_weights, rows)
         recv = torch.empty((self.world * rows, self.row_bytes), dtype=torch.uint8, device=x.device)
         self.transport.all_gather(recv, send)

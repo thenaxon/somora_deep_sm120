@@ -27,7 +27,8 @@ calls inside CUDA graph capture use the fixed capacity and eager calls the count
 as all ranks are eager or all are captured).
 
 Switches: SM120_EP_IMPL = allgather (default when the EP group has > 1 rank) | off;
-          SM120_EP_TRANSPORT = nccl | gloo | b12x (see transport.py); SM120_EP_DECODE_ROWS = <int>.
+          SM120_EP_TRANSPORT = nccl | gloo | b12x (see transport.py); SM120_EP_DECODE_ROWS = <int>;
+          SM120_EP_COMPACT = 1 (default) | 0 (prefill experts on the padded rows too, for A/B).
 """
 
 from __future__ import annotations
@@ -198,7 +199,9 @@ class EPRoutedExperts:
         send = self._pack(x, topk_idx, topk_weights, rows)
         recv = torch.empty((self.world * rows, self.row_bytes), dtype=torch.uint8, device=x.device)
         self.transport.all_gather(recv, send)
-        real = None if counts is None or sum(counts) == self.world * rows else _real_rows(counts, rows, x.device)
+        compact = os.environ.get("SM120_EP_COMPACT", "1") != "0"  # 0: experts see the padding rows (A/B only)
+        real = None if (counts is None or not compact or sum(counts) == self.world * rows) \
+            else _real_rows(counts, rows, x.device)
         if real is None:
             xg, idl, wg = self._unpack_local(recv)
             part = self.inner(xg, idl, wg)  # bf16 [world*rows, H], zeros where no local route

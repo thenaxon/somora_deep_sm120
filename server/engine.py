@@ -32,6 +32,23 @@ from typing import Any
 
 log = logging.getLogger("di_server.engine")
 
+
+def _prof_rng(name: str):
+    try:
+        import sm120_prof
+        return sm120_prof.rng(name)
+    except ImportError:
+        import contextlib
+        return contextlib.nullcontext()
+
+
+def _set_prof_active(on: bool) -> None:
+    try:
+        import sm120_prof
+        sm120_prof.ACTIVE = on
+    except ImportError:
+        pass
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 TOOLS = os.path.join(ROOT, "tools")
@@ -208,12 +225,14 @@ class EngineLoop:
                 unfinished = self.engine.has_unfinished_requests()
                 if unfinished:
                     t0 = time.perf_counter()
-                    outs = self.engine.step()
+                    with _prof_rng("sm120:engine.step"):
+                        outs = self.engine.step()
                     self.stats["busy_s"] += time.perf_counter() - t0
                     self.stats["steps"] += 1
                     pending_flush = True
                 elif pending_flush:
-                    outs = self.engine.flush_inflight_reqs()
+                    with _prof_rng("sm120:engine.flush"):
+                        outs = self.engine.flush_inflight_reqs()
                     self.stats["flushes"] += 1
                     pending_flush = False
                 else:
@@ -282,6 +301,93 @@ class EngineLoop:
         if r.logprobs:
             self.tap.add(r.request_id, r.logprobs)
         self.stats["added"] += 1
+        self._profile_maybe_start(r)
+
+    # ------------------------------------------------------------------ SM120_PROFILE_PREFILL (diagnostics)
+    _prof = None
+
+    def _profile_maybe_start(self, r) -> None:
+        """SM120_PROFILE_PREFILL=N: profile (torch profiler, CPU + CUDA) from the N-th request this engine process
+        admits until its first token, i.e. its whole prefill, and write a trace plus a per-category table to
+        SM120_PROFILE_DIR (default /work). One shot per process; with --dp every rank counts its own requests."""
+        n = int(os.environ.get("SM120_PROFILE_PREFILL", "0") or 0)
+        if n <= 0 or self.stats["added"] != n or self._prof is not None:
+            return
+        try:
+            import torch
+            from torch.profiler import ProfilerActivity, profile
+            torch.cuda.synchronize()
+            p = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=False)
+            _set_prof_active(True)
+            p.__enter__()
+            self._prof_tid = threading.get_native_id()
+            self._prof = (r.request_id, p, time.perf_counter(), self.stats["steps"], len(r.prompt_ids))
+            log.info("SM120_PROFILE_PREFILL: profiling request %d (%s, %d prompt tokens)", n, r.request_id,
+                     len(r.prompt_ids))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("SM120_PROFILE_PREFILL: could not start the profiler: %r", exc)
+            self._prof = ("", None, 0.0, 0, 0)
+
+    def _profile_stop(self, r) -> None:
+        rid, p, t0, s0, plen = self._prof
+        self._prof = ("", None, 0.0, 0, 0)  # one shot
+        try:
+            import torch
+            torch.cuda.synchronize()
+            wall = (time.perf_counter() - t0) * 1000
+            p.__exit__(None, None, None)
+            _set_prof_active(False)
+            out = os.environ.get("SM120_PROFILE_DIR", "/work")
+            tag = f"prefill_r{self.cfg.get('dp_rank', 0)}_p{os.getpid()}"
+            path = os.path.join(out, tag)
+            p.export_chrome_trace(path + ".trace.json")
+            sys.path.insert(0, os.path.join(ROOT, "tests"))
+            import contextlib
+            import io
+            import prof_e2e
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                prof_e2e.summarize(f"prefill of {plen} tokens ({rid})", prof_e2e.kernels(p), wall,
+                                   self.stats["steps"] - s0)
+                self._profile_cpu_table(p, wall)
+            open(path + ".txt", "w").write(buf.getvalue())
+            log.info("SM120_PROFILE_PREFILL: wrote %s.trace.json and %s.txt (wall %.0f ms)\n%s", path, path, wall,
+                     buf.getvalue())
+        except Exception as exc:  # noqa: BLE001
+            log.warning("SM120_PROFILE_PREFILL: could not write the profile: %r", exc)
+
+    def _profile_cpu_table(self, p, wall: float) -> None:
+        """Host side of the profiled prefill: named ranges (sm120:* ours, deepinfer:* DeepInfer's) and the CUDA /
+        collective calls that block, by total time; then the engine thread's timeline of those ranges."""
+        import collections
+        evs = [ev for ev in p.events() if ev.device_type.name == "CPU"]
+        # the engine thread = the one that ran engine.step (profiler thread ids need not be native ids)
+        tid = next((ev.thread for ev in evs if ev.name == "sm120:engine.step"), getattr(self, "_prof_tid", None))
+        tot, cnt = collections.Counter(), collections.Counter()
+        timeline = []
+        t_first = None
+        block = ("cudaStreamSynchronize", "cudaDeviceSynchronize", "cudaEventSynchronize", "cudaMemcpy",
+                 "cudaMemcpyAsync", "aten::_local_scalar_dense", "aten::item")
+        for ev in evs:
+            n = ev.name
+            ours = n.startswith(("sm120:", "deepinfer:"))
+            if not (ours or n in block or n.startswith(("nccl:", "c10d::", "gloo:", "record_param_comms"))):
+                continue
+            d = (ev.time_range.end - ev.time_range.start) / 1000.0
+            key = n if ev.thread == tid or tid is None else f"{n} [other thread]"
+            tot[key] += d
+            cnt[key] += 1
+            if ours and ev.thread == tid:
+                t_first = ev.time_range.start if t_first is None else min(t_first, ev.time_range.start)
+                timeline.append((ev.time_range.start, d, n))
+        print(f"\n  host side (ms; wall {wall:.1f} ms; 'other thread' = gather / prefetch / comm threads):")
+        for k, v in tot.most_common(30):
+            print(f"    {v:10.2f} ms  x{cnt[k]:<6d} {k}")
+        if timeline:
+            print("  engine thread timeline (named ranges, start offset ms / duration ms):")
+            for t, d, n in sorted(timeline)[:80]:
+                if d >= 0.5:
+                    print(f"    +{(t - t_first) / 1000.0:9.2f}  {d:9.2f}  {n}")
 
     def _route(self, outs) -> None:
         for ptr in outs:
@@ -291,6 +397,8 @@ class EngineLoop:
                 continue
             if r.first_token_t is None:
                 r.first_token_t = time.perf_counter()
+                if self._prof is not None and self._prof[0] == r.request_id:
+                    self._profile_stop(r)
             r.n_out += 1
             row = self.tap.pop_row(o.request_id) if r.logprobs else None
             r.out.put(("token", int(o.token_id), bool(o.finished), str(o.finish_reason or ""), row))

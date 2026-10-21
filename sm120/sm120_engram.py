@@ -60,6 +60,8 @@ from typing import Callable, Sequence
 import numpy as np
 import torch
 
+import sm120_prof
+
 E8M0_ONE = 127  # E8M0 byte of 2^0
 FP8_GROUP = 32  # one E8M0 scale per 32 FP8 values along a row
 
@@ -729,7 +731,7 @@ class EngramFetcher:
             if kinds <= {"host", "uring"} and _env("SM120_ENGRAM_GRAPH", "async") == "async":
                 return self._async_graph_hooks(indices, use_tma_aligned_col_major_sf)
             return self._graph_hooks(T, use_tma_aligned_col_major_sf)
-        with self._lock:
+        with self._lock, sm120_prof.rng("sm120:engram.fetch"):
             self._drain()
             self._gen += 1
             gen = self._gen
@@ -757,7 +759,8 @@ class EngramFetcher:
                     # An event sync: DeepInfer's forbid_cuda_sync guard does not cover events (utils.py:119).
                     ev = torch.cuda.Event()
                     ev.record(torch.cuda.current_stream(self.device))
-                    ev.synchronize()
+                    with sm120_prof.rng("sm120:engram.fetch_event_sync"):
+                        ev.synchronize()
                 self.stats["sync_s"] += time.perf_counter() - t0
                 for l in sorted(via_host):
                     job = (self._gather_layer, l, n)
@@ -860,7 +863,8 @@ class EngramFetcher:
                 t0 = time.perf_counter()
                 fut = self._futures[l]
                 if fut is not None:
-                    fut.result()
+                    with sm120_prof.rng("sm120:engram.hook_wait_gather"):
+                        fut.result()
                     self._futures[l] = None
                 self.stats["wait_s"] += time.perf_counter() - t0
                 if self.is_cuda:

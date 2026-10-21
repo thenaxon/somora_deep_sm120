@@ -28,6 +28,8 @@ TOOLS = os.path.abspath(os.path.join(HERE, "..", "tools"))
 sys.path.insert(0, TOOLS)
 
 CATS = [  # first match wins; patterns on the lower-cased kernel name
+    ("comm.nccl", r"nccl"),
+    ("ep.pack", r"_pack_kernel|_unpack_kernel"),
     ("attn.fused_prep_cast", r"_prepare_q_kernel|_rope_cast_kernel"),
     ("attn.sparse_mla", r"mla|prefill_mg|unifieddecode|unified_decode|split_kv|merge_kernel|map_indexed"),
     ("indexer.score", r"mxfp4|pagedscore|tensorcorepagedscore|_score|dsa_|indexer"),

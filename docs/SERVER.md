@@ -259,6 +259,19 @@ placeholder steps count (`scheduler.hpp:296-330`, built for DP-wide prefill voti
 about 2.3 s of TTFT. The server sets it to `--prefill-interval 1`. The cost is that one decode step of the running requests waits
 for each prefill chunk (bounded by chunked prefill, `max_num_batched_tokens`).
 
+## Profiling a prefill (`SM120_PROFILE_PREFILL`)
+
+`-e SM120_PROFILE_PREFILL=N` makes every engine process profile the N-th request it admits (torch profiler, CPU +
+CUDA) from admission to its first token, i.e. its whole prefill, once. It writes `prefill_r<rank>_p<pid>.trace.json`
+(chrome://tracing / Perfetto) and `.txt` (per-category GPU kernel table: attention, GEMM, MoE, mHC, NCCL, EP pack,
+...; wall vs GPU busy) to `SM120_PROFILE_DIR` (default `/work`), and logs the table. With `--dp`, a single request on
+an idle server goes to rank 0. The profiled request is slower (about +2.5 s for the trace export); time the others.
+
+```bash
+docker run ... -e SM120_PROFILE_PREFILL=2 -e SM120_PROFILE_DIR=/work ...   # then send 2 fresh requests
+docker logs <container> 2>&1 | grep -A20 "SM120_PROFILE_PREFILL: wrote"
+```
+
 ## Determinism
 
 The bare engine (`tools/diag_repeat.py`, no HTTP) gives different tokens for the same prompt, run after run, with the default b12x

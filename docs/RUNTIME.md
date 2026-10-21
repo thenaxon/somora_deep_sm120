@@ -219,6 +219,9 @@ Everything inside a captured decode step must follow these rules (the attention,
    it, largest first) and cached; creation under `torch.cuda.is_current_stream_capturing()` is refused with a clear
    error.
 4. Buffers referenced by a graph are never freed or re-allocated (module-level caches).
+   The same holds for compiled code: every lazy b12x preparation ends with `evict_unretained()`, which unloads the
+   programs that are not retained, so `sm120_patches` (P9) runs warm-up + capture inside b12x
+   `retain_compiled_programs()` and keeps the record for the life of the process.
 5. The DFlash graph (`DEEPINFER_DFLASH_ENFORCE_EAGER=0`) also captures the draft layers' attention and the draft
    sampling (TileLang `fused_sample`, `topk`), so `deep_select.topk` must be capturable too.
 
@@ -233,3 +236,7 @@ Everything inside a captured decode step must follow these rules (the attention,
    (FP8 activations straight from DeepInfer's quantized input instead of bf16 -> MXFP8 inside b12x, or fusing the
    shared expert into the routed call).
 5. **Long decodes:** acceptance and step-time numbers so far come from short runs (16-64 decode steps).
+6. **Eager prefill MoE reloads:** b12x MoE programs used only by eager prefill shapes (not captured in a graph)
+   are still evicted by later lazy preparations and loaded again on their next use. This is safe since the P9
+   retention fix, but costs load time on some first-seen prefill shapes. A fix would keep `sm120_moe`'s plans in
+   one b12x session or retain them as well.

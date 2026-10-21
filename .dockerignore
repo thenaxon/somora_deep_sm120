@@ -1,0 +1,6 @@
+.git
+**/__pycache__
+**/*.pyc
+*.pt
+*.log
+third_party/

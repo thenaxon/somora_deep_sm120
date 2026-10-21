@@ -1,0 +1,52 @@
+# somora_deep_sm120 DEV image: DeepInfer + b12x only; this repo is mounted at /opt/sm120 instead of copied.
+#
+#   docker build -t somora_deep_sm120:dev -f docker/Dockerfile.dev .
+#   docker run --rm -it --gpus all --ipc=host --shm-size=16g -v "$PWD":/opt/sm120 -v <work>:/work \
+#       -v <hf-shards>:/ckpt:ro -v <cache>:/cache somora_deep_sm120:dev bash
+#
+# CUDA 13.2 needs driver >= 595. No vendored DeepSeek kernels (FlashMLA/DeepGEMM/DeepEP/DeepSelect): they are
+# SM100-only; sm120/ replaces them on b12x 1.5.1. The layers up to `pip install b12x` are the same as docker/Dockerfile.
+# Unlike the serving image, b12x is unpatched and DeepInfer's _C lacks the Sequence.block_table binding
+# (tests/run_runtime_unit.sh applies the b12x patch; prefix_cache/build_patched_c.sh builds a patched _C copy).
+FROM nvidia/cuda:13.2.1-devel-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3.12 python3.12-venv python3.12-dev git g++ make ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV VIRTUAL_ENV=/opt/venv PATH=/opt/venv/bin:$PATH
+RUN python3.12 -m venv $VIRTUAL_ENV && pip install --no-cache-dir -U pip wheel setuptools
+
+RUN pip install --no-cache-dir torch==2.13.0+cu132 --index-url https://download.pytorch.org/whl/cu132
+
+# DeepInfer requirements.txt without the dev include; transformers bumped for b12x (>=4.51).
+RUN pip install --no-cache-dir \
+        einops==0.8.2 huggingface_hub==0.36.2 ninja==1.13.0 numpy==2.3.5 orjson==3.11.7 pillow==11.3.0 \
+        posix_ipc==1.3.2 psutil==7.2.2 pybind11==3.0.1 pyzmq==27.1.0 requests==2.32.5 safetensors==0.8.0 \
+        scipy==1.17.0 sympy==1.14.0 tabulate==0.9.0 tilelang==0.1.15 tile-kernels==2.1.0 tokenizers==0.21.4 \
+        tqdm==4.67.3 transformers==4.51.3 xgrammar==0.2.2 pytest
+
+RUN pip install --no-cache-dir b12x==1.5.1
+
+RUN apt-get update && apt-get install -y --no-install-recommends liburing-dev pkg-config patch \
+    && rm -rf /var/lib/apt/lists/*
+
+# DeepInfer at the pinned commit; host extension (_C: scheduler, block manager, cuda_utils), pure C++, arch-agnostic.
+ARG DEEPINFER_REPO=https://github.com/deepseek-ai/DeepInfer.git
+ARG DEEPINFER_COMMIT=8b16149741a4935e1dec8cea27853f273b374c5b
+ENV DEEPINFER_ACCELERATOR=nvidia
+RUN git init -q /opt/deepinfer && git -C /opt/deepinfer remote add origin "$DEEPINFER_REPO" \
+    && git -C /opt/deepinfer fetch -q --depth 1 origin "$DEEPINFER_COMMIT" \
+    && git -C /opt/deepinfer checkout -q FETCH_HEAD && rm -rf /opt/deepinfer/.git
+WORKDIR /opt/deepinfer
+RUN MAX_JOBS=8 bash scripts/build.sh build
+
+ENV SM120_ROOT=/opt/sm120 \
+    PYTHONPATH=/opt/sm120/sm120:/opt/deepinfer \
+    DEEPINFER_ROOT=/opt/deepinfer \
+    DEEPINFER_JIT_CACHE_DIR=/cache/jit \
+    TILELANG_CACHE_DIR=/cache/tilelang \
+    TRITON_CACHE_DIR=/cache/triton \
+    HF_HUB_OFFLINE=1
+WORKDIR /

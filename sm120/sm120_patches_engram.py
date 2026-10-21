@@ -1,0 +1,345 @@
+"""SM120 runtime patches that let DeepInfer run with Engram enabled (no RDMA, tables not in GPU memory).
+
+Activation: call `install()` once at start-up, after `sm120_patches.install()` (it registers lazy
+post-import hooks through `sm120_patches.when_imported`, imports nothing heavy itself). The hook line
+for sm120_patches.py is in docs/ENGRAM.md ("Requests"). `SM120_ENGRAM_PATCHES=0` disables all
+of them; `sm120_patches_engram.APPLIED` lists what ran.
+
+    E1  models/deepseek.py:477 materialize_hf_parameter -> tiny placeholder for `is_engram` tables
+        (stock: a CPU tensor of the shard, ~98 GB per table, plus a CUDA fp32 sf, ~12 GB per table).
+    E2  hugging_face/weights.py:331 _load_engram_tables -> record (shard path, tensor names) per table
+        instead of copying 100 GB per table; other tables (no placeholder) still load the stock way.
+    E3  v4_modules/engram.py:69 NgramEmbedding.__init__ keeps that record; engram.py:195
+        EngramRuntime.initialize opens the tables with sm120_engram (mmap of the shard, SM120_ENGRAM_MODE)
+        and hands them to the deep_ep.EngramBuffer shim (attach_tables) instead of write()+gather_sf().
+    E5  hugging_face/loading.py:48,98 safe_open (shard validation, shape checks) -> header-only fallback when
+        safetensors cannot map a shard: it maps files privately, which the kernel refuses (ENOMEM) for the
+        101 GB Engram shard on a machine with less RAM+swap. Only keys()/get_slice().get_shape()/get_dtype()
+        are used there.
+    E6  CUDA-graph decode: models/deepseek.py DeepseekModel.__init__ registers models with engram;
+        worker/cuda_graph_runner.py:150 CudaGraphRunner.replay first hashes the step's n-gram windows (already
+        written into the graph's input_metadata_source by _prepare_input_tensors, incl. ZOS) and calls
+        EngramBuffer.prestage(), which fills the static row buffers the captured hooks read. Inside the graph
+        the fetch is only a view + sf transposition of those buffers (sm120_engram.EngramFetcher._graph_hooks).
+    E4  (only SM120_ENGRAM_TK=torch) tile_kernels.engram.{engram_hash,fused_weight,engram_gate_fwd} ->
+        sm120_engram torch versions (for bisecting the TileLang kernels on SM120).
+
+    SM120_ENGRAM_LAZY=1|0   E1/E2 (default 1; 0 = stock loader, needs RAM for the full tables)
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import os
+
+APPLIED: list[str] = []
+_INSTALLED = False
+
+
+def _on(name: str, default: str = "1") -> bool:
+    return os.environ.get(name, default).strip().lower() not in ("0", "false", "no", "off")
+
+
+def _note(msg: str) -> None:
+    APPLIED.append(msg)
+    try:
+        import sm120_patches
+
+        sm120_patches.APPLIED.append(msg)
+    except Exception:  # noqa: BLE001
+        pass
+    if _on("SM120_PATCH_VERBOSE"):
+        print(f"[sm120_patches_engram] {msg}", flush=True)
+
+
+# ------------------------------------------------------------------------------------------------ E1
+def _placeholder(param):
+    """Shape/dtype-correct stand-in that owns 1 byte: expand() of a 1x1 tensor. Every attribute the
+    builder attached (is_engram, layer_id, row_start, num_per_part, head_vocab_sizes, ...) is kept."""
+    import torch
+
+    data = torch.zeros((1, 1), dtype=param.dtype, device="cpu").expand(*param.shape)
+    result = torch.nn.Parameter(data, requires_grad=False)
+    for k, v in param.__dict__.items():
+        if k != "sf":
+            setattr(result, k, v)
+    if hasattr(param, "sf"):
+        result.sf = torch.ones((1, 1), dtype=param.sf.dtype, device="cpu").expand(*param.sf.shape)
+    result.sm120_engram_lazy = True
+    return result
+
+
+def _patch_materialize(mod):
+    """E1: deepseek.py imports materialize_hf_parameter by name (deepseek.py:32), so patch it there."""
+    orig = mod.materialize_hf_parameter
+    if getattr(orig, "_sm120_engram", False):
+        return
+
+    def materialize_hf_parameter(param, *, device, packed_fp4=False):
+        if getattr(param, "is_engram", False):
+            return _placeholder(param)
+        return orig(param, device=device, packed_fp4=packed_fp4)
+
+    materialize_hf_parameter._sm120_engram = True
+    mod.materialize_hf_parameter = materialize_hf_parameter
+    _note("E1 deepseek.materialize_hf_parameter: Engram tables -> 1-byte placeholders (read later from the shard)")
+
+
+# ------------------------------------------------------------------------------------------------ E2
+def _patch_load_tables(mod):
+    orig = mod._load_engram_tables
+    if getattr(orig, "_sm120_engram", False):
+        return
+
+    def _load_engram_tables(params, coverage, hf_dir):
+        import sm120_engram
+
+        lazy, rest = {}, {}
+        for model_name, weight_name in coverage.engram_tables.items():
+            p = params.get(model_name)
+            (lazy if p is not None and getattr(p, "sm120_engram_lazy", False) else rest)[model_name] = weight_name
+        stats = {"engram_tables": 0, "engram_rows": 0}
+        if rest:
+            stats = orig(params, dataclasses.replace(coverage, engram_tables=rest), hf_dir)
+        ckpt_dir = os.environ.get("SM120_ENGRAM_CKPT") or str(hf_dir)
+        for model_name, weight_name in sorted(lazy.items()):
+            p = params[model_name]
+            shard = mod._shard_of(coverage.weight_map, weight_name)
+            path = os.path.join(ckpt_dir, shard)
+            header, _ = sm120_engram.read_safetensors_header(path)
+            keys = set(header) - {"__metadata__"}
+            wkey = mod.resolve_hf_name(weight_name, keys)
+            skey = mod.resolve_hf_name(mod.scale_name(weight_name), keys)
+            wloc, sloc = sm120_engram.locate_tensor(path, wkey), sm120_engram.locate_tensor(path, skey)
+            assert wloc.shape[1] == p.shape[1], f"{model_name}: HF table width {wloc.shape[1]} != runtime {p.shape[1]}"
+            assert sloc.shape[0] == wloc.shape[0], f"{model_name}: scale rows {sloc.shape} != table rows {wloc.shape}"
+            p.sm120_engram_source = (wloc, sloc)
+            stats["engram_tables"] += 1
+            stats["engram_rows"] += wloc.shape[0]
+            _note(f"E2 {model_name}: {wloc.shape[0]} rows mapped from {os.path.basename(path)} "
+                  f"(@{wloc.offset}, scale @{sloc.offset}), not copied")
+        return stats
+
+    _load_engram_tables._sm120_engram = True
+    mod._load_engram_tables = _load_engram_tables
+    _note("E2 hugging_face.weights._load_engram_tables: record shard locations instead of copying")
+
+
+# ------------------------------------------------------------------------------------------------ E3
+def _patch_runtime(mod):
+    NgramEmbedding, EngramRuntime = mod.NgramEmbedding, mod.EngramRuntime
+    if getattr(EngramRuntime.initialize, "_sm120_engram", False):
+        return
+    orig_init = NgramEmbedding.__init__
+
+    def __init__(self, cfg, source_embedding):
+        orig_init(self, cfg, source_embedding)
+        p = source_embedding.embedding  # the Parameter: `.data` (self.weight) drops custom attributes
+        self.sm120_source = getattr(p, "sm120_engram_source", None)
+        self.sm120_layer_id = getattr(p, "layer_id", None)
+        self.sm120_row_start = int(getattr(p, "row_start", 0))
+
+    def initialize(self) -> None:
+        import torch
+
+        import sm120_engram
+
+        embeddings = [layer.ngram_embedding for layer in self._layers]
+        if self._buffer is None:
+            self._buffer = self.allocate(embeddings)
+        buf = self._buffer
+        if not hasattr(buf, "attach_tables"):
+            raise RuntimeError("SM120 Engram: deep_ep.EngramBuffer is not the SM120 shim (check PYTHONPATH)")
+        mode = os.environ.get("SM120_ENGRAM_MODE", "auto")
+        max_lookups = embeddings[0].max_num_tokens * embeddings[0].num_entries_per_token
+        device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+        tables, offsets = [], []
+        for e in embeddings:
+            if e.sm120_source is not None:
+                wloc, sloc = e.sm120_source
+                t = sm120_engram.open_table(None, e.sm120_layer_id, wloc=wloc, sloc=sloc, mode=mode, device=device,
+                                            max_lookups=max_lookups)
+                tables.append(t)
+                offsets.append(0)  # the whole global table, whatever this rank's shard was
+            else:
+                # stock-loaded shard (SM120_ENGRAM_LAZY=0): the CPU tensor itself, never the relabelled view
+                if e.engram_group.size() > 1:
+                    raise NotImplementedError("SM120 Engram: stock-loaded shards need engram_parallel_size=1")
+                sf = e.gather_sf() if e.sf is not None else None
+                tables.append(sm120_engram.EngramHostTable.from_tensors(e.weight, sf, name=f"layer{e.sm120_layer_id}"))
+                offsets.append(e.sm120_row_start)
+        buf.attach_tables(tables, offsets)
+        for e in embeddings:
+            e.release_storage()
+        desc = ", ".join(f"{t.name}:{t.kind}:{t.rows}rows" for t in tables)
+        _note(f"E3 EngramRuntime.initialize: attached {desc}")
+
+    initialize._sm120_engram = True
+    NgramEmbedding.__init__ = __init__
+    EngramRuntime.initialize = initialize
+    _note("E3 NgramEmbedding.__init__ / EngramRuntime.initialize: tables via sm120_engram")
+
+
+# ------------------------------------------------------------------------------------------------ E5
+class _HeaderSlice:
+    def __init__(self, info):
+        self._info = info
+
+    def get_shape(self):
+        return list(self._info["shape"])
+
+    def get_dtype(self):
+        return self._info["dtype"]
+
+
+class _HeaderHandle:
+    """The metadata part of a safetensors handle, from the header alone (no mapping)."""
+
+    def __init__(self, path):
+        import sm120_engram
+
+        header, _ = sm120_engram.read_safetensors_header(path)
+        self._header = {k: v for k, v in header.items() if k != "__metadata__"}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def keys(self):
+        return list(self._header)
+
+    def get_slice(self, name):
+        return _HeaderSlice(self._header[name])
+
+    def get_tensor(self, name):
+        raise RuntimeError("SM120 header-only safetensors handle: tensor data is read elsewhere")
+
+
+def _patch_safe_open(mod):
+    orig = mod.safe_open
+    if getattr(orig, "_sm120_engram", False):
+        return
+
+    def safe_open(path, *args, **kwargs):
+        try:
+            handle = orig(path, *args, **kwargs)
+            handle.__enter__()
+        except Exception as exc:  # noqa: BLE001
+            if "mmap" not in str(exc) and "allocate memory" not in str(exc):
+                raise
+            _note(f"E5 safe_open({os.path.basename(str(path))}) failed ({exc}); using its header only")
+            return _HeaderHandle(str(path))
+        return _Entered(handle)
+
+    safe_open._sm120_engram = True
+    mod.safe_open = safe_open
+    _note("E5 hugging_face.loading.safe_open: header-only fallback for unmappable shards")
+
+
+class _Entered:
+    """Wraps an already entered safetensors handle so `with` works once more."""
+
+    def __init__(self, handle):
+        self._h = handle
+
+    def __enter__(self):
+        return self._h
+
+    def __exit__(self, *exc):
+        return self._h.__exit__(*exc)
+
+
+# ------------------------------------------------------------------------------------------------ E6
+_ENGRAM_MODELS: list = []
+
+
+def _patch_model_registry(mod):
+    cls = mod.DeepseekModel
+    if getattr(cls.__init__, "_sm120_engram", False):
+        return
+    orig = cls.__init__
+
+    def __init__(self, *args, **kwargs):
+        orig(self, *args, **kwargs)
+        if getattr(self, "engram_runtime", None) is not None:
+            _ENGRAM_MODELS.append(self)
+
+    __init__._sm120_engram = True
+    cls.__init__ = __init__
+    _note("E6 DeepseekModel.__init__: register engram models for graph prestaging")
+
+
+def prestage_for_replay(input_metadata) -> None:
+    """Hash this step's windows and fill the engram row buffers before a graph replay (eager, current stream)."""
+    if not _ENGRAM_MODELS or not _on("SM120_ENGRAM_PRESTAGE"):  # =0 only as a negative control (stale rows)
+        return
+    import tile_kernels
+    import torch
+
+    ids = getattr(input_metadata, "ngram_token_ids", None)
+    if ids is None:
+        return
+    ids = ids.to("cuda", non_blocking=True) if not ids.is_cuda else ids
+    mask = getattr(input_metadata, "images_seq_mask", None)
+    if mask is not None and not mask.is_cuda:
+        mask = mask.to("cuda", non_blocking=True)
+    for m in _ENGRAM_MODELS:
+        buf = m.engram_runtime._buffer
+        if buf is None or getattr(buf.fetcher, "graph_mode", None) != "prestage":
+            continue  # nothing captured yet, or the in-graph ("async") fetch serves itself
+        hashes = tile_kernels.engram.engram_hash(ids.contiguous(), m.ngram_multipliers, m.ngram_vocab_sizes,
+                                                 m.ngram_offsets, mask)
+        buf.prestage(hashes)
+        n = buf.fetcher.stats.get("prestages", 0)
+        if n in (1, 10, 100, 1000):
+            _note(f"E6 prestaged engram rows before graph replay #{n} (T={hashes.shape[1]})")
+
+
+def _patch_graph_replay(mod):
+    cls = mod.CudaGraphRunner
+    if getattr(cls.replay, "_sm120_engram", False):
+        return
+    orig = cls.replay
+
+    def replay(self, cuda_graph_data):
+        prestage_for_replay(cuda_graph_data.input_metadata_source)
+        return orig(self, cuda_graph_data)
+
+    replay._sm120_engram = True
+    cls.replay = replay
+    _note("E6 CudaGraphRunner.replay: engram rows prestaged before every replay")
+
+
+# ------------------------------------------------------------------------------------------------ E4
+def _patch_tile_kernels(mod):
+    import sm120_engram
+
+    mod.engram_hash = sm120_engram.engram_hash
+    mod.fused_weight = sm120_engram.fused_weight
+    mod.engram_gate_fwd = sm120_engram.engram_gate_fwd
+    _note("E4 tile_kernels.engram.{engram_hash,fused_weight,engram_gate_fwd} -> torch (SM120_ENGRAM_TK=torch)")
+
+
+# ------------------------------------------------------------------------------------------------ install
+def install() -> None:
+    """Register the hooks (idempotent). Requires sm120_patches (the hook machinery)."""
+    global _INSTALLED
+    if _INSTALLED or not _on("SM120_ENGRAM_PATCHES"):
+        return
+    import sm120_patches
+
+    if not sm120_patches.enabled():
+        return
+    _INSTALLED = True
+    when = sm120_patches.when_imported
+    if _on("SM120_ENGRAM_LAZY"):
+        when("deepinfer.model_executor.models.deepseek")(_patch_materialize)
+        when("deepinfer.hugging_face.weights")(_patch_load_tables)
+        when("deepinfer.hugging_face.loading")(_patch_safe_open)
+    when("deepinfer.model_executor.models.v4_modules.engram")(_patch_runtime)
+    when("deepinfer.model_executor.models.deepseek")(_patch_model_registry)
+    when("deepinfer.worker.cuda_graph_runner")(_patch_graph_replay)
+    if os.environ.get("SM120_ENGRAM_TK", "").strip().lower() == "torch":
+        when("tile_kernels.engram")(_patch_tile_kernels)

@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+# run outputs and local data
+*.pt
+*.log
+*.jsonl
+!eval/quality_set.jsonl
+/work/
+/ckpt/
+/cache/
+# reference implementation (supplied by the user, see tools/ref/README.md)
+/third_party/

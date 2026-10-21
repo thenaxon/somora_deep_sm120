@@ -1,0 +1,24 @@
+somora_deep_sm120
+Copyright 2026 The somora_deep_sm120 contributors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This project is not affiliated with, endorsed by, or sponsored by DeepSeek or NVIDIA.
+All product names and trademarks are the property of their respective owners.
+
+It builds on, but does not redistribute, the following software:
+
+- DeepInfer (https://github.com/deepseek-ai/DeepInfer), Copyright DeepSeek, Apache License 2.0.
+  The Docker image clones it at a pinned commit. patches/deepinfer-sequence-block-table.patch is a
+  modification of one DeepInfer source file and is distributed under the same license. The drop-in
+  packages in sm120/ reimplement the Python APIs of DeepSeek's FlashMLA, DeepGEMM, DeepEP and
+  DeepSelect libraries as DeepInfer calls them.
+
+- b12x (https://pypi.org/project/b12x/), Apache License 2.0, installed from PyPI. Its upstream
+  issue tracker is part of FlashInfer (https://github.com/flashinfer-ai/flashinfer).
+  patches/b12x-tiny-decode-swiglu.patch is a modification of b12x and is distributed under the
+  same license.
+
+- DeepSeek-V4.1-Flash model weights and their reference inference code are NOT included. They are
+  available from DeepSeek under their own license terms. The validation tools in tools/ref/ expect
+  the user to supply them.

@@ -7,9 +7,12 @@ every layer + compressor / indexer partial groups + DFlash SWA), a copy of a par
 prefill continues at token k like a later chunk of a chunked prefill (scheduler.hpp:398-433, 1060-1120). Missing in
 the open-source release is the cache itself. This module adds it:
 
-* **Snapshots.** Every request gets `chunk_checkpoints` at multiples of `grain` (default 128 = one KV block, the
-  kvstore grain `KVSTORE_GRAIN`), so its prefill chunks end there. After a step whose prefill chunk ended at k (a
-  checkpoint or the end of the prompt), the k-token prefix is recorded: its first ceil(k / 128) KV blocks are pinned
+* **Snapshots.** Every request gets `chunk_checkpoints` at multiples of `checkpoint_stride` (default: the larger of
+  `grain` and max_num_batched_tokens, so a prefill that runs alone is not split into more engine steps than chunked
+  prefill makes anyway; a smaller stride, down to `grain`, gives finer hits at the cost of one engine step per
+  checkpoint), so its prefill chunks end there. After a step whose prefill chunk ended at k (a checkpoint, any other
+  chunk end at a multiple of `grain` (default 128 = one KV block, the kvstore grain `KVSTORE_GRAIN`), or the end of
+  the prompt), the k-token prefix is recorded: its first ceil(k / 128) KV blocks are pinned
   (`BlockManager.pin_blocks`) and the sequence's state slot is copied into a cache-owned slot (the engine's own
   `clone_and_zero_states_and_blocks_on_default_stream`, stream-ordered after the step's forward and before the
   sequence's next step). Prefix KV is never rewritten (paged, append-only); the state at exactly k is what makes a hit
@@ -91,9 +94,13 @@ class _SchedulerProxy:
 
 class PrefixCache:
     def __init__(self, engine, *, grain: int = BLOCK, max_entries: int = 64, max_block_frac: float = 0.5,
-                 snapshot_prompt_end: bool | None = None, nextn: int = 0):
+                 snapshot_prompt_end: bool | None = None, nextn: int = 0, checkpoint_stride: int | None = None):
         if grain % BLOCK:
             raise ValueError(f"grain must be a multiple of {BLOCK}")
+        if not checkpoint_stride:  # None / 0: do not split prefills beyond the engine's own chunking
+            mnbt = getattr(getattr(engine, "scheduler_config", None), "max_num_batched_tokens", None) or grain
+            checkpoint_stride = max(grain, int(mnbt))
+        checkpoint_stride = -(-int(checkpoint_stride) // grain) * grain  # a multiple of the grain
         from deepinfer._C.engine import Sequence
 
         if not hasattr(Sequence, "block_table"):
@@ -101,6 +108,7 @@ class PrefixCache:
                                "patches/deepinfer-sequence-block-table.patch (prefix_cache/build_patched_c.sh)")
         self.engine = engine
         self.grain = grain
+        self.checkpoint_stride = checkpoint_stride
         self.max_entries = max_entries
         self.max_blocks = int(max_block_frac * engine.cache_config.num_gpu_blocks) if hasattr(engine, "cache_config") \
             else None
@@ -127,8 +135,9 @@ class PrefixCache:
         engine.add_request = self.add_request
         engine.step = self.step
         engine.flush_inflight_reqs = self.flush_inflight_reqs
-        log.info("prefix cache on: grain %d, max_entries %d, max_blocks %s, prompt-end snapshots %s, state slots %d",
-                 grain, max_entries, self.max_blocks, self.snapshot_prompt_end, self._num_state_slots())
+        log.info("prefix cache on: grain %d, checkpoint stride %d, max_entries %d, max_blocks %s, prompt-end snapshots "
+                 "%s, state slots %d", grain, checkpoint_stride, max_entries, self.max_blocks, self.snapshot_prompt_end,
+                 self._num_state_slots())
 
     # ------------------------------------------------------------------ helpers
     def _num_state_slots(self) -> int:
@@ -184,7 +193,8 @@ class PrefixCache:
         if not usable:
             return self._orig_add(**a)
         L = int(ids.size)
-        ckpts = list(range(self.grain, L, self.grain)) if (self.checkpoints or self.snapshot) else []
+        st = self.checkpoint_stride
+        ckpts = list(range(st, L, st)) if (self.checkpoints or self.snapshot) else []
         ckpts = sorted(set(ckpts) | {c for c in self.extra_checkpoints if 0 < c < L})
         if a.get("chunk_checkpoints"):
             ckpts = sorted(set(ckpts) | set(a["chunk_checkpoints"]))

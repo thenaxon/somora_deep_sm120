@@ -32,7 +32,7 @@ never change once written.
 
 | piece | how |
 |---|---|
-| snapshot points | every request gets `chunk_checkpoints` at multiples of `grain` (default 128 in tests, 512 in the server), so prefill chunks end there; plus the end of every prompt; plus the **end of every generation** (prompt + answer, for the next chat turn) |
+| snapshot points | every request gets `chunk_checkpoints` at multiples of `checkpoint_stride`, so prefill chunks end there. Default: max(`grain`, `max_num_batched_tokens`), which adds no engine steps to a prefill that runs alone (the tests use stride = grain = 128). Snapshots are taken at every prefill chunk end that is a multiple of `grain` (512 in the server); plus the end of every prompt; plus the **end of every generation** (prompt + answer, for the next chat turn) |
 | generation end | the step wrapper reads finished request ids from the step's outputs (`RequestOutput.get_finished`). The sequence (remembered from `schedule`) is snapshotted after `step()` returns, before the next `schedule()` frees it, at k = its `num_cached_tokens` read together with its state. With ZOS the engine post-processes step N inside step N+1 *after* launching N+1 (`worker.execute_model_step`), so a finished sequence may already have run one more forward; reading k and copying the state after everything launched keeps the pair consistent |
 | snapshot | after a step whose prefill chunk ended at k: `BlockManager.pin_blocks(seq.block_table[:ceil(k/128)])`, and the state slot is copied into a cache-owned slot (`clone_and_zero_states_and_blocks_on_default_stream`, ordered on the stream after the step's forward and before the sequence's next step) |
 | index | key = (k, blake2b of the k token ids), entries in an LRU. Eviction unpins the blocks and frees the slot |
@@ -48,8 +48,8 @@ never change once written.
 The serving image (`docker/Dockerfile`) builds DeepInfer with the patch already applied, so `--prefix-cache` works there directly:
 
 ```bash
-python3 /opt/sm120/server/server.py --ckpt /work/ckpt3 --prefix-cache [--prefix-cache-grain 512 --prefix-cache-entries 64 \
-    --prefix-cache-max-block-frac 0.5]                      # /health shows "prefix_cache": hits, hit_tokens, entries ...
+python3 /opt/sm120/server/server.py --ckpt /work/ckpt3 --prefix-cache [--prefix-cache-grain 512 --prefix-cache-checkpoint-stride 0 \
+    --prefix-cache-entries 64 --prefix-cache-max-block-frac 0.5]                      # /health shows "prefix_cache": hits, hit_tokens, entries ...
 SM120_MOE_IMPL=torch python3 /opt/sm120/tests/test_prefix_cache.py --ckpt /work/ckpt3 --json /work/pc_test_ckpt3.json
 ```
 
@@ -102,7 +102,7 @@ Prompt-end snapshots are therefore on in every mode.
 - `ckpt3`: the 3-layer model is chaotic (ref-vs-ref top-1 is about 0.7), and the logits differ by up to 10.7.
 - `ckpt_full`: min cos 0.9895-0.9967, top-1 100%, identical tokens. That is ordinary rounding.
 
-Within a server running with `--prefix-cache`, every request is split at the same grain multiples, hit or not. A request's output
+Within a server running with `--prefix-cache`, every request is split at the same stride multiples, hit or not. A request's output
 therefore does not depend on what is in the cache.
 
 ## TTFT
@@ -114,9 +114,15 @@ therefore does not depend on what is in the cache.
 | ckpt_full, 1024 + 30, grain 128 | 3.49 s | 8.79 s | **1.52 s** (2.3x) |
 | server, ckpt3, 1503-token prompt repeated (grain 512, hit at 1024) | | 1.82 s (first request) | 0.56 s |
 
-Each forced chunk is a separate prefill step, and eager prefill steps are expensive on SM120 (torch prefill attention / indexer paths). So a
-small grain makes misses slower. The server therefore defaults to grain 512 plus prompt-end snapshots. The multi-turn case, where the next
-prompt starts with the previous whole prompt, always hits at the previous prompt end, whatever the grain.
+Each forced chunk is a separate prefill step, and eager prefill steps are expensive on SM120. So a small stride makes misses slower:
+on the RTX 5090 with ckpt_full, `--prefix-cache` with checkpoints every 512 tokens (v0.2.0 default) made a 4k prompt 2.7-2.9 s instead of
+1.2-1.5 s and a 32k prompt 20.5 s instead of 7.7 s; on the 4-GPU host (`--dp 4`) it made prefill about 8x slower. The checkpoint stride
+therefore defaults to `--max-num-batched-tokens` (`--prefix-cache-checkpoint-stride 0`): a prefill is split only where chunked prefill splits
+it anyway, and snapshots land on those chunk ends and on prompt ends. The multi-turn case, where the next prompt starts with the previous
+whole prompt or answer, always hits at the previous prompt / generation end, whatever the stride. Hits inside a prompt (a shared system
+prompt shorter than the stride, or the same prompt sent twice) need a smaller stride, e.g. `--prefix-cache-checkpoint-stride 512`, at the
+cost of one prefill step per checkpoint. `tests/test_server.py --prefix-cache` and `tests/test_tools_server.py --prefix-cache` repeat the
+same prompt, so they need such a stride.
 
 ## Limits and open points
 

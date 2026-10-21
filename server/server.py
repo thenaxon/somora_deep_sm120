@@ -455,7 +455,8 @@ class App:
                                  nextn=args.nextn, graphs=args.graphs, zos=args.zos,
                                  prefill_interval=args.prefill_interval, deterministic=args.deterministic,
                                  dp_size=args.dp, dp_rank=args.dp_rank or 0, ep_size=args.ep,
-                                 prefix_cache=dict(grain=args.prefix_cache_grain, max_entries=args.prefix_cache_entries,
+                                 prefix_cache=dict(grain=args.prefix_cache_grain, checkpoint_stride=args.prefix_cache_checkpoint_stride,
+                                                   max_entries=args.prefix_cache_entries,
                                                    max_block_frac=args.prefix_cache_max_block_frac)
                                  if args.prefix_cache else None)
 
@@ -497,7 +498,12 @@ def main() -> int:
                     help="reuse computed prompt prefixes (prefix_cache; needs the patched _C: "
                          "PYTHONPATH=/opt/sm120/sm120:/work/deepinfer_pc DEEPINFER_ROOT=/work/deepinfer_pc)")
     ap.add_argument("--prefix-cache-grain", type=int, default=512,
-                    help="snapshot every N prompt tokens (multiple of 128) plus at every prompt end")
+                    help="snapshot granularity: prefixes are recorded at chunk ends that are multiples of N (multiple "
+                         "of 128), plus at every prompt end")
+    ap.add_argument("--prefix-cache-checkpoint-stride", type=int, default=0,
+                    help="split prefills at multiples of N for snapshots (rounded up to the grain). 0 (default): "
+                         "max(grain, --max-num-batched-tokens), i.e. no extra engine steps; a smaller stride gives "
+                         "finer prefix hits but costs one prefill step per checkpoint")
     ap.add_argument("--prefix-cache-entries", type=int, default=64, help="max cached prefix snapshots (state slots)")
     ap.add_argument("--prefix-cache-max-block-frac", type=float, default=0.5,
                     help="max fraction of KV blocks the cache may keep pinned")

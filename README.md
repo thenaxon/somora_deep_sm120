@@ -80,11 +80,11 @@ more expert weights per token, so the speed numbers are **not** a prediction for
 | | result |
 |---|---|
 | correctness, full-depth test model (327 / 2081-token prompt) | prefill hidden-state error within 3× the ref-vs-ref noise floor on every layer except layer 0 (see limitations); prefill top-1 agreement with the reference 0.927 / 0.949 (reference vs itself with other kernels: 0.933 / 0.953) |
-| decode step, CUDA graphs, batch 1 / 8 / 32 (`tests/prof_e2e.py`) | 18.1 / 23.2 / 28.0 ms |
+| decode step, CUDA graphs, batch 1 / 8 / 32 (`tests/prof_e2e.py`) | 18.0 / 21.8 / 26.6 ms |
 | server, single stream, CUDA graphs (prefix cache on) | TTFT 0.34 s, TPOT 16.6 ms (60 tok/s) |
 | server, 4 concurrent streams | 147 tok/s aggregate, median TPOT 22.2 ms |
 | server, MTP/DSpark nextn 5 | TPOT 5-6 ms (optimistic: the reduced-expert model's repetitive output inflates acceptance) |
-| MTP invariant | with the deterministic MoE, nextn 0 / 1 / 5 decode identical tokens |
+| determinism | with `SM120_MOE_DETERMINISTIC=1`, eager and CUDA graphs are bit-identical (17/17 tokens, 0.0 error on every layer); nextn 0 / 1 / 5 decode identical tokens with a deterministic MoE |
 | server test suite, 3-layer test model | 21/21 with `--deterministic --prefix-cache` |
 | prefix cache hit, 1503-token prompt | TTFT 1.82 s → 0.56 s, identical tokens |
 
@@ -98,7 +98,7 @@ Details and more tables: [docs/VALIDATION.md](docs/VALIDATION.md), [docs/ATTENTI
   known rounding property of DeepInfer's `fused_transform` path, not a port bug ([docs/VALIDATION.md](docs/VALIDATION.md)).
 - **b12x `fused_moe` (the default MoE) is not run-to-run deterministic.** The same prompt can decode different tokens
   after a few steps. `--deterministic` / `SM120_MOE_IMPL=torch` is exact but slower, and `SM120_MOE_DETERMINISTIC=1`
-  gives a deterministic b12x mode ([docs/RUNTIME.md](docs/RUNTIME.md)).
+  gives a deterministic b12x mode, recommended when reproducibility matters ([docs/VALIDATION.md](docs/VALIDATION.md)).
 - The b12x tiny-decode MoE kernel misses the SwiGLU clamp
   ([flashinfer-ai/flashinfer#6866](https://github.com/flashinfer-ai/flashinfer/issues/6866)). The image patches it, and
   the default uses the dynamic path anyway ([patches/PATCHES.md](patches/PATCHES.md)).

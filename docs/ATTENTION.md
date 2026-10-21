@@ -31,6 +31,7 @@ All switches are read on every call (`sm120/sm120_attn/_config.py`).
 | `SM120_INDEXER_IMPL` | `$SM120_ATTN_IMPL` | MQA-logits backend |
 | `SM120_ATTN_FUSED_IMPL` | `triton` (`torch` if `SM120_ATTN_IMPL=torch`) | fused q-prep and RoPE/FP8-cast kernels |
 | `SM120_TOPK_IMPL` | `triton` (`torch` if `SM120_ATTN_IMPL=torch`) | top-k key kernel |
+| `SM120_TOPK_FUSED` | `0` | `1`: fused single-kernel radix top-k. Bit-identical to the torch path including tie order, but about 10.8 ms per call vs 0.33 ms for the default (Triton fp32 key kernel + `torch.topk`), so opt-in only |
 | `SM120_ATTN_COMPUTE` | `bf16` | b12x `v41_compute_mode`. `fp8` is faster but less accurate (cos about 0.99-0.997). |
 | `SM120_ATTN_PERMUTE` | `1` | `1` reproduces FlashMLA's exact q_b_proj/wv_proj permutations and fused I/O layouts. `0` makes the permute functions identity and uses natural layouts. **Must be the same at weight load and at run time.** |
 | `SM120_ATTN_STRICT` | `0` | `1` raises instead of falling back from b12x to torch |
@@ -40,10 +41,12 @@ All switches are read on every call (`sm120/sm120_attn/_config.py`).
 | `SM120_ATTN_PREFILL_KV` | `auto` | how the bf16 prefill KV is re-encoded for b12x (section 4). `fp8` puts every token into the 528 B cache. |
 | `SM120_ATTN_PREFILL_ROWS` | `2048` | query rows per b12x prefill launch (fixed plan capacity). Scratch is about rows x H x 1 KiB, 128 MiB at H=64. |
 | `SM120_ATTN_PREFILL_LONELY_FIX` | `0` | `1` restores the full-output fix-up for queries without keys (b12x already writes 0 there) |
+| `SM120_ATTN_DECODE_STAGE` | `0` | `1` copies the caller's tensors into staging buffers before the b12x decode call (default: bind them directly, fresh `out`, cached NaN LSE) |
 | `SM120_ATTN_DECODE_COMPACT` | `0` | `1` compacts decode index lists before b12x (not needed: b12x skips -1 entries) |
 | `SM120_INDEXER_SCRATCH_MB` | `1024` | per-call scratch budget of the b12x indexer; rows are chunked to fit it |
 | `SM120_INDEXER_FILL_TAIL` | `0` | `1`: b12x `fp8_fp4_mqa_logits` also writes -inf past the longest valid row (DeepGEMM leaves it uninitialized; DeepInfer always passes `end` to top-k) |
 | `SM120_MHC_IMPL` | `triton` | `torch` keeps the torch loop for `tf32_hc_prenorm_gemm` |
+| `SM120_MHC_PRECISION` | `ieee` | `tf32` (opt-in, accuracy not signed off): 12 vs 14 us at decode, 0.052 vs 0.283 ms at T=2048 |
 | `SM120_EINSUM_IMPL` | `triton` | `torch` keeps the dequant + bmm path for `fp8_einsum` |
 | `SM120_LMHEAD_IMPL` | `bf16` | `fp8` enables the FP8 lm_head (section 9) |
 | `SM120_ATTN_DEBUG` | `0` | print each dispatch decision once, plus plan lists and prefill KV class counts. Fallback warnings are always printed. |
@@ -357,7 +360,7 @@ Decode lm_head is a bandwidth-bound GEMV: 129280 x 5120 bf16 = 1.32 GB per step.
   installs it on import of `sampler_utils`. It composes with the logit capture (P6), which looks `bf16_gemm_nt` up at
   call time.
 
-Measured on full-depth test model activations (`tests/lmhead_eval.py`, `hidden.prefill.final_norm` from a
+Measured on full-depth test model activations (`tests/lmhead_fp8_eval.py`, `hidden.prefill.final_norm` from a
 `tools/run_deepinfer.py` dump, head from the same checkpoint). The bf16 recomputation equals DeepInfer's own logits
 (cos 1.000000); the weight quantization error is rel-L2 2.6e-2.
 
@@ -420,9 +423,14 @@ mHC/einsum kernels.
 
 | B | decode ms/step, nextn 0 | decode ms/step, nextn 5 (6 rows per request verified per step) |
 |---|---|---|
-| 1 | 18.1 | 15.8 |
-| 8 | 23.2 | 22.9 |
-| 32 | 28.0 | 51.4 |
+| 1 | 18.0 | 15.8 |
+| 8 | 21.8 | 22.9 |
+| 32 | 26.6 | 51.4 |
+
+nextn 0 is after the decode-overhead work below (direct tensor binding in decode attention, one shared decode scratch
+arena, one host sync in prefill); before it, 18.1 / 23.2 / 28.0 ms. The nextn 5 column and the category breakdown
+below were measured before that work. b12x decode attention under graphs is now 0.017 / 0.027 / 0.069 ms at
+B = 1 / 8 / 32 (was 0.064 / 0.078 / 0.120); the shared scratch arena also fixed an out-of-memory at nextn 5 capture.
 
 | category (nextn 0), ms/step | B=1 | B=8 | B=32 |
 |---|---|---|---|
@@ -486,11 +494,16 @@ configurations diverge after a few tokens, so the comparison is step-0 cosine ag
 | 6 | C1 consumer | 0.913 / 0.916 | - |
 | 7 | index source using candidates | 0.902 / 0.905 | - |
 
-- **MTP / DSpark draft path** (`tests/mtp.sh` on an MTP test checkpoint, nextn 0 / 5, eager / graphs, and nextn 5
+- **MTP / DSpark draft path** (`tests/mtp_check.sh` on an MTP test checkpoint, nextn 0 / 5, eager / graphs, and nextn 5
   with `SM120_ATTN_IMPL=torch`): greedy tokens identical in all runs. The draft layers' attention runs on b12x under
   graphs (no-extra decode plan, `swa_width=192`), and the 20k-token profile prefill also runs on b12x. Draft acceptance
   on the truncated checkpoint is 0 because its DSpark targets are not the trained ones; it says nothing about attention.
-- **Unit tests:** `tests/test_attn_shims.py` + `tests/test_mhc_einsum.py`, 77 passed.
+- **Full-depth test model, eager vs CUDA graphs:** with `SM120_MOE_DETERMINISTIC=1`, eager, graphs and a second graphs
+  run are bit-identical (17/17 tokens, 0.0 difference on every layer), so capture/replay adds no error. With the
+  default (non-deterministic) b12x MoE, graph-run layer errors equal eager within noise (ratios to ref-vs-ref 1.1-1.2),
+  but the 17 greedy tokens vary from run to run at near-ties (positions 2 and 5), in eager and graphs alike. See
+  [VALIDATION.md](VALIDATION.md).
+- **Unit tests:** `tests/test_attn_shims.py` + `tests/test_mhc_einsum.py`, 83 passed (with the EP tests also passing).
 
 ## 10. Known gaps
 
@@ -500,7 +513,8 @@ configurations diverge after a few tokens, so the comparison is step-0 cosine ag
    back to torch with one warning, so a failure costs speed, not correctness; use `SM120_ATTN_STRICT=1` to surface it.
    Main cache 288 B (non-SWA layers) or extra cache 528 B goes to torch.
 3. **Plan creation under capture** (a shape not warmed up) records the torch path: correct but slow, with a warning.
-4. **Top-k is still `torch.topk`** over the full `max_kv_len` width, which costs bandwidth on decode.
+4. **Top-k is still `torch.topk`** over the full `max_kv_len` width, which costs bandwidth on decode. The fused radix
+   kernel (`SM120_TOPK_FUSED=1`) is correct but slower; a faster fused top-k is open.
 5. **Prefill overhead:** the KV re-encode is repeated per YOCO consumer layer, and there is one host sync per call.
 6. **NaN handling in top-k:** NaN ranks lowest; the original aborts.
 7. **Dense varlen `flash_attn_varlen_*`** is a forward-only torch loop with bottom-right causal alignment (unused by
@@ -545,13 +559,12 @@ Caches are written with DeepInfer's `store_kv_cache_ref` when importable, otherw
 | script | what it does |
 |---|---|
 | `tests/bench_attn.py` | kernel microbenchmarks, torch vs b12x |
-| `tests/prof_prefill.py` | torch-profiler breakdown of the b12x prefill |
 | `tests/prof_e2e.py` | engine profile: `--modes graph` gives per-category GPU kernel time, wall time, GPU-busy time and host gap per step; `--modes eager --modules` attributes GPU/CPU time per innermost `nn.Module` and per shim entry point (`sm120:*` ranges) |
 | `tests/e2e_matrix.sh` | end-to-end runs with env variants, each fed through `tools/compare.py` (`TEST_CKPT`, `TEST_PROMPT`, `TEST_REF`, `TEST_REF2`, `TEST_ARGS`, `TEST_CAPTURE`, `TEST_L0`) |
 | `tests/determinism.sh` | two identical runs per config, then a diff of every tap |
-| `tests/mtp.sh` | MTP/DSpark draft path, greedy tokens compared across configs |
-| `tests/longctx.sh`, `tests/longctx_check.py`, `tests/longctx_bench.sh` | long-context correctness and performance |
-| `tests/lmhead_eval.py` | FP8 lm_head accuracy on dumped hidden states |
+| `tests/mtp_check.sh` | MTP/DSpark draft path, greedy tokens compared across configs |
+| `tests/longctx_check.py`, `tests/longctx_bench.sh` | long-context correctness and performance |
+| `tests/lmhead_fp8_eval.py` | FP8 lm_head accuracy on dumped hidden states |
 
 Operational notes: keep `B12X_AUTOTUNE=0` (avoids multi-candidate races during the first compile); set
 `SM120_ATTN_DEBUG=1` on a first run to see the plan list and prefill KV class counts. If the host `/dev/shm` is small

@@ -1,5 +1,8 @@
 #!/bin/bash
-# run_deepinfer twice per config and diff the two outputs (prefill logits / hidden taps)
+# Run-to-run determinism check: runs tools/run_deepinfer.py twice per config on $WORK/ckpt3 and diffs the two
+# outputs (prefill/decode logits, hidden taps, tokens). Each argument is one env config, e.g.
+#   determinism.sh "SM120_MOE_DETERMINISTIC=1" "SM120_MOE_IMPL=torch" ""   ('' = defaults)
+# The default b12x fused_moe is not run-to-run deterministic (atomic top-k combine); the two configs above are.
 # Container paths (override via env): SM120_ROOT=/opt/sm120 (this repo), WORK=/work (work dir),
 # HF_CKPT=/ckpt (original HF checkpoint shards, read-only).
 SM120_ROOT=${SM120_ROOT:-/opt/sm120}; WORK=${WORK:-/work}; HF_CKPT=${HF_CKPT:-/ckpt}; export SM120_ROOT WORK HF_CKPT

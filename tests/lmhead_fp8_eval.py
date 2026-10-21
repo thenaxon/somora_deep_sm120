@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """FP8 (weight-only) lm_head vs bf16 on real activations: logit cos / top-1 / top-5 / KL, plus kernel timing.
 
-    python3 lmhead_eval.py --ckpt /work/ckpt_full --dumps /work/full_short_di.pt,/work/full_long_di.pt
+    python3 lmhead_fp8_eval.py --ckpt /work/ckpt_full --dumps /work/full_short_di.pt,/work/full_long_di.pt
 
 Hidden states: the dump's hidden["prefill"]["final_norm"] (the head input). Head weight: <ckpt>/head.weight.
 The bf16 reference is the deep_gemm shim's bf16_gemm_nt with fp32 output (what get_logits runs); it is checked

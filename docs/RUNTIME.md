@@ -18,7 +18,7 @@ All numbers below are from one RTX 5090 with truncated test checkpoints ([VALIDA
 | DeepInfer sampler / DFlash TileLang op tests | 74 + 124 passed |
 | b12x tiny-decode SwiGLU patch | all checks pass incl. the V4.1 shape; tiny-decode is 0.90-0.95x the dynamic path, so the default stays dynamic (`SM120_MOE_TINY_DECODE=0`) |
 | logit capture (`tools/run_deepinfer.py`, 3-layer model) | decode argmax == sampled token for all 16 steps |
-| determinism | default b12x MoE: repeats differ (atomic top-k combine). `SM120_MOE_DETERMINISTIC=1` / `--batch-invariant`: bit-identical repeats, prefill + decode logits and tokens |
+| determinism | default b12x MoE: repeats differ (atomic top-k combine). `SM120_MOE_DETERMINISTIC=1` / `--batch-invariant`: bit-identical repeats, prefill + decode logits and tokens; on the full-depth test model eager, graphs and a second graphs run are bit-identical (17/17 tokens, 0.0 error on every layer) |
 | CUDA graphs end to end | 3-layer, YOCO and full-depth test models; no b12x fallback warnings under capture |
 | MTP / DSpark | nextn 1 and 5, eager and graphs; speculative == greedy holds exactly with the deterministic MoE ([VALIDATION.md](VALIDATION.md)) |
 

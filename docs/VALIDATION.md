@@ -252,13 +252,22 @@ Logits:
 |---|---|---|---|
 | 327 tokens, eager | 0.927 | 0.933 | 5/17 identical prefix, 11/17 position-wise; first 4 decode steps top-1 1.000 |
 | 2081 tokens, eager | 0.949 | 0.953 | 9/17 prefix, 15/17 position-wise; first 4 top-1 1.000 |
-| 327 tokens, `--graphs` | 0.927 | 0.933 | **17/17 identical to the torch-kernel reference**; 5/17 vs tilelang |
+| 327 tokens, `--graphs` | 0.927 | 0.933 | one run: 17/17 identical to the torch-kernel reference, 5/17 vs tilelang (see below: one draw of the non-deterministic MoE) |
 
 - With all 40 layers the model is far less chaotic than the shorter truncations (top-1 0.93-0.95 vs 0.68-0.74), and
   the decoded tokens look like real text.
-- Different runs (eager/graphs, nextn) decode slightly different tokens after a few steps. That is the run-to-run
-  nondeterminism of b12x `fused_moe` ([SERVER.md](SERVER.md), "Determinism"); `SM120_MOE_IMPL=torch` is deterministic.
-  Because of it, the 17/17 graph-mode result is not guaranteed to reproduce bit-exactly on every run.
+- **Run-to-run variation and eager vs graphs.** The default b12x `fused_moe` combines the top-k expert outputs with
+  atomics and is not run-to-run deterministic. On this truncated checkpoint the greedy tokens therefore flip at
+  near-ties (positions 2 and 5) from run to run, in eager and graph mode alike, while the per-layer errors against the
+  reference stay within noise (ratios 1.06-1.18). The "17/17" graph run above is one such draw; an eager run picked a
+  different token at position 5.
+- **Tested: deterministic eager == graphs.** With `SM120_MOE_DETERMINISTIC=1` (b12x `deterministic_output`), eager,
+  graphs and a second graphs run are bit-identical: 17/17 tokens and 0.0 difference on every layer. So CUDA-graph
+  capture/replay introduces no error. The deterministic tokens
+  (`[304, 270, 1840, 5090, 294, 270, 14108, 3554, 33, 455, ...]`) leave the torch-kernel reference at position 2
+  (1840 vs 3072), a near-tie decided only by the MoE combine order.
+- For reproducible outputs use `SM120_MOE_DETERMINISTIC=1` (keeps b12x) or the exact torch MoE
+  (`SM120_MOE_IMPL=torch`, which the server's `--deterministic` sets).
 
 Speed (327-token prompt, 16 decode steps, single request; step times from `meta.step_timing`):
 
@@ -290,7 +299,8 @@ MTP acceptance (real DSpark targets, but 16/384 backbone experts and 32/128 draf
 
 ## 7. Open points
 
-- b12x `fused_moe` run-to-run nondeterminism breaks bit-reproducibility across runs and between nextn settings.
+- The default b12x `fused_moe` is not run-to-run deterministic; use `SM120_MOE_DETERMINISTIC=1` when bit-reproducibility
+  across runs and between nextn settings matters.
 - Longer decodes (hundreds of steps) are needed for stable acceptance and step-time numbers.
 - No validation of the full (untruncated) model yet: it does not fit one 32 GB GPU and needs the multi-GPU path
   ([MULTI_GPU.md](MULTI_GPU.md)).

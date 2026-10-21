@@ -212,7 +212,7 @@ for n in 0 1 5; do
   python3 /opt/sm120/tools/run_deepinfer.py --ckpt /work/ckpt3_mtp --prompt-ids /work/prompt_ids.json --no-hidden --nextn $n \
     --out /work/mtp_n$n.pt
 done
-bash /opt/sm120/tests/mtp.sh       # nextn 0 / 5, eager / graphs, and nextn 5 with torch attention; greedy tokens compared
+bash /opt/sm120/tests/mtp_check.sh       # nextn 0 / 5, eager / graphs, and nextn 5 with torch attention; greedy tokens compared
 ```
 
 - `--nextn N` sets `DEEPINFER_USE_NEXTN_DECODE` and `lookahead_tokens=min(1, N)`. A decode step then carries 1+N logit

@@ -122,7 +122,16 @@ it anyway, and snapshots land on those chunk ends and on prompt ends. The multi-
 whole prompt or answer, always hits at the previous prompt / generation end, whatever the stride. Hits inside a prompt (a shared system
 prompt shorter than the stride, or the same prompt sent twice) need a smaller stride, e.g. `--prefix-cache-checkpoint-stride 512`, at the
 cost of one prefill step per checkpoint. `tests/test_server.py --prefix-cache` and `tests/test_tools_server.py --prefix-cache` repeat the
-same prompt, so they need such a stride.
+same prompt, so they need such a stride (`tests/run_server_tests.sh` / `run_tools_tests.sh` add
+`--prefix-cache-checkpoint-stride 512` when the server runs `--prefix-cache` without one).
+
+| workload | hits with the default stride (= `--max-num-batched-tokens`) | suggestion |
+|---|---|---|
+| multi-turn chat (next prompt = previous prompt + answer + new turn) | full: prompt-end and generation-end snapshots | default |
+| shared system prompt / tool list, then different user turns | up to the last stride multiple inside the shared part (nothing if it is shorter than the stride) | agent workloads with short shared system prompts: `--prefix-cache-checkpoint-stride 1024` or `2048` |
+| identical prompt sent again | up to the last stride multiple below the prompt length | as above |
+
+Each checkpoint inside a prompt costs one extra prefill step for every request, hit or miss.
 
 ## Limits and open points
 

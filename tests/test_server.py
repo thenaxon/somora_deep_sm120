@@ -260,7 +260,8 @@ def main() -> int:
         hit = t2 - t0
         h1 = cl.get("/health")[1]["prefix_cache"]
         check("prefix cache: repeated prompt hits", h1["hits"] - h0["hits"] >= 1,
-              f"hits +{h1['hits'] - h0['hits']}, cached tokens +{h1['hit_tokens'] - h0['hit_tokens']}")
+              f"hits +{h1['hits'] - h0['hits']}, cached tokens +{h1['hit_tokens'] - h0['hit_tokens']}" + ("" if h1["hits"] > h0["hits"] else f" (server checkpoint stride {h1.get('checkpoint_stride')}: in-prompt hits need "
+                                                   "--prefix-cache-checkpoint-stride <= 1024)"))
         check("prefix cache: TTFT faster on a hit", hit < miss, f"miss {miss:.3f}s hit {hit:.3f}s")
         check("prefix cache: same tokens on a hit", d1 and d2 and txt1 == txt2)  # soft without --deterministic
         st, r = cl.post("/v1/completions", dict(model=model, prompt=prefix + [11111, 22222, 33333] + [444] * 40,

@@ -337,7 +337,8 @@ class PrefixCache:
 
     def summary(self) -> dict:
         s = dict(self.stats)
-        s.update(entries=len(self.entries), pinned_blocks=self._pinned_blocks(),
+        s.update(entries=len(self.entries), pinned_blocks=self._pinned_blocks(), grain=self.grain,
+                 checkpoint_stride=self.checkpoint_stride,
                  hit_rate=s["hits"] / s["lookups"] if s["lookups"] else 0.0,
                  token_hit_rate=s["hit_tokens"] / s["prompt_tokens"] if s["prompt_tokens"] else 0.0)
         return s

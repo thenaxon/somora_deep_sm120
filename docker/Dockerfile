@@ -1,9 +1,9 @@
 # somora_deep_sm120: DeepInfer on SM120 (RTX 5090 / RTX PRO 6000 Blackwell), self-contained serving image
 # (OpenAI-compatible server).
 #
-#   docker build -t somora_deep_sm120:0.1.0 -f docker/Dockerfile .          # build context = repo root
+#   docker build -t somora_deep_sm120:0.1.1 -f docker/Dockerfile .          # build context = repo root
 #   docker run --rm --gpus all --ipc=host --shm-size=16g -p 8000:8000 -v /models:/models:ro -v sm120-cache:/cache \
-#       somora_deep_sm120:0.1.0 --model /models/DeepSeek-V4.1-Flash [--prefix-cache] [--nextn 5] [--no-graphs]
+#       somora_deep_sm120:0.1.1 --model /models/DeepSeek-V4.1-Flash [--prefix-cache] [--nextn 5] [--no-graphs]
 #
 # DeepInfer is cloned at the pinned commit (without its vendor/ submodules: FlashMLA/DeepGEMM/DeepEP/DeepSelect are
 # SM100-only and replaced by sm120/). The layers up to `pip install b12x` are the same as docker/Dockerfile.dev.

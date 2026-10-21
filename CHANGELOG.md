@@ -3,6 +3,12 @@
 All notable changes to this project are documented here. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0 any minor release may change interfaces.
 
+## [Unreleased]
+
+### Added
+- Start-up banner: somora lettering with "deep sm120", version, checkpoint, DP size and port
+  (`server/banner.py`, `SM120_BANNER=0` disables it).
+
 ## [0.1.0] - unreleased
 
 First release. Experimental.

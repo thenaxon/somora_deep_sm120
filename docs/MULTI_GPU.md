@@ -2,10 +2,10 @@
 
 Target: a host with several SM120 GPUs and no NVLink, e.g. the 4x RTX PRO 6000 Blackwell Max-Q (PCIe) target.
 
-Status: **implemented, but only emulated-tested.** The EP MoE layer, the DP-wide decode graph-size sync, the DeepInfer
+Status: **runs the full model on 4× RTX PRO 6000 Blackwell Max-Q over PCIe** (results: [RESULTS.md](RESULTS.md)). Originally developed and tested in emulation: The EP MoE layer, the DP-wide decode graph-size sync, the DeepInfer
 hooks and the multi-rank server front end (`server.py --dp N`) are in place. They have been tested on one GPU
-(in-process emulation, several processes on one GPU over gloo, and a 1-rank NCCL group under CUDA graphs). Nothing
-has run on 4 real GPUs yet. Treat multi-GPU serving as untested until the steps in §6 pass.
+(in-process emulation, several processes on one GPU over gloo, and a 1-rank NCCL group under CUDA graphs). Run the
+steps in §6 on every new host before serving.
 
 ## 1. What DeepInfer does on SM100, and what changes
 

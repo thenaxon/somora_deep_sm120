@@ -12,17 +12,18 @@ prefix cache needs one extra read-only C++ binding, added by a one-line patch at
 
 Target model: DeepSeek-V4.1-Flash (MoE, FP4 experts, compressed sparse attention, mHC, Engram, MTP/DSpark).
 
-> **Status: experimental (v0.2.0).** On a single RTX 5090, DeepInfer runs end to end on truncated test checkpoints
-> made from the real V4.1-Flash weights, and it is validated layer by layer against DeepSeek's reference
-> implementation. The full model does not fit one 32 GB GPU. Multi-GPU expert parallelism for PCIe-only machines is
-> implemented, but so far it has only been tested in single-GPU emulation. Not affiliated with DeepSeek or NVIDIA.
+> **Status: experimental (v0.2.1).** DeepInfer runs the full DeepSeek-V4.1-Flash on 4× RTX PRO 6000 Blackwell Max-Q
+> over PCIe: stable, with quality on par with a tuned vLLM deployment, but not yet competitive on speed (decode about
+> 2-3× and prefill about 15× behind as of v0.2.0, see [docs/RESULTS.md](docs/RESULTS.md)). On a single RTX 5090 it is
+> validated layer by layer against DeepSeek's reference implementation with truncated test checkpoints. Not affiliated
+> with DeepSeek or NVIDIA.
 
 ## Hardware
 
 | GPU | status |
 |---|---|
-| GeForce RTX 5090 (SM120, 32 GB) | **tested**: every result below |
-| RTX PRO 6000 Blackwell (Max-Q), 4× over PCIe, no NVLink | target for the full model; multi-GPU path implemented, not yet run on real hardware |
+| GeForce RTX 5090 (SM120, 32 GB) | **tested**: truncated test checkpoints, all single-GPU results below |
+| RTX PRO 6000 Blackwell (Max-Q), 4× over PCIe, no NVLink | **tested** with the full model (`--dp 4`): [docs/RESULTS.md](docs/RESULTS.md) |
 | other SM120 / SM121 | untested |
 
 NVIDIA driver >= 595 is required (CUDA 13.2). Pinned versions are listed in [COMPATIBILITY.md](COMPATIBILITY.md).
@@ -72,13 +73,27 @@ More in [docker/README.md](docker/README.md) and [docs/SERVER.md](docs/SERVER.md
 - **Exact prefix caching**: a cache hit gives the same result as a miss, bit for bit, with the deterministic MoE
   ([docs/PREFIX_CACHE.md](docs/PREFIX_CACHE.md)).
 - **Multi-GPU expert parallelism for PCIe**: DP attention + EP MoE over NCCL instead of DeepEP, with a DP proxy in front
-  of the per-GPU engines. Implemented; compile-checked and tested in single-GPU emulation only ([docs/MULTI_GPU.md](docs/MULTI_GPU.md),
+  of the per-GPU engines. Runs the full model on 4× RTX PRO 6000 ([docs/RESULTS.md](docs/RESULTS.md), [docs/MULTI_GPU.md](docs/MULTI_GPU.md),
   [docs/MULTI_GPU_RUNBOOK.md](docs/MULTI_GPU_RUNBOOK.md)).
 - **Validation tooling** (`tools/`): a runner for DeepSeek's reference implementation, a checkpoint truncator,
   per-layer and intra-layer comparison against the ref-vs-ref noise floor ([docs/VALIDATION.md](docs/VALIDATION.md)).
 - Optional **FP8 lm_head** for decode (`SM120_LMHEAD_IMPL=fp8`, off by default) ([docs/ATTENTION.md](docs/ATTENTION.md)).
 
 ## Results
+
+### Full model, 4× RTX PRO 6000 Blackwell Max-Q (v0.2.0)
+
+| | this engine | tuned vLLM, TP=4 |
+|---|---|---|
+| quality, 28-item set (core / tool / json / image) | 27/27 | 26/27 |
+| decode, 1 user, real code / chat prompts | 111 / 73 tok/s | 339 / 165 tok/s |
+| prefill rate | ~1,000 tok/s | ~16,000 tok/s |
+| 4k prompts, 64 users, output | 248 tok/s | 425 tok/s |
+
+Stable in all runs (CUDA graphs, DSpark, clean shutdown). Causes of the slow prefill and the v0.2.1 fixes:
+[docs/RESULTS.md](docs/RESULTS.md).
+
+### Single RTX 5090, truncated test checkpoints
 
 All numbers come from **one RTX 5090** with **truncated test checkpoints** built from the real V4.1-Flash weights. The
 main one is the *full-depth test model*: all 40 layers, real attention/norm/mHC/shared-expert weights, engram on
@@ -103,7 +118,9 @@ Details and more tables: [docs/VALIDATION.md](docs/VALIDATION.md), [docs/ATTENTI
 
 ## Known limitations
 
-- **The full V4.1-Flash model needs more than one GPU.** The multi-GPU path has not run on real multi-GPU hardware yet.
+- **Speed on the 4-GPU target is behind a tuned vLLM TP=4 deployment** (decode about 2-3×, prefill about 15× as of
+  v0.2.0). DP attention runs each request's prefill on one GPU; tensor parallelism is tracked in
+  [#1](https://github.com/thenaxon/somora_deep_sm120/issues/1). The full model needs more than one GPU.
 - **Layer 0 deviates from the reference** beyond the noise floor (about 12-20× noise, not at other layers). This is a
   known rounding property of DeepInfer's `fused_transform` path, not a port bug ([docs/VALIDATION.md](docs/VALIDATION.md)).
 - **b12x `fused_moe` (the default MoE) is not run-to-run deterministic.** The same prompt can decode different tokens

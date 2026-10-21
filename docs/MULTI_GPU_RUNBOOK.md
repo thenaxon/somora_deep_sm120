@@ -4,7 +4,7 @@ This is the procedure for running the serving image on a host with 4 SM120 GPUs 
 4x RTX PRO 6000 Blackwell Max-Q, 96 GB each) and comparing it against an existing baseline such as a vLLM
 deployment of the same model.
 
-**Multi-GPU has not been run on real hardware yet** (see [MULTI_GPU.md](MULTI_GPU.md)). Do the validation steps in §4
+Measured results on such a host are in [RESULTS.md](RESULTS.md). Do the validation steps in §4
 before trusting any numbers, and start eager (`--no-graphs`).
 
 If a baseline (e.g. a vLLM deployment with TP=4) occupies all four GPUs, both cannot run at the same time. Plan a

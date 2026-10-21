@@ -120,9 +120,8 @@ Options considered:
 | C. DP attention + b12x `ep_moe` | as B with b12x's EP op | W4A16 only, loses the FP8 activation path |
 
 Option B is implemented in `sm120/sm120_ep/`, using DeepInfer's own EP expert sharding at load and its DP-wide step voting,
-so every rank enters every MoE layer in lockstep. **Status: implemented and tested on one GPU only** (in-process emulation of
-4 ranks, 2 processes on one GPU with gloo, a 1-rank NCCL group captured in a CUDA graph). It has not run on 4 physical GPUs
-yet. Expected costs, the transport choice and the open follow-ups (DP max-sync of the decode graph size, b12x PCIe collectives)
+so every rank enters every MoE layer in lockstep. **Status: runs on 4 physical GPUs** ([RESULTS.md](RESULTS.md)); also tested in emulation
+(4 in-process ranks, 2 processes on one GPU with gloo, a 1-rank NCCL group captured in a CUDA graph). Expected costs, the transport choice and the open follow-ups (DP max-sync of the decode graph size, b12x PCIe collectives)
 are in [MULTI_GPU.md](MULTI_GPU.md); the bring-up procedure is in [MULTI_GPU_RUNBOOK.md](MULTI_GPU_RUNBOOK.md).
 
 Memory budget for the full DeepSeek-V4.1-Flash checkpoint (about 510 GB: 296 GB FP4 routed experts, 203 GB Engram tables,

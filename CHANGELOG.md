@@ -6,11 +6,31 @@ before 1.0 any minor release may change interfaces.
 ## [Unreleased]
 
 ### Fixed
+- Prefill with `--prefix-cache` was split into `--prefix-cache-grain`-sized engine steps (512 tokens by default): a
+  4k prompt took 8 steps instead of 1. Checkpoints now sit at multiples of the new `--prefix-cache-checkpoint-stride`
+  (default: max(grain, `--max-num-batched-tokens`)), so the cache never adds steps; prompt-end and generation-end
+  snapshots are unchanged. On one RTX 5090, 32k TTFT with the prefix cache went from 20.5 s to 8 s. Hits inside a
+  prompt shorter than the stride need a smaller stride (see docs/PREFIX_CACHE.md).
+- Multi-GPU EP prefill: the token counts are synchronised once per step instead of in every MoE layer (40 host syncs
+  per step before), and the local experts run on the real rows only instead of on every rank's padded rows.
+- Engram: `SM120_ENGRAM_STATS=1` now also prints periodically (`SM120_ENGRAM_STATS_INTERVAL`, default 60 s), not only
+  at a clean exit.
 - `chat_template_kwargs` in chat requests was ignored. `{"thinking": true}` (and `enable_thinking`), `reasoning_effort`
   and `drop_thinking` are now honoured; top-level `thinking` / `reasoning_effort` win. Non-boolean `thinking` values
   are rejected with 400 instead of being coerced.
 
 ### Added
+- Engram page cache: start-up and after-load log lines report how much of the tables is resident; after all ranks
+  have loaded, the server drops clean page-cache pages of the other weight shards and prefaults the tables if they fit
+  into free RAM (`SM120_ENGRAM_PREFAULT_AT=ready`, `SM120_ENGRAM_DROP_WEIGHT_PAGES=0` to keep the pages).
+- `--dp`: a peer-copy self-test at start-up sets `NCCL_P2P_LEVEL=SYS` for the ranks when GPU peer access works
+  (an explicit `NCCL_P2P_LEVEL`/`NCCL_P2P_DISABLE` or `SM120_NCCL_P2P_LEVEL` wins).
+- Faster `fp8_einsum` for long prompts (17–23 %, bit-identical).
+- `SM120_EP_TRANSPORT=b12x`: optional b12x PCIe all-gather / reduce-scatter for EP prefill (4 ranks), with
+  `tests/test_ep_b12x_transport.py`. NCCL stays the default; on the 4-GPU target it was faster above one row.
+- `eval/scenarios.py` + `eval/prompts.json`: workload scenarios against any OpenAI-compatible endpoint (realistic
+  prompts for speculative decoding, many long prompts, shared system prompt over several turns, mixed long/short
+  load, capacity under a latency SLO).
 - `eval/compare_endpoints.py --teacher-forced`: both endpoints (and an optional third reference: a file or an
   endpoint) score the same continuation position by position: top-1 agreement, KL per position, forced-token
   logprob delta, NLL per endpoint, and which endpoint is closer to the reference. Continuations from either endpoint,

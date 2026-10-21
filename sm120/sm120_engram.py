@@ -186,6 +186,41 @@ def drop_page_cache(path: str, offset: int = 0, length: int = 0) -> None:
         os.close(fd)
 
 
+def resident_bytes(path: str, offset: int = 0, length: int | None = None, chunk: int = 1 << 30) -> int | None:
+    """Bytes of path[offset:offset+length] in the page cache (mincore(2) on a temporary mapping), None if unknown."""
+    try:
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.mmap.restype = ctypes.c_void_p
+        libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_long]
+        libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        libc.mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
+        pg = mmap.PAGESIZE
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            size = os.fstat(fd).st_size
+            end = size if length is None else min(size, offset + length)
+            start = offset // pg * pg
+            total = 0
+            for a in range(start, end, chunk):
+                n = min(chunk, end - a)
+                p = libc.mmap(None, n, mmap.PROT_READ, mmap.MAP_SHARED, fd, a)
+                if p in (None, ctypes.c_void_p(-1).value):
+                    return None
+                try:
+                    vec = np.zeros((n + pg - 1) // pg, dtype=np.uint8)
+                    if libc.mincore(p, n, vec.ctypes.data) != 0:
+                        return None
+                    total += int(np.count_nonzero(vec & 1)) * pg
+                finally:
+                    libc.munmap(p, n)
+            return total
+        finally:
+            os.close(fd)
+    except Exception:  # noqa: BLE001 - diagnostics only
+        return None
+
+
 # ------------------------------------------------------------------------------------------------ table
 def _scale_bytes(scale: torch.Tensor, rows: int) -> torch.Tensor:
     """Any Engram scale representation -> [rows, groups] uint8 E8M0 bytes (same device)."""
@@ -277,6 +312,19 @@ class EngramHostTable:
         for loc in self.source:
             if loc is not None:
                 _madvise(_mmap_file(loc.path), advice, loc.offset, loc.nbytes)
+
+    def resident(self) -> int | None:
+        """Bytes of the table currently in the page cache (host tables backed by a shard), None if unknown."""
+        if self.source is None:
+            return None
+        total = 0
+        for loc in self.source:
+            if loc is not None:
+                r = resident_bytes(os.path.realpath(loc.path), loc.offset, loc.nbytes)
+                if r is None:
+                    return None
+                total += r
+        return total
 
     def prefault(self, threads: int | None = None, chunk_bytes: int = 256 << 20) -> float:
         """Read the whole table once (sequential, parallel) so later lookups hit the page cache. Returns

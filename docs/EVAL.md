@@ -8,6 +8,7 @@ All tools in `eval/` are stdlib-only clients of any OpenAI-compatible endpoint: 
 |---|---|
 | `eval/compare_endpoints.py` | greedy A/B on identical token ids: exact match, first divergence, position-wise agreement, chosen-token logprob deltas, top-K overlap and deltas, near-tie classification of the divergence. Record/replay (`--save-a`, `--a file:PATH`) for endpoints that cannot run at the same time |
 | `compare_endpoints.py --teacher-forced` | numerical fidelity: both endpoints (and optionally DeepSeek's reference implementation) score the same continuation; top-1 agreement and KL per position; see [Numerical fidelity](#numerical-fidelity) |
+| `eval/scenarios.py` + `eval/prompts.json` | workload scenarios: realistic prompts (speculative decoding), many long prompts, shared-prefix assistant sessions, mixed long/short traffic, capacity under an SLO; see [Workload scenarios](#workload-scenarios) |
 | `eval/loadgen.py` | closed-loop load at concurrency 1/4/16/64 × prompt 512/4k/32k, 256 output tokens: TTFT, TPOT, E2E p50/p99, output and total tok/s; random token-id prompts (no prefix-cache help) |
 | `eval/quality_check.py` + `eval/quality_set.jsonl` | 28 prompts with known answers: math (5), Python code with asserts (3, `--exec-code` runs them in a separate `python3 -I` process with a timeout), German (4), a fact, an 8k-token passkey needle, tool calling (8), structured output (3) and images (3), see below. Items with `known_fail` (currently `math-reason`, which the model gets wrong without thinking mode) are reported as KFAIL/KPASS and not counted. Scores are reported per category |
 
@@ -129,6 +130,57 @@ reference implementation on the same checkpoint (`ref_runner.py` dump, 17 contin
 On this chaotic 3-layer model the two MoE paths are about as far from each other as each is from the reference, and
 the verdict tool reports B marginally closer. The per-endpoint NLL of human text is 5.25 (A) vs 5.24 (B); the 3-layer
 model does not model text at all, so only the full model makes those numbers meaningful.
+
+## Workload scenarios
+
+`loadgen.py` measures the raw grid with random token ids. `scenarios.py` adds workloads in which design differences
+between engines become visible. For DeepInfer on PCIe-only GPUs these are DP attention with EP MoE (every GPU prefills
+its own requests), exact prefix caching, and speculative decoding with the model's own MTP heads.
+It runs from any Python 3.10+ without extra packages (`python3 eval/scenarios.py ...`), against any OpenAI-compatible
+endpoint, and writes `--out NAME` → `NAME.json` (all numbers) and `NAME.md` (the table).
+
+| scenario | what it sends | read it as |
+|---|---|---|
+| `realistic` | the bundled prompts (`eval/prompts.json`: 24 code, 24 German and 16 English chat prompts, written for this repo) at concurrency 1/4/16, greedy, 256 tokens | decode speed on real text. Speculative decoding only helps when drafts are accepted, and acceptance depends on the text: random token ids make every MTP/EAGLE engine look slow. `tokens_per_step` (this server, concurrency 1) and `spec_acceptance` (vLLM `/metrics`) show how much the drafts contribute |
+| `prefill` | 16/32/64 users, each with a distinct 8k/16k/32k-token document, all at once | prefill throughput and fairness: TTFT p50/p99/max, time until the last user has an answer, prompt tok/s. With DP attention every GPU prefills its own requests independently; with TP all GPUs work on one prefill at a time |
+| `shared-prefix` | 16 users × 4 turns; every user starts with the same ~6k-token system prompt (tool definitions and instructions) and continues their own conversation; run once with a shared and once with a per-user (`unique`) system prompt | what prefix caching buys: TTFT per turn for both variants, plus the endpoint's cache counters (`/health` of this server: hits and cached tokens; vLLM `/metrics`: prefix cache hits/queries). Turn 1 of `shared` and all turns of `unique` pay the full prefill on an engine without a prefix cache |
+| `mixed` | 8 short chats stream continuously; first alone, then with 16k-token requests arriving about every 4 s | head-of-line blocking: TTFT, TPOT p99 and the longest stall (`short_max_gap`) of the short streams, alone vs. with long prefills. Chunked prefill and how it is interleaved with decode decide this |
+| `capacity` | concurrency 1, 2, 4 … 128 with real prompts (or `--prompt-tokens N` synthetic documents), 256 tokens each, until an SLO is missed (default TTFT p99 ≤ 2 s, TPOT p99 ≤ 50 ms) | the number of concurrent users an endpoint serves within the SLO, and the throughput there |
+
+**Fairness.** Run the same command with the same `--seed` against both endpoints; prompts depend only on the seed.
+Use the same `max_tokens` and temperature (default 0). `ignore_eos` only where a scenario forces it (prefill, mixed,
+capacity): realistic runs stop at EOS, so compare tok/s and TPOT, not wall time, when the two engines answer at
+different lengths. Run one endpoint at a time on the same GPUs, and give both the same `max_model_len`, the same KV
+budget and the same speculative setting (state `--nextn` / num_speculative_tokens in `--label`). Long synthetic
+documents are sized by characters (`--chars-per-token`, 3.6 for V4.1); the tables report the real prompt token counts.
+For vLLM, tool definitions in `shared-prefix` are plain text in the system prompt, so no tool parser is needed.
+Server statistics are optional: an endpoint without `/health` or `/metrics` just gets no cache or acceptance columns.
+
+```bash
+python3 eval/scenarios.py realistic     --url http://host:8000 --label "DeepInfer nextn 3" --out results/di_realistic
+python3 eval/scenarios.py prefill       --url http://host:8000 --concurrency 16,32,64 --prompt-lens 8192,16384,32768 --out results/di_prefill
+python3 eval/scenarios.py shared-prefix --url http://host:8000 --users 16 --turns 4 --out results/di_shared
+python3 eval/scenarios.py mixed         --url http://host:8000 --duration 60 --out results/di_mixed
+python3 eval/scenarios.py capacity      --url http://host:8000 --slo-ttft 2 --slo-tpot 50 --out results/di_capacity
+```
+
+### Verified on the RTX 5090 (plumbing only)
+
+`ckpt3` (3-layer test model, garbage text), this repo's server with `--graphs --prefix-cache --max-num-seqs 32
+--max-blocks 1024`, reduced sizes. These numbers check that every scenario measures what it claims; they say nothing
+about the full model.
+
+- `realistic` (64 tokens): c=1 about 340 tok/s, TPOT 2.3 ms; c=4 about 1000 tok/s. On `ckpt3_mtp --nextn 3`:
+  `tokens_per_step` 0.94, half the throughput. The truncated model's MTP drafts are never accepted, so it only pays the
+  draft cost. On the full model this column shows the speculative gain.
+- `prefill` (4k / 8k distinct prompts, 4 / 8 users at once): TTFT p99 1.0-3.6 s, 15-18k prompt tok/s on one GPU.
+- `shared-prefix` (8 users × 3 turns, 6.1k-token system prompt): turn-1 TTFT p50 0.74 s shared vs 1.59 s unique; the
+  server's prefix cache served 79 % of all prompt tokens (shared) vs 63 % (unique: later turns still reuse their own
+  earlier turns).
+- `mixed` (4 short streams, 8k-token requests every ~4 s): the short streams' longest stall rises from 152 ms to 440 ms
+  and their TPOT p99 from 5.5 to 10.6 ms while the long prompts are prefilled.
+- `capacity` (64 tokens, corpus prompts): all levels up to 16 users within TTFT p99 ≤ 2 s / TPOT p99 ≤ 50 ms
+  (3658 tok/s at 16).
 
 ## Verified results (RTX 5090, 3-layer test checkpoint `ckpt3`, two server instances one after the other)
 

@@ -1,0 +1,584 @@
+{
+"code": [
+{
+"id": "code-00",
+"messages": [
+{
+"role": "user",
+"content": "Write a Python function `merge_intervals(intervals)` that merges overlapping [start, end] intervals and returns them sorted. Include a short docstring and two usage examples."
+}
+]
+},
+{
+"id": "code-01",
+"messages": [
+{
+"role": "user",
+"content": "Implement an LRU cache class in Python with `get(key)` and `put(key, value)` in O(1), using `collections.OrderedDict`. Explain the design in two sentences."
+}
+]
+},
+{
+"id": "code-02",
+"messages": [
+{
+"role": "user",
+"content": "Write a Rust function that parses a line like `key=value; key2=value2` into a `HashMap<String, String>`, ignoring empty pairs. Add unit tests."
+}
+]
+},
+{
+"id": "code-03",
+"messages": [
+{
+"role": "user",
+"content": "Write a bash script that finds all files larger than 100 MB below a directory given as the first argument and prints them sorted by size, largest first."
+}
+]
+},
+{
+"id": "code-04",
+"messages": [
+{
+"role": "user",
+"content": "Implement binary search in C over a sorted int array. Return the index or -1. Handle empty arrays and avoid integer overflow when computing the midpoint."
+}
+]
+},
+{
+"id": "code-05",
+"messages": [
+{
+"role": "user",
+"content": "Write a SQL query that returns, for each customer, the total order amount in 2025 and their rank by that amount. Tables: customers(id, name), orders(id, customer_id, amount, created_at)."
+}
+]
+},
+{
+"id": "code-06",
+"messages": [
+{
+"role": "user",
+"content": "Write a TypeScript function `debounce(fn, ms)` with correct typing of the wrapped function's parameters. Show how to use it with a search input."
+}
+]
+},
+{
+"id": "code-07",
+"messages": [
+{
+"role": "user",
+"content": "Implement a thread-safe bounded queue in Java with `put` and `take` that block when full or empty. Use `ReentrantLock` and two conditions."
+}
+]
+},
+{
+"id": "code-08",
+"messages": [
+{
+"role": "user",
+"content": "Write a Python script that reads a CSV file with columns date,amount,category and prints the monthly total per category as a table, using only the standard library."
+}
+]
+},
+{
+"id": "code-09",
+"messages": [
+{
+"role": "user",
+"content": "Write a Go HTTP handler that accepts a JSON body {\"text\": string}, returns the word count as JSON, and responds with 400 on invalid input."
+}
+]
+},
+{
+"id": "code-10",
+"messages": [
+{
+"role": "user",
+"content": "Explain and implement Dijkstra's algorithm in Python with a heap. The graph is a dict mapping node -> list of (neighbor, weight)."
+}
+]
+},
+{
+"id": "code-11",
+"messages": [
+{
+"role": "user",
+"content": "Write a Python generator that yields the prime numbers below n using a segmented sieve, so memory stays small for n = 10**9."
+}
+]
+},
+{
+"id": "code-12",
+"messages": [
+{
+"role": "user",
+"content": "Refactor this function to be readable and add type hints:\n\ndef f(a,b):\n  r=[]\n  for i in a:\n    if i in b and i not in r: r.append(i)\n  return r"
+}
+]
+},
+{
+"id": "code-13",
+"messages": [
+{
+"role": "user",
+"content": "Write a regular expression that matches ISO 8601 dates (YYYY-MM-DD) with valid months and days (ignore leap years), and explain each part."
+}
+]
+},
+{
+"id": "code-14",
+"messages": [
+{
+"role": "user",
+"content": "Write a C++ class template `RingBuffer<T, N>` with push, pop and size, using a fixed std::array. Do not allocate on the heap."
+}
+]
+},
+{
+"id": "code-15",
+"messages": [
+{
+"role": "user",
+"content": "Write a Python decorator `retry(times, exceptions)` that retries a function with exponential backoff and logs every failure."
+}
+]
+},
+{
+"id": "code-16",
+"messages": [
+{
+"role": "user",
+"content": "Implement the Levenshtein distance in Python with O(min(n, m)) memory and show the distance between 'kitten' and 'sitting'."
+}
+]
+},
+{
+"id": "code-17",
+"messages": [
+{
+"role": "user",
+"content": "Write a Dockerfile for a small Python web service using a multi-stage build, a non-root user and a health check."
+}
+]
+},
+{
+"id": "code-18",
+"messages": [
+{
+"role": "user",
+"content": "Write unit tests with pytest for a function `slugify(title)` that lowercases, replaces spaces with '-', and removes characters other than a-z, 0-9 and '-'."
+}
+]
+},
+{
+"id": "code-19",
+"messages": [
+{
+"role": "user",
+"content": "Implement a trie in Python supporting insert, search and starts_with, and use it to autocomplete the prefix 'ca' from a word list."
+}
+]
+},
+{
+"id": "code-20",
+"messages": [
+{
+"role": "user",
+"content": "Write a JavaScript function that deep-merges two plain objects, where arrays are concatenated and nested objects merged recursively."
+}
+]
+},
+{
+"id": "code-21",
+"messages": [
+{
+"role": "user",
+"content": "Write a Python asyncio program that downloads 10 URLs concurrently with at most 3 requests in flight, using a semaphore."
+}
+]
+},
+{
+"id": "code-22",
+"messages": [
+{
+"role": "user",
+"content": "Explain the difference between processes and threads in Python, including the GIL, and give one example where each is the better choice."
+}
+]
+},
+{
+"id": "code-23",
+"messages": [
+{
+"role": "user",
+"content": "Write a Kotlin data class for a bank account with deposit and withdraw methods that reject negative amounts and overdrafts."
+}
+]
+}
+],
+"chat_de": [
+{
+"id": "chat_de-00",
+"messages": [
+{
+"role": "user",
+"content": "Erkläre einem Zehnjährigen, warum der Himmel blau ist."
+}
+]
+},
+{
+"id": "chat_de-01",
+"messages": [
+{
+"role": "user",
+"content": "Schreib eine kurze, freundliche E-Mail an einen Kollegen, in der du ein Meeting von Dienstag auf Donnerstag verschiebst."
+}
+]
+},
+{
+"id": "chat_de-02",
+"messages": [
+{
+"role": "user",
+"content": "Was sind die Vor- und Nachteile von Wärmepumpen im Altbau? Antworte in einer Liste."
+}
+]
+},
+{
+"id": "chat_de-03",
+"messages": [
+{
+"role": "user",
+"content": "Fasse die Handlung von Goethes Faust I in fünf Sätzen zusammen."
+}
+]
+},
+{
+"id": "chat_de-04",
+"messages": [
+{
+"role": "user",
+"content": "Wie funktioniert eine Photovoltaikanlage? Erkläre es ohne Fachbegriffe."
+}
+]
+},
+{
+"id": "chat_de-05",
+"messages": [
+{
+"role": "user",
+"content": "Gib mir einen Wochenplan für drei vegetarische Abendessen mit Einkaufsliste."
+}
+]
+},
+{
+"id": "chat_de-06",
+"messages": [
+{
+"role": "user",
+"content": "Was ist der Unterschied zwischen Wetter und Klima?"
+}
+]
+},
+{
+"id": "chat_de-07",
+"messages": [
+{
+"role": "user",
+"content": "Schreib ein kurzes Gedicht über den Herbst in Wien."
+}
+]
+},
+{
+"id": "chat_de-08",
+"messages": [
+{
+"role": "user",
+"content": "Erkläre, wie man einen Zinseszins berechnet, mit einem Rechenbeispiel."
+}
+]
+},
+{
+"id": "chat_de-09",
+"messages": [
+{
+"role": "user",
+"content": "Welche Tipps hast du für ein Vorstellungsgespräch als Softwareentwicklerin?"
+}
+]
+},
+{
+"id": "chat_de-10",
+"messages": [
+{
+"role": "user",
+"content": "Übersetze ins Englische: 'Der Zug hatte zwanzig Minuten Verspätung, deshalb habe ich den Anschluss verpasst.'"
+}
+]
+},
+{
+"id": "chat_de-11",
+"messages": [
+{
+"role": "user",
+"content": "Wie bereite ich mich auf einen Halbmarathon vor, wenn ich jetzt fünf Kilometer laufen kann?"
+}
+]
+},
+{
+"id": "chat_de-12",
+"messages": [
+{
+"role": "user",
+"content": "Erkläre die Gewaltenteilung in Österreich kurz und verständlich."
+}
+]
+},
+{
+"id": "chat_de-13",
+"messages": [
+{
+"role": "user",
+"content": "Was sollte man bei der Pflege von Zimmerpflanzen im Winter beachten?"
+}
+]
+},
+{
+"id": "chat_de-14",
+"messages": [
+{
+"role": "user",
+"content": "Schreib eine Produktbeschreibung für eine wiederverwendbare Trinkflasche aus Edelstahl."
+}
+]
+},
+{
+"id": "chat_de-15",
+"messages": [
+{
+"role": "user",
+"content": "Wie entstehen Gezeiten? Antworte in drei Absätzen."
+}
+]
+},
+{
+"id": "chat_de-16",
+"messages": [
+{
+"role": "user",
+"content": "Formuliere eine höfliche Beschwerde an einen Online-Shop wegen einer verspäteten Lieferung."
+}
+]
+},
+{
+"id": "chat_de-17",
+"messages": [
+{
+"role": "user",
+"content": "Was ist maschinelles Lernen? Erkläre es mit einem Alltagsbeispiel."
+}
+]
+},
+{
+"id": "chat_de-18",
+"messages": [
+{
+"role": "user",
+"content": "Plane einen Tagesausflug in die Wachau mit Zeiten und Sehenswürdigkeiten."
+}
+]
+},
+{
+"id": "chat_de-19",
+"messages": [
+{
+"role": "user",
+"content": "Erkläre den Unterschied zwischen 'das' und 'dass' mit Beispielen."
+}
+]
+},
+{
+"id": "chat_de-20",
+"messages": [
+{
+"role": "user",
+"content": "Wie kann ich im Haushalt Strom sparen? Nenne zehn konkrete Maßnahmen."
+}
+]
+},
+{
+"id": "chat_de-21",
+"messages": [
+{
+"role": "user",
+"content": "Schreib eine kurze Geschichte über einen Leuchtturmwärter, der einen unerwarteten Besuch bekommt."
+}
+]
+},
+{
+"id": "chat_de-22",
+"messages": [
+{
+"role": "user",
+"content": "Was passiert im Körper beim Schlafen? Erkläre die Schlafphasen."
+}
+]
+},
+{
+"id": "chat_de-23",
+"messages": [
+{
+"role": "user",
+"content": "Wie schreibe ich einen guten Lebenslauf? Gib eine Gliederung mit Hinweisen."
+}
+]
+}
+],
+"chat_en": [
+{
+"id": "chat_en-00",
+"messages": [
+{
+"role": "user",
+"content": "Explain how a refrigerator works in simple terms."
+}
+]
+},
+{
+"id": "chat_en-01",
+"messages": [
+{
+"role": "user",
+"content": "Write a short story about a robot that learns to paint."
+}
+]
+},
+{
+"id": "chat_en-02",
+"messages": [
+{
+"role": "user",
+"content": "What are the main causes of inflation? Answer in a structured way."
+}
+]
+},
+{
+"id": "chat_en-03",
+"messages": [
+{
+"role": "user",
+"content": "Give me a three-day itinerary for Rome with a focus on history."
+}
+]
+},
+{
+"id": "chat_en-04",
+"messages": [
+{
+"role": "user",
+"content": "Explain the difference between a virus and a bacterium."
+}
+]
+},
+{
+"id": "chat_en-05",
+"messages": [
+{
+"role": "user",
+"content": "Draft a polite reminder email about an unpaid invoice."
+}
+]
+},
+{
+"id": "chat_en-06",
+"messages": [
+{
+"role": "user",
+"content": "How do vaccines train the immune system?"
+}
+]
+},
+{
+"id": "chat_en-07",
+"messages": [
+{
+"role": "user",
+"content": "Summarize the main ideas of stoic philosophy in five bullet points."
+}
+]
+},
+{
+"id": "chat_en-08",
+"messages": [
+{
+"role": "user",
+"content": "What should I consider when buying a used car?"
+}
+]
+},
+{
+"id": "chat_en-09",
+"messages": [
+{
+"role": "user",
+"content": "Explain what a blockchain is and one realistic use case."
+}
+]
+},
+{
+"id": "chat_en-10",
+"messages": [
+{
+"role": "user",
+"content": "Write a limerick about a cat who loves cheese."
+}
+]
+},
+{
+"id": "chat_en-11",
+"messages": [
+{
+"role": "user",
+"content": "Describe the water cycle for a school presentation."
+}
+]
+},
+{
+"id": "chat_en-12",
+"messages": [
+{
+"role": "user",
+"content": "Compare renting and buying a home in a short table."
+}
+]
+},
+{
+"id": "chat_en-13",
+"messages": [
+{
+"role": "user",
+"content": "How does compound interest work? Include an example."
+}
+]
+},
+{
+"id": "chat_en-14",
+"messages": [
+{
+"role": "user",
+"content": "What are good habits for learning a new language as an adult?"
+}
+]
+},
+{
+"id": "chat_en-15",
+"messages": [
+{
+"role": "user",
+"content": "Explain the rules of chess for a complete beginner."
+}
+]
+}
+]
+}

@@ -4,7 +4,8 @@
     python3 /opt/sm120/server/server.py --ckpt /work/ckpt3 --port 8000 [--max-num-seqs 8] [--nextn N] [--graphs]
 
 Endpoints: GET /health, GET /v1/models, POST /v1/completions, POST /v1/chat/completions (the checkpoint's
-encoding/encoding.py chat template; "thinking": true or reasoning_effort -> thinking mode), streaming (SSE,
+encoding/encoding.py chat template; "thinking": true, reasoning_effort or the same keys in chat_template_kwargs ->
+thinking mode), streaming (SSE,
 "stream": true) and non-streaming. Sampling: temperature, top_p, top_k, max_tokens, stop (str | list), seed,
 ignore_eos; extension "return_token_ids": true (non-streaming). Chat: tools / tool_choice / parallel_tool_calls (DSML tool
 calls, tools.py), response_format text / json_object / json_schema (grammar-constrained, DeepInfer structured output),
@@ -64,11 +65,13 @@ class TextCodec:
     def decode(self, ids: list[int]) -> str:
         return self.tok.decode(ids, skip_special_tokens=True)
 
-    def render_chat(self, messages: list[dict], thinking: bool, reasoning_effort=None) -> tuple[str, list[dict]]:
+    def render_chat(self, messages: list[dict], thinking: bool, reasoning_effort=None,
+                    drop_thinking: bool = True) -> tuple[str, list[dict]]:
         """-> (prompt, image records in prompt order; one image placeholder token per image in the prompt)."""
         if self.enc is not None:
             prompt, mm = self.enc.encode_messages(messages, thinking_mode="thinking" if thinking else "chat",
-                                                  reasoning_effort=reasoning_effort, return_multi_modal_data=True)
+                                                  reasoning_effort=reasoning_effort, drop_thinking=drop_thinking,
+                                                  return_multi_modal_data=True)
             return prompt, mm.get("images") or []
         return self.bos + "".join(f"{m.get('role')}: {m.get('content')}\n" for m in messages) + "assistant: ", []
 
@@ -117,6 +120,27 @@ class Detok:
 # ------------------------------------------------------------------------------------------------ HTTP
 class BadRequest(Exception):
     pass
+
+
+def chat_options(body: dict) -> tuple[bool, object, bool]:
+    """Thinking mode, reasoning effort and drop_thinking of a chat request. Top-level fields ("thinking",
+    "reasoning_effort") win over `chat_template_kwargs` (as clients such as LiteLLM or vLLM-style requests send them:
+    {"thinking": true}, {"enable_thinking": true}, {"reasoning_effort": ...}, {"drop_thinking": false}). A reasoning
+    effort alone switches thinking on. Other chat_template_kwargs keys are ignored."""
+    kw = body.get("chat_template_kwargs")
+    if kw is None:
+        kw = {}
+    if not isinstance(kw, dict):
+        raise BadRequest("chat_template_kwargs must be an object")
+    effort = body.get("reasoning_effort", kw.get("reasoning_effort"))
+    thinking = body.get("thinking", kw.get("thinking", kw.get("enable_thinking")))
+    if thinking is None:
+        thinking = effort is not None
+    drop = kw.get("drop_thinking", True)
+    for name, v in (("thinking", thinking), ("drop_thinking", drop)):
+        if not isinstance(v, bool):
+            raise BadRequest(f"{name} must be true or false")
+    return thinking, effort, drop
 
 
 def _finish_reason(di_reason: str, stopped: bool) -> str:
@@ -233,8 +257,7 @@ class Handler(BaseHTTPRequestHandler):
             msgs = body.get("messages")
             if not isinstance(msgs, list) or not msgs:
                 raise BadRequest("messages must be a non-empty list")
-            effort = body.get("reasoning_effort")
-            thinking = bool(body.get("thinking", effort is not None))
+            thinking, effort, drop_thinking = chat_options(body)
             enc = app.codec.enc
             try:
                 plan = tools.plan_from_body(body)
@@ -248,7 +271,7 @@ class Handler(BaseHTTPRequestHandler):
             if plan.tools and plan.choice == "none":
                 extra_stop = [tools.Dsml(enc).calls_open]  # the tools are shown to the model but must not be called
             try:
-                prompt, image_records = app.codec.render_chat(msgs, thinking, effort)
+                prompt, image_records = app.codec.render_chat(msgs, thinking, effort, drop_thinking)
             except Exception as exc:  # noqa: BLE001  (encoding.py validates roles / content)
                 raise BadRequest(f"cannot render messages: {exc}") from None
             ids = app.codec.encode(prompt)

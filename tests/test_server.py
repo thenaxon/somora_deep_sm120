@@ -162,6 +162,35 @@ def main() -> int:
           f"{len(ev)} events")
     st, r = cl.post("/v1/chat/completions", dict(model=model, messages=msgs, max_tokens=8, thinking=True))
     check("chat thinking mode", st == 200 and "reasoning_content" in r["choices"][0]["message"])
+    # chat_template_kwargs (as LiteLLM / vLLM-style clients send it). The rendered prompt ends with <think> in thinking
+    # mode and with </think> in chat mode, so the prompt's last token shows which mode was rendered.
+    think_ids = {True: 128821, False: 128822}  # V4.1 <think> / </think>
+
+    def mode(extra, stream=False):
+        body = dict(model=model, messages=msgs, max_tokens=8, temperature=0, return_token_ids=True, **extra)
+        st, r = cl.post("/v1/chat/completions", body)
+        if st != 200:
+            return st, None, None
+        return st, r["choices"][0]["prompt_token_ids"][-1] == think_ids[True], r["choices"][0]["message"]
+
+    for label, extra, want in [("thinking", {"chat_template_kwargs": {"thinking": True}}, True),
+                               ("enable_thinking", {"chat_template_kwargs": {"enable_thinking": True}}, True),
+                               ("reasoning_effort", {"chat_template_kwargs": {"reasoning_effort": "high"}}, True),
+                               ("thinking false", {"chat_template_kwargs": {"thinking": False}}, False),
+                               ("top-level wins", {"thinking": False, "chat_template_kwargs": {"thinking": True}}, False)]:
+        st, on, m = mode(extra)
+        check(f"chat_template_kwargs {label}", st == 200 and on == want and (("reasoning_content" in m) == want),
+              f"st {st} thinking prompt {on}")
+    ev, _, _, done = cl.stream("/v1/chat/completions", dict(model=model, messages=msgs, max_tokens=16, temperature=0,
+                                                            chat_template_kwargs={"thinking": True}))
+    rc = "".join((e["choices"][0]["delta"].get("reasoning_content") or "") for e in ev if e.get("choices"))
+    check("chat_template_kwargs thinking (stream)", done and len(rc) > 0, f"{len(rc)} reasoning chars")
+    tool = {"type": "function", "function": {"name": "get_time", "parameters": {"type": "object", "properties": {}}}}
+    st, on, m = mode({"chat_template_kwargs": {"thinking": True}, "tools": [tool]})
+    check("chat_template_kwargs thinking + tools", st == 200 and on and "reasoning_content" in m, f"st {st}")
+    st, _ = cl.post("/v1/chat/completions", dict(model=model, messages=msgs, chat_template_kwargs={"thinking": "yes"}))
+    st2, _ = cl.post("/v1/chat/completions", dict(model=model, messages=msgs, chat_template_kwargs=["thinking"]))
+    check("chat_template_kwargs bad types -> 400", st == st2 == 400, f"{st} {st2}")
 
     # 5. concurrency: N streams at once, different lengths; they must overlap and all finish
     N = args.concurrency

@@ -248,7 +248,7 @@ class Handler(BaseHTTPRequestHandler):
             if body.get("tools") or (body.get("response_format") or {}).get("type", "text") != "text":
                 raise BadRequest("tools and response_format are supported on /v1/chat/completions only")
             p = body.get("prompt")
-            if isinstance(p, list) and len(p) == 1:
+            if isinstance(p, list) and len(p) == 1 and isinstance(p[0], str):
                 p = p[0]
             if isinstance(p, str):
                 ids = app.codec.encode(p)

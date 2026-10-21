@@ -468,9 +468,34 @@ def _raw_string_grammar(xg, sub: dict):
     return xg.Grammar.from_ebnf(f'root ::= rawchar{rep}\nrawchar ::= [^<] | rawlt\nrawlt ::= "<" (=([^/]))')
 
 
+INT_RANGE_AS_ENUM = 1024  # integer ranges with at most this many values become an explicit enum (see below)
+
+
+def _fix_int_ranges(schema):
+    """xgrammar 0.2.2 builds wrong digit patterns for some integer ranges (minimum 0, maximum 120 admits 121-129).
+    Small ranges are rewritten as an explicit enum, which xgrammar compiles exactly."""
+    if isinstance(schema, list):
+        return [_fix_int_ranges(x) for x in schema]
+    if not isinstance(schema, dict):
+        return schema
+    out = {k: _fix_int_ranges(v) for k, v in schema.items()}
+    if out.get("type") == "integer" and "enum" not in out:
+        lo = out.get("minimum", out["exclusiveMinimum"] + 1 if isinstance(out.get("exclusiveMinimum"), int) else None)
+        hi = out.get("maximum", out["exclusiveMaximum"] - 1 if isinstance(out.get("exclusiveMaximum"), int) else None)
+        if isinstance(lo, (int, float)) and isinstance(hi, (int, float)) and 0 <= hi - lo < INT_RANGE_AS_ENUM:
+            import math
+
+            vals = list(range(math.ceil(lo), math.floor(hi) + 1))
+            if vals:
+                for k in ("minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"):
+                    out.pop(k, None)
+                out["enum"] = vals
+    return out
+
+
 def _json_grammar(xg, schema: dict, strict: bool, compact: bool):
     kw = dict(any_whitespace=False) if compact else dict(any_whitespace=True, max_whitespace_cnt=JSON_MAX_WS)
-    return xg.Grammar.from_json_schema(json.dumps(schema), strict_mode=strict, **kw)
+    return xg.Grammar.from_json_schema(json.dumps(_fix_int_ranges(schema)), strict_mode=strict, **kw)
 
 
 def _invoke_grammar(xg, D: Dsml, fn: dict, strict: bool = True):

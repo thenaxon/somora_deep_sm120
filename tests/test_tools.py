@@ -357,6 +357,21 @@ def test_bounded_json_string_has_no_control_chars():
     assert accepts(g, good) and not accepts(g, bad)
 
 
+def test_integer_ranges_exact():
+    """xgrammar 0.2.2 admits 121-129 for 0..120; tools.py rewrites small ranges as enums."""
+    if not _have_xgrammar():
+        return
+    p = tools.plan_from_body({"response_format": {"type": "json_schema", "json_schema": {"schema": {
+        "type": "object", "properties": {"a": {"type": "integer", "minimum": 0, "maximum": 120},
+                                         "b": {"type": "integer", "exclusiveMinimum": -3, "exclusiveMaximum": 3}},
+        "required": ["a", "b"]}}}})
+    ok = ['{"a": 0, "b": -2}', '{"a": 120, "b": 2}', '{"a": 99, "b": 0}']
+    bad = ['{"a": 121, "b": 0}', '{"a": 129, "b": 0}', '{"a": -1, "b": 0}', '{"a": 5, "b": 3}', '{"a": 5, "b": -3}']
+    accepts = _matcher_factory(ok + bad)
+    g = tools.build_grammar(enc(), p)
+    assert all(accepts(g, t) for t in ok) and not any(accepts(g, t) for t in bad)
+
+
 def main() -> int:
     global ENC_PATH
     if "--encoding" in sys.argv:

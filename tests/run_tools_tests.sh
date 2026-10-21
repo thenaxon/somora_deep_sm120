@@ -38,7 +38,8 @@ else
 fi
 if [ "${SERVER_TESTS:-0}" = 1 ]; then
     echo "== test_server.py"
-    timeout 1500 python3 $SM120_ROOT/tests/test_server.py --url "$URL" --nondeterministic-ok ${SERVER_TEST_ARGS:-} || RC=1
+    ND=(); [[ " ${SARGS[*]} " == *" --deterministic "* ]] || ND=(--nondeterministic-ok)
+    timeout 1500 python3 $SM120_ROOT/tests/test_server.py --url "$URL" "${ND[@]}" ${SERVER_TEST_ARGS:-} || RC=1
 fi
 kill -- -$SPID 2>/dev/null; wait $SPID 2>/dev/null
 for _ in $(seq 90); do  # GPU memory released (the next server in this container must not OOM)

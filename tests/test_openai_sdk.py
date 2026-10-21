@@ -30,6 +30,16 @@ def main() -> int:
     ap.add_argument("--max-tokens", type=int, default=768)
     args = ap.parse_args()
 
+    try:
+        run(args)
+    except Exception as exc:  # noqa: BLE001  (e.g. the engine died)
+        check("test run completed", False, f"{type(exc).__name__}: {exc}"[:300])
+    fails = [n for n, ok, _ in RESULTS if not ok]
+    print(f"\n{len(RESULTS) - len(fails)}/{len(RESULTS)} passed" + (f"; FAILED: {fails}" if fails else ""))
+    return 1 if fails else 0
+
+
+def run(args) -> None:
     import openai
     from openai import OpenAI
     from pydantic import BaseModel, Field
@@ -68,8 +78,8 @@ def main() -> int:
         check("tools: tool result round trip", r2.choices[0].finish_reason in ("stop", "length", "tool_calls"),
               r2.choices[0].finish_reason)
 
-    # tools, streaming: the SDK's chunk types; arguments arrive in pieces
-    name, argbuf, ids, finish, n = None, "", set(), None, 0
+    # tools, streaming: the SDK's chunk types; arguments arrive in pieces, per call index
+    calls, finish, n = {}, None, 0
     for c in client.chat.completions.create(model=model, messages=msgs, tools=tools, tool_choice="required",
                                             max_tokens=args.max_tokens, temperature=0.7, seed=4, stream=True):
         if not c.choices:
@@ -77,19 +87,22 @@ def main() -> int:
         d = c.choices[0].delta
         for t in d.tool_calls or []:
             n += 1
+            cur = calls.setdefault(t.index, {"id": None, "name": None, "args": ""})
             if t.id:
-                ids.add(t.id)
+                cur["id"] = t.id
             if t.function and t.function.name:
-                name = t.function.name
+                cur["name"] = t.function.name
             if t.function and t.function.arguments:
-                argbuf += t.function.arguments
+                cur["args"] += t.function.arguments
         finish = c.choices[0].finish_reason or finish
     try:
-        args_ok = json.loads(argbuf)["unit"] in ("celsius", "fahrenheit")
+        args_ok = bool(calls) and all(json.loads(x["args"])["unit"] in ("celsius", "fahrenheit") for x in calls.values())
     except (ValueError, KeyError):
         args_ok = False
-    check("tools stream (SDK chunks)", name == "get_weather" and args_ok and finish == "tool_calls" and len(ids) >= 1,
-          f"{n} tool_call deltas, args {argbuf[:80]}")
+    ok = args_ok and finish == "tool_calls" and all(x["name"] == "get_weather" and x["id"] for x in calls.values()) \
+        and len({x["id"] for x in calls.values()}) == len(calls)
+    check("tools stream (SDK chunks)", ok, f"{len(calls)} calls, {n} tool_call deltas, "
+                                          f"args {[x['args'][:50] for x in calls.values()]}")
 
     # streaming helper that accumulates tool calls (client.chat.completions.stream / beta), if this SDK has it
     stream_api = getattr(client.chat.completions, "stream", None) or getattr(
@@ -152,10 +165,6 @@ def main() -> int:
         check("SDK sees 400 as BadRequestError", False)
     except openai.BadRequestError as exc:
         check("SDK sees 400 as BadRequestError", True, str(exc)[:100])
-
-    fails = [n for n, ok, _ in RESULTS if not ok]
-    print(f"\n{len(RESULTS) - len(fails)}/{len(RESULTS)} passed" + (f"; FAILED: {fails}" if fails else ""))
-    return 1 if fails else 0
 
 
 if __name__ == "__main__":

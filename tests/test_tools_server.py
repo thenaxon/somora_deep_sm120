@@ -149,13 +149,34 @@ def main() -> int:
     ap.add_argument("--nondeterministic-ok", action="store_true",
                     help="server runs b12x MoE (not --deterministic): greedy repeat comparisons are INFO")
     ap.add_argument("--prefix-cache", action="store_true", help="server runs --prefix-cache (small grain): test hits")
+    ap.add_argument("--warm-prefill", action="store_true",
+                    help="first send one prompt of every power-of-two length up to 4096 tokens (works around the "
+                         "CUDA-graph crash on the first prefill of a new prompt-length bucket after earlier requests, "
+                         "see docs/SERVER.md)")
     args = ap.parse_args()
     if args.nondeterministic_ok:
         SOFT.add("tools greedy stream == non-stream")
     cl = Client(args.url)
+    try:
+        run(cl, args)
+    except Exception as exc:  # noqa: BLE001  (e.g. the engine died: later responses are errors)
+        test_server.check("test run completed", False, f"{type(exc).__name__}: {exc}"[:300])
+    fails = [n for n, ok, _ in RESULTS if not ok]
+    print(f"\n{len(RESULTS) - len(fails)}/{len(RESULTS)} passed" + (f"; FAILED: {fails}" if fails else ""))
+    return 1 if fails else 0
+
+
+def run(cl, args) -> None:
     model = cl.get("/v1/models")[1]["data"][0]["id"]
     user = [{"role": "user", "content": "What is the weather in Vienna, in celsius? Then mail it to the ops team."}]
     base = dict(model=model, messages=user, tools=TOOLS, max_tokens=args.max_tokens, temperature=0.8)
+    hist = user + [{"role": "assistant", "content": None, "tool_calls": [
+        {"id": "call_1", "type": "function", "function": {"name": "get_weather",
+                                                          "arguments": '{"city": "Vienna", "unit": "celsius"}'}}]},
+        {"role": "tool", "tool_call_id": "call_1", "content": '{"temp": 21, "sky": "clear"}'}]
+    if args.warm_prefill:
+        for n in [2 ** k for k in range(13)] + [4000]:
+            cl.post("/v1/completions", dict(model=model, prompt=[100 + i % 1000 for i in range(n)], max_tokens=2))
 
     # 1. tool_choice required / named / parallel_tool_calls false, non-streaming
     for label, extra, allowed in [
@@ -216,10 +237,6 @@ def main() -> int:
     check("tools auto stream", done and finish in ("stop", "length", "tool_calls"), f"finish {finish} calls {len(calls)}")
 
     # 4. multi-turn history: assistant tool_calls + tool results, then a forced follow-up call
-    hist = user + [{"role": "assistant", "content": None, "tool_calls": [
-        {"id": "call_1", "type": "function", "function": {"name": "get_weather",
-                                                          "arguments": '{"city": "Vienna", "unit": "celsius"}'}}]},
-        {"role": "tool", "tool_call_id": "call_1", "content": '{"temp": 21, "sky": "clear"}'}]
     st, r = cl.post("/v1/chat/completions", dict(base, messages=hist, tool_choice={"type": "function", "function": {
         "name": "send_email"}}))
     ok, info = check_calls(r["choices"][0]["message"].get("tool_calls") if st == 200 else None, {"send_email"})
@@ -355,10 +372,6 @@ def main() -> int:
         check(f"400: {label}", st == 400, json.dumps(r)[:120])
     st, h = cl.get("/health")
     check("server healthy after the tool tests", st == 200 and h["status"] == "ok")
-
-    fails = [n for n, ok, _ in RESULTS if not ok]
-    print(f"\n{len(RESULTS) - len(fails)}/{len(RESULTS)} passed" + (f"; FAILED: {fails}" if fails else ""))
-    return 1 if fails else 0
 
 
 if __name__ == "__main__":

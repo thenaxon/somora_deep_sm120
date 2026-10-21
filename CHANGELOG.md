@@ -24,24 +24,53 @@ before 1.0 any minor release may change interfaces.
   and reports scores per category.
 
 ### Changed
-- Multi-GPU runbook: Hugging Face hub caches must be mounted at their root (snapshot files are symlinks into
-  `blobs/`); realistic image size (about 7 GB); building when the host cannot reach the repository; host-RAM
-  budgeting for the engram modes (per-rank memory, page cache vs. pinned memory, baseline stopped).
-- `eval/quality_check.py`: items can be marked `known_fail` (reported as KFAIL/KPASS, not counted). `math-reason`
-  is marked: the model answers 2 without thinking mode, independent of the engine.
 - Thinking-mode streaming sends the reasoning as `delta.reasoning_content` (it was sent as `content`).
-- Requests submitted after an engine crash now fail at once instead of waiting for `--request-timeout`.
+- `eval/quality_check.py` reports scores per category (core / tool / json / image).
 
 ### Fixed
-- `/v1/completions` rejected a one-token token-id prompt (`[id]`) as a malformed string list.
 - xgrammar 0.2.2 admits raw control characters in length-bounded JSON strings; the server patches that character class.
 - xgrammar 0.2.2 builds wrong digit patterns for some integer ranges (`minimum: 0, maximum: 120` admits 121-129); ranges
   with up to 1024 values are passed to it as an explicit `enum`.
+- Text-only prompts carry an empty `multi_modal_data` when the model has a vision processor (as DeepInfer's
+  `LLM.generate` does); a batch that mixed text and image prompts failed an assertion in `deepseek_vl`.
+- ViT attention shim: 4-D SDPA, so a full-size image no longer falls back to the math kernel (about 10 GiB, CUDA OOM).
 
-### Known issues
-- With CUDA graphs (`--graphs`, the image default), a server with some request history can lose its engine on the first
-  prefill of a new size (illegal instruction / illegal memory access in the decode graph replay). This also happens without
-  tools. Eager mode is not affected. Details and a partial workaround: [docs/SERVER.md](docs/SERVER.md#tool-calling-and-structured-output).
+## [0.1.1] - 2026-10-21
+
+### Fixed
+- CUDA-graph server crash (`CUDA error: an illegal instruction` in decode graph replay) after a prompt that needed a b12x plan not seen before: the lazy preparation evicted and unloaded b12x programs that captured graphs still launch. The programs launched during graph warm-up and capture are now retained (`sm120_patches` P9, test `tests/graph_replay_lazy_prep.sh`).
+- `libnuma1` in both images; DeepInfer's NUMA binding no longer logs tracebacks. On single-node hosts the binding is
+  skipped (new runtime patch P10): with libnuma present, `bind_numa(-1)` would segfault.
+- The serving image sets `DEEPINFER_MULTIMODAL_POOL_SIZE_GB=2` (DeepInfer default 8): 2 GB instead of 8 GB pinned host
+  memory per rank for image inputs. Sizing and the `/dev/shm/psm_*` leftovers after a crash are in
+  `docs/MULTI_GPU_RUNBOOK.md` §3.
+- `tests/run_server_tests.sh` stops the whole server process group and waits for GPU memory; the mid-decode server
+  check no longer depends on timing under CUDA graphs.
+- No more `/dev/shm/psm_*` leaks (2 GB per engine and stop): runtime patch P11 unlinks the multimodal pool's name after
+  the worker fork; `server.py` turns SIGTERM into a clean shutdown (as PID 1 the default action was to ignore it until
+  `docker stop` killed it), and the `--dp` proxy forwards it to the ranks. `docker stop` now takes about 1.5 s, exits
+  with 0 and logs no tracebacks: forked worker processes exit quietly and the engine is closed before interpreter exit.
+- `/v1/completions` accepts a prompt of a single token id; after an engine crash, new requests fail at once instead of
+  waiting for the per-token timeout.
+
+### Added
+- Start-up banner: somora lettering with "deep sm120", version, checkpoint, DP size and port
+  (`server/banner.py`, `SM120_BANNER=0` disables it).
+- `tests/graph_replay_lazy_prep.sh`: regression test for the CUDA-graph crash (new prompt lengths after a request history).
+- `tests/mm_pool_check.py`: text+image requests through DeepInfer's own API, with and without the multimodal pool
+  (pipeline check; the truncated test checkpoints carry no real vision weights).
+
+### Changed
+- Multi-GPU runbook: Hugging Face hub caches must be mounted at their root (snapshot files are symlinks into
+  `blobs/`); realistic image size (about 7 GB); building when the host cannot reach the repository; host-RAM
+  budgeting for the engram modes (per-rank memory, page cache vs. pinned memory, baseline stopped), the multimodal
+  pool and NUMA (`--cap-add SYS_NICE` on multi-socket hosts).
+- `eval/quality_check.py`: items can be marked `known_fail` (reported as KFAIL/KPASS, not counted). `math-reason`
+  is marked: the model answers 2 without thinking mode, independent of the engine.
+
+### Known limitations
+- b12x MoE programs used only by eager prefill are evicted by later lazy b12x preparations and reloaded on next use
+  (load time on some first-seen prefill shapes; graphs are not affected). See docs/RUNTIME.md, open point 6.
 
 ## [0.1.0] - 2026-10-21
 

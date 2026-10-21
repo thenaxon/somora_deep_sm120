@@ -19,6 +19,7 @@ GRAPHS=--graphs run graph_async_tf SM120_ENGRAM_GRAPH=async
 GRAPHS=--graphs run graph_prestage_tf SM120_ENGRAM_GRAPH=prestage
 GRAPHS=--graphs run graph_nopre_tf SM120_ENGRAM_GRAPH=prestage SM120_ENGRAM_PRESTAGE=0
 for x in eager_tf2 graph_async_tf graph_prestage_tf graph_nopre_tf; do
-  echo "==== $x vs eager_tf"
+  [ $x = graph_nopre_tf ] && note=" (NEGATIVE CONTROL: SM120_ENGRAM_PRESTAGE=0 serves stale rows, must diverge)" || note=""
+  echo "==== $x vs eager_tf$note"
   python3 $SM120_ROOT/tools/compare.py --di $WORK/eg${TAG}_$x.pt --ref $WORK/eg${TAG}_eager_tf.pt --ref2 '' 2>&1 | grep -E "decode (first|all)|decoded x"
 done

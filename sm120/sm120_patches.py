@@ -17,10 +17,12 @@ Every patch is listed and justified in patches/PATCHES.md.
                                      patches/b12x-tiny-decode-swiglu.patch (clamp fix), else still off.
     SM120_REMAP_SMEM_BYTES=<int>     shared-memory budget of the patched sampler.remap_draft_topk kernel (P8)
     SM120_CACHE_ROOT=/cache          persistent cache root: B12X_COMPILE_CACHE_DIR, TRITON_CACHE_DIR defaults
+    SM120_RETAIN_GRAPH_PROGRAMS=1|0  keep the b12x programs launched by graph warm-up/capture loaded (P9, default 1)
 """
 
 from __future__ import annotations
 
+import contextlib
 import importlib
 import importlib.abc
 import importlib.util
@@ -410,6 +412,31 @@ def _patch_remap_reexport(mod):
         mod.remap_draft_topk_tl = fn
 
 
+_RETAINED_B12X: list = []
+
+
+@contextlib.contextmanager
+def _retain_b12x_programs():
+    """Keep every b12x program launched by the warm-up + capture loaded for the life of the process.
+
+    Every later lazy b12x preparation (a prefill / indexer shape first seen while serving) ends with
+    evict_unretained(), which drops each program that is neither in that session's plans nor retained,
+    and the collected CuTe executable unloads its CUDA library. A captured graph that launches such a
+    program then fails on replay with "illegal instruction". b12x's retain_compiled_programs() records
+    the programs launched inside it; the record only counts while the object is alive, so it is kept."""
+    if os.environ.get("SM120_RETAIN_GRAPH_PROGRAMS", "1") == "0":
+        yield
+        return
+    try:
+        from b12x._lib.compile_plan import retain_compiled_programs
+    except Exception:  # noqa: BLE001 - no b12x / no such API: nothing to retain
+        yield
+        return
+    with retain_compiled_programs() as retained:
+        _RETAINED_B12X.append(retained)
+        yield
+
+
 def _wrap_graph_capture(cls, label: str) -> None:
     orig = cls.capture
     if getattr(orig, "_sm120", False):
@@ -428,7 +455,8 @@ def _wrap_graph_capture(cls, label: str) -> None:
         t0 = time.time()
         print(f"[sm120_patches] {label} capture start: sizes={sizes} moe={m0} gemm={g0}", flush=True)
         try:
-            return orig(self, *args, **kwargs)
+            with _retain_b12x_programs():
+                return orig(self, *args, **kwargs)
         except Exception as exc:
             print(f"[sm120_patches] {label} capture FAILED ({type(exc).__name__}: {exc}). Every shim op inside "
                   "the forward must be capturable: b12x MoE/linears are (plans are warmed by DeepInfer's "
@@ -455,6 +483,77 @@ def _patch_dflash_graph_runner(mod):
     """P9 (cont.): same for the DFlash/DSpark draft graphs."""
     _wrap_graph_capture(mod.DFlashCudaGraphRunner, "DFlashCudaGraphRunner")
     _note("P9 DFlashCudaGraphRunner.capture wrapped")
+
+
+def numa_node_count() -> int:
+    """NUMA nodes the kernel reports (/sys/devices/system/node/node<N>); 1 if unknown."""
+    try:
+        return max(1, sum(1 for d in os.listdir("/sys/devices/system/node")
+                          if d.startswith("node") and d[4:].isdigit()))
+    except OSError:
+        return 1
+
+
+@when_imported("deep_cluster.topology")
+def _patch_bind_numa(mod):
+    """P10: deep_cluster.topology.bind_numa(which_numa(gpu)) segfaults when the GPU has no NUMA affinity (sysfs
+    numa_node = -1, the normal value on single-socket hosts): libnuma is called with node -1 and
+    numa_bitmask_setbit(mask, (unsigned)-1) writes out of bounds. Without libnuma it "only" logs a long traceback
+    (worker/base.py _bind_numa, ve/multimodal_processor.py). Binding is meaningless with one node, so skip it there
+    and for node < 0; multi-node hosts with a valid node keep DeepInfer's binding (needs libnuma1)."""
+    from deep_cluster.topology import bind as bind_mod
+
+    orig = mod.bind_numa
+    if getattr(orig, "_sm120", False):
+        return
+
+    def bind_numa(node: int) -> int:
+        nodes = numa_node_count()
+        if int(node) < 0 or nodes <= 1:
+            if not _NUMA_LOGGED:
+                _NUMA_LOGGED.append(True)
+                print(f"[sm120_patches] NUMA binding skipped (GPU NUMA node {int(node)}, {nodes} node(s) on this host)",
+                      flush=True)
+            return 0
+        return orig(node)
+
+    bind_numa._sm120 = True
+    mod.bind_numa = bind_numa
+    bind_mod.bind_numa = bind_numa
+    _note("P10 deep_cluster.topology.bind_numa: skipped on single-node hosts / node < 0 (libnuma segfault)")
+
+
+_NUMA_LOGGED: list = []
+
+
+@when_imported("deepinfer.ve.multimodal_processor")
+def _patch_mm_pool_unlink(mod):
+    """P11: unlink the multimodal pool's /dev/shm name (multiprocessing.shared_memory, psm_*) as soon as the worker
+    processes exist. They are forked (ForkProcessWithCrashHeader) and inherit the mapping, nothing reopens the
+    segment by name, so the memory now lives exactly as long as a process maps it: no psm_* is left behind after
+    SIGTERM/SIGKILL/OOM (DeepInfer only unlinks in LLMEngine.close(), which a killed server never reaches)."""
+    cls = mod.MultimodalProcessor
+    orig = cls._start_workers
+    if getattr(orig, "_sm120", False):
+        return
+
+    def _start_workers(self, num_workers):
+        orig(self, num_workers)
+        pool = mod.get_multi_modal_pool()
+        shm = getattr(pool, "_buffer_shm", None) if pool is not None else None
+        if shm is None:
+            return
+        try:
+            shm.unlink()  # shm_unlink + resource_tracker unregister
+        except FileNotFoundError:
+            pass
+        shm.unlink = lambda: None  # SharedTorchMemoryPool.close() unlinks again
+        print(f"[sm120_patches] multimodal pool /dev/shm/{shm.name} unlinked after fork "
+              f"({pool.total_bytes >> 20} MiB stay mapped until exit)", flush=True)
+
+    _start_workers._sm120 = True
+    cls._start_workers = _start_workers
+    _note("P11 MultimodalProcessor._start_workers: multimodal pool shm name unlinked after the worker fork")
 
 
 @when_imported("deepinfer")

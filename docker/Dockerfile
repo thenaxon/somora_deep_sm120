@@ -1,9 +1,9 @@
 # somora_deep_sm120: DeepInfer on SM120 (RTX 5090 / RTX PRO 6000 Blackwell), self-contained serving image
 # (OpenAI-compatible server).
 #
-#   docker build -t somora_deep_sm120:0.1.0 -f docker/Dockerfile .          # build context = repo root
+#   docker build -t somora_deep_sm120:0.1.1 -f docker/Dockerfile .          # build context = repo root
 #   docker run --rm --gpus all --ipc=host --shm-size=16g -p 8000:8000 -v /models:/models:ro -v sm120-cache:/cache \
-#       somora_deep_sm120:0.1.0 --model /models/DeepSeek-V4.1-Flash [--prefix-cache] [--nextn 5] [--no-graphs]
+#       somora_deep_sm120:0.1.1 --model /models/DeepSeek-V4.1-Flash [--prefix-cache] [--nextn 5] [--no-graphs]
 #
 # DeepInfer is cloned at the pinned commit (without its vendor/ submodules: FlashMLA/DeepGEMM/DeepEP/DeepSelect are
 # SM100-only and replaced by sm120/). The layers up to `pip install b12x` are the same as docker/Dockerfile.dev.
@@ -29,8 +29,9 @@ RUN pip install --no-cache-dir \
 RUN pip install --no-cache-dir b12x==1.5.1
 
 # ---- serving additions ---------------------------------------------------------------------------------------------
-# liburing headers: b12x's O_DIRECT io_uring row reader (engram SM120_ENGRAM_MODE=uring, docs/ENGRAM.md); patch(1)
-RUN apt-get update && apt-get install -y --no-install-recommends liburing-dev pkg-config patch \
+# liburing headers: b12x's O_DIRECT io_uring row reader (engram SM120_ENGRAM_MODE=uring, docs/ENGRAM.md); patch(1);
+# libnuma1: DeepInfer's NUMA binding of the engine and multimodal worker processes (deep_cluster/topology/bind.py)
+RUN apt-get update && apt-get install -y --no-install-recommends liburing-dev pkg-config patch libnuma1 \
     && rm -rf /var/lib/apt/lists/*
 
 # b12x tiny-decode SwiGLU clamp fix (patches/PATCHES.md, https://github.com/flashinfer-ai/flashinfer/issues/6866).
@@ -73,6 +74,7 @@ ENV SM120_ROOT=/opt/sm120 \
     SM120_MOE_TINY_DECODE=0 \
     SM120_ENGRAM_MODE=host \
     DEEPINFER_PREFILL_ATTEMPT_INTERVAL=1 \
+    DEEPINFER_MULTIMODAL_POOL_SIZE_GB=2 \
     DEEPINFER_DISABLE_SYNC_GUARD=1
 
 WORKDIR /

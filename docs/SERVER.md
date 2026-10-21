@@ -42,12 +42,20 @@ curl -N localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
 
 # tests (server must be running), or all in one go:
 python3 /opt/sm120/tests/test_server.py --url http://127.0.0.1:8000
+# greedy reference for --di-ref: make it with the same image and code as the server (torch MoE, like --deterministic);
+# a dump from an older version can differ and fails the "greedy == run_deepinfer.py" check
+SM120_MOE_IMPL=torch python3 /opt/sm120/tools/run_deepinfer.py --ckpt /work/ckpt3 --prompt-ids /work/prompt_ids.json \
+  --out /work/srv_ref_torchmoe.pt
 /opt/sm120/tests/run_server_tests.sh /work/ckpt3 8000 /work/srv.log --deterministic -- \
-  --di-ref /work/srv_ref_di_torchmoe.pt --prompt-ids /work/prompt_ids.json
+  --di-ref /work/srv_ref_torchmoe.pt --prompt-ids /work/prompt_ids.json
 ```
 
 Through the image entrypoint, `--model PATH` maps to `--ckpt` and CUDA graphs are on by default (`--no-graphs` turns them off);
 see [../docker/README.md](../docker/README.md).
+
+At start-up the server prints the somora banner with the version, checkpoint, `--dp` and port (once, not per
+`--dp` rank). It is coloured only on a terminal, plain in `docker logs`, ASCII-only without a UTF-8 locale;
+`SM120_BANNER=0` (or `NO_COLOR` for colour only) turns it off.
 
 The OpenAI Python client works with `base_url="http://host:8000/v1"` and any `api_key` (it is not checked).
 

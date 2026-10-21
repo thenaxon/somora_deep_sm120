@@ -27,12 +27,12 @@ Build on the host (about 6 minutes with a warm network; the finished image is ab
 
 ```bash
 git clone <this repo> somora_deep_sm120 && cd somora_deep_sm120
-docker build -t somora_deep_sm120:0.1.0 -f docker/Dockerfile .
+docker build -t somora_deep_sm120:0.1.1 -f docker/Dockerfile .
 ```
 
 If the host has no access to the repository (e.g. no GitHub credentials for a private checkout), clone the tag on
 another machine and copy the tree over, or build elsewhere and transfer the image:
-`docker save somora_deep_sm120:0.1.0 | ssh <host> docker load`. The build itself only needs network access to
+`docker save somora_deep_sm120:0.1.1 | ssh <host> docker load`. The build itself only needs network access to
 PyPI, the PyTorch wheel index and GitHub (for the pinned DeepInfer commit).
 
 ## 2. Checkpoint and mounts
@@ -65,11 +65,33 @@ All 4 rank processes map the same files, so the page cache holds one copy.
 - Prefaulted pages are ordinary page cache, not locked memory: under memory pressure the kernel evicts them and
   misses are read from NVMe again (slower, but no OOM). This also holds without swap. `uva` instead page-locks the
   whole 203 GB and needs that much RAM on top of everything else.
+- **Multimodal pool (pinned host RAM per rank, on top of the engram budget above).** Each engine process pins a
+  `DEEPINFER_MULTIMODAL_POOL_SIZE_GB` buffer (`multiprocessing.shared_memory`, `/dev/shm/psm_*`). The multimodal
+  worker processes use it to hand preprocessed images to the engine. DeepInfer's default is 8 GB, i.e. 32 GB pinned
+  for 4 ranks. The image sets **2 GB** (8 GB for 4 ranks).
+  - What it holds: one block per in-flight request, with all of the request's resized RGB images plus 4 bytes per
+    prompt token. The block is freed once the prefill has copied it to the GPU. A full-resolution image (1024 vision
+    tokens, about 1302×1302 px) takes about 5.1 MB, the smallest (`min_pixels`, 544×544) about 0.9 MB. 1 GB is about 200
+    full-resolution images in flight.
+  - When it is full, the worker waits for space. A single request whose images exceed the whole pool waits until
+    `DEEPINFER_MULTI_MODAL_WORKER_TIMEOUT` (1800 s) aborts the process. So size it to at least your largest request's
+    images: 2 GB covers about 400 full-resolution images.
+  - `DEEPINFER_USE_MULTIMODAL_POOL=0` removes the pinned buffer; images then travel through the worker queue (same
+    tokens on the test model, slower copies). Text-only serving does not use the pool.
+  - The OpenAI server does not take image inputs yet (planned for v0.2.0); the engine's vision path runs on SM120
+    (plumbing and kernel shapes checked; numerics with real vision weights not verified yet).
+  - No `/dev/shm/psm_*` leftovers. Patch P11 unlinks the segment's name right after DeepInfer forks its multimodal
+    workers, so the memory exists only while a process maps it, also after SIGKILL, OOM or `docker kill`. The server
+    handles SIGTERM (`docker stop`; the server is PID 1 through `exec` in the entrypoint) with a clean shutdown, and
+    the `--dp` proxy forwards it to its ranks. Before v0.1.1 every stopped engine left a 2 GB `psm_*` file in the
+    host's `/dev/shm` (with `--ipc=host`); delete leftovers from older runs by hand.
+- **NUMA:** the image has libnuma1. On a multi-socket host add `--cap-add SYS_NICE`, otherwise the memory policy part of
+  DeepInfer's binding is refused (CPU affinity still applies). Single-socket hosts skip the binding (patch P10).
 
 ## 4. Validate the multi-GPU path first
 
 ```bash
-docker run --rm --gpus all --ipc=host --shm-size=32g --entrypoint bash somora_deep_sm120:0.1.0 -c '
+docker run --rm --gpus all --ipc=host --shm-size=32g --entrypoint bash somora_deep_sm120:0.1.1 -c '
   nvidia-smi topo -m
   torchrun --nproc_per_node 4 /opt/sm120/tests/bench_ep_comm.py --out /tmp/bench_ep_comm.json --moe
   python3 /opt/sm120/tests/test_ep_moe.py'
@@ -83,7 +105,7 @@ Then follow the remaining steps of [MULTI_GPU.md](MULTI_GPU.md) §6 (W=4 NCCL te
 docker run -d --name sm120-serve --gpus all --ipc=host --shm-size=32g --ulimit memlock=-1 -p 8100:8000 \
   -v /models/DeepSeek-V4.1-Flash:/models/ds41:ro -v /srv/sm120/cache:/cache -v /srv/work:/work \
   -e SM120_EP_IMPL=allgather -e SM120_EP_TRANSPORT=nccl -e SM120_ENGRAM_MODE=<per §3> \
-  somora_deep_sm120:0.1.0 --model /models/ds41 --served-model-name deepseek-v4.1-flash \
+  somora_deep_sm120:0.1.1 --model /models/ds41 --served-model-name deepseek-v4.1-flash \
     --dp 4 --gpu-memory-utilization 0.92 --max-model-len 40960 --max-num-seqs 16 --max-num-batched-tokens 4096 \
     --max-blocks 4096 --prefix-cache --no-graphs        # drop --no-graphs once eager works
 docker logs -f sm120-serve     # 4 ranks start (one engine process per GPU, NCCL EP group), then the dp proxy serves

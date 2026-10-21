@@ -7,8 +7,24 @@ SM120_ROOT=${SM120_ROOT:-/opt/sm120}; WORK=${WORK:-/work}; HF_CKPT=${HF_CKPT:-/c
 set -u
 CKPT=$1; PORT=$2; LOG=$3; shift 3
 SARGS=(); while [ $# -gt 0 ] && [ "$1" != "--" ]; do SARGS+=("$1"); shift; done; [ $# -gt 0 ] && shift
-python3 $SM120_ROOT/server/server.py --ckpt "$CKPT" --port "$PORT" "${SARGS[@]}" > "$LOG" 2>&1 &
+# own process group (engine + multimodal workers): stopped as a whole at the end, see stop_server
+setsid python3 $SM120_ROOT/server/server.py --ckpt "$CKPT" --port "$PORT" "${SARGS[@]}" > "$LOG" 2>&1 &
 SPID=$!
+stop_server() {
+    kill -TERM -- -"$SPID" 2>/dev/null
+    for _ in $(seq 60); do kill -0 -- -"$SPID" 2>/dev/null || break; sleep 1; done
+    kill -KILL -- -"$SPID" 2>/dev/null
+    python3 - <<'PY'
+import time
+import torch
+for i in range(120):  # the driver releases the context's memory shortly after the process is gone
+    free, total = torch.cuda.mem_get_info()
+    if free > 0.85 * total:
+        break
+    time.sleep(1)
+print(f"GPU free after stop: {free / 2**30:.1f}/{total / 2**30:.1f} GiB")
+PY
+}
 python3 - "$PORT" <<'PY'
 import sys, time, urllib.request
 for i in range(600):
@@ -19,6 +35,6 @@ for i in range(600):
 PY
 timeout 1500 python3 $SM120_ROOT/tests/test_server.py --url "http://127.0.0.1:$PORT" "$@"
 RC=$?
-kill $SPID; wait $SPID 2>/dev/null
+stop_server
 grep -E "di_server.*(done|disconnected)" "$LOG" | tail -4
 exit $RC

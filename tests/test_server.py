@@ -189,23 +189,36 @@ def main() -> int:
     check("concurrent streams overlap (continuous batching)", overlap and h["stats"]["max_running"] > 1,
           f"engine max_running {h['stats']['max_running']}")
 
-    # 6. a short request submitted while a long one decodes finishes first
+    # 6. a short request submitted while a long one decodes finishes first. The short one is sent once the long
+    # one has streamed a few tokens (not after a fixed sleep: with CUDA graphs a small model decodes 200 tokens
+    # in well under a second), and the long one is long enough to still be decoding when the short one ends.
     long_res, short_res = {}, {}
+    long_decoding = threading.Event()
 
     def long_job():
-        long_res["r"] = cl.stream("/v1/completions", dict(model=model, prompt="Long:", max_tokens=200, temperature=0,
-                                                          ignore_eos=True))
+        n = [0]
+
+        def on_event(ev):
+            n[0] += 1
+            if n[0] == 5:
+                long_decoding.set()
+
+        try:
+            long_res["r"] = cl.stream("/v1/completions", dict(model=model, prompt="Long:", max_tokens=600,
+                                                              temperature=0, ignore_eos=True), on_event=on_event)
+        finally:
+            long_decoding.set()
 
     tl = threading.Thread(target=long_job)
     tl.start()
-    time.sleep(1.0)
+    long_decoding.wait(timeout=120)
     ts = time.perf_counter()
     short_res["r"] = cl.stream("/v1/completions", dict(model=model, prompt="Short:", max_tokens=8, temperature=0,
                                                        ignore_eos=True))
     t_short_end = short_res["r"][2]
     tl.join()
     check("request added mid-decode is served immediately", short_res["r"][3] and t_short_end < long_res["r"][2],
-          f"short done after {t_short_end - ts:.2f}s, long ends {long_res['r'][2] - ts:.2f}s later-ref")
+          f"short done after {t_short_end - ts:.2f}s, long done after {long_res['r'][2] - ts:.2f}s")
 
     # 7. cancellation: disconnect after 5 events; the engine must abort and keep serving
     st, h0 = cl.get("/health")
@@ -256,7 +269,15 @@ def main() -> int:
         check("prefix cache: multi-turn extension hits the prompt-end snapshot", st == 200 and h2["hits"] > h1["hits"],
               f"{h2}")
 
-    # 9. bad requests
+    # 9. a one-token token-id prompt is a token-id prompt (not a one-element list of strings)
+    st, r = cl.post("/v1/completions", dict(model=model, prompt=[1000], max_tokens=4, temperature=0, ignore_eos=True,
+                                            return_token_ids=True))
+    check("one-token token-id prompt", st == 200 and r["usage"]["prompt_tokens"] == 1
+          and r["choices"][0]["prompt_token_ids"] == [1000], json.dumps(r)[:120])
+    st, r = cl.post("/v1/completions", dict(model=model, prompt=["Hello"], max_tokens=4, temperature=0))
+    check("one-element string-list prompt", st == 200 and r["usage"]["prompt_tokens"] >= 1, json.dumps(r)[:120])
+
+    # 10. bad requests
     st, _ = cl.post("/v1/completions", dict(model=model, prompt="x", top_p=0))
     st2, _ = cl.post("/v1/chat/completions", dict(model=model, messages=[]))
     st3, _ = cl.post("/v1/completions", dict(model=model, prompt="x", n=2))

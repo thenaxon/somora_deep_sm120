@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import queue
+import signal
 import sys
 import threading
 import time
@@ -459,6 +460,20 @@ class App:
                                  if args.prefix_cache else None)
 
 
+_MAIN_PID = os.getpid()
+
+
+def _sigterm(signum, frame):
+    """docker stop / kill -TERM in the server process: unwind through the finally blocks (KeyboardInterrupt).
+
+    Processes forked from it (DeepInfer's multimodal workers) inherit this handler; DeepInfer stops them with
+    terminate() and they have nothing to clean up, so they exit at once instead of printing a KeyboardInterrupt
+    traceback from inside their queue read."""
+    if os.getpid() != _MAIN_PID:
+        os._exit(0)
+    raise KeyboardInterrupt
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--ckpt", required=True)
@@ -501,7 +516,15 @@ def main() -> int:
     ap.add_argument("--image-fetch-timeout", type=float, default=10.0, help="seconds per image URL fetch")
     ap.add_argument("--log-level", default="INFO")
     args = ap.parse_args()
+    # docker stop / kill -TERM: run the finally blocks (engine shutdown here, rank shutdown in the dp proxy) instead
+    # of dying in place; the default SIGTERM action skips them.
+    signal.signal(signal.SIGTERM, _sigterm)
     logging.basicConfig(level=args.log_level, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    if args.dp_rank is None:  # once per server, not in the per-GPU children of --dp
+        import banner
+
+        banner.print_banner(f"v{banner.version()}  ·  {os.path.basename(os.path.normpath(args.ckpt))}"
+                            f"  ·  dp {args.dp}  ·  :{args.port}")
     if args.dp_rank is None and (args.dp > 1 or args.force_proxy):
         import dp_proxy
 

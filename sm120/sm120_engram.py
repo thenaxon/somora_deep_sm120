@@ -1719,9 +1719,11 @@ _PREFETCH = None  # EngramPrefetcher of this process (start_prefetcher), None wh
 _STEP_IS_PROMPT: bool | None = None  # kind of the model forward running now (E6), None = unknown
 
 
-def set_step_is_prompt(prompt: bool) -> None:
+def set_step_is_prompt(prompt: bool | None) -> None:
     global _STEP_IS_PROMPT
     _STEP_IS_PROMPT = prompt
+
+
 _TRACE = os.environ.get("SM120_ENGRAM_TRACE", "0") not in ("0", "")  # per prefill-gather timing lines
 
 _FADVISE_SRC = r"""
@@ -1910,7 +1912,9 @@ class EngramPrefetcher:
 
     def consumed(self, n_tokens: int) -> None:
         with self._cv:
-            self._consumed += int(n_tokens)
+            # at most what was prefetched: prefills of prompts the prefetcher never saw (or warm-up runs) must not
+            # build up credit that later lets it read far beyond SM120_ENGRAM_PREFETCH_AHEAD
+            self._consumed = min(self._consumed + int(n_tokens), self._issued)
             self._cv.notify_all()
 
     def close(self) -> None:

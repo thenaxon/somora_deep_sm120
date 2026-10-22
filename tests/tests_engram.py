@@ -347,6 +347,18 @@ def run_tests(args, cfg: Cfg, ckpt: str, M, E, tokenizer, device: torch.device) 
             k = np.searchsorted(lo, rows * width + base, side="right") - 1
             ok7 &= bool((k >= 0).all() and (rows * width + base + width <= hi[k]).all())
     check("T7 prefetch rows", ok7, f"{B} prompts, {nrows} rows: windows, block-wise hashes and page coverage")
+    # T7b: bookkeeping: cancel forgets the id (a reused id is prefetched again), consumption never exceeds what was
+    # prefetched (no credit beyond SM120_ENGRAM_PREFETCH_AHEAD)
+    import collections, threading
+    pf.tables, pf.slots, pf._q, pf._ids, pf._recent, pf._cv = [], [], [], set(), collections.deque(), threading.Condition()
+    pf._issued, pf._consumed, pf.stats = 0, 0, {"cancelled": 0}
+    pf._ids.add("r1"); pf._q.append(["r1", None, 0, 0, 0, None])
+    pf.cancel("r1")
+    pf._issued = 100
+    pf.consumed(4096)
+    pf.consumed(10)
+    check("T7b prefetch bookkeeping", "r1" not in pf._ids and not pf._q and pf._consumed == 100,
+          f"ids {pf._ids}, consumed {pf._consumed} of issued {pf._issued}")
 
     # T3: lookups through the EngramBuffer shim vs official ParallelEngramEmbedding on safetensors rows
     from deep_ep._engram import EngramBuffer
@@ -367,6 +379,27 @@ def run_tests(args, cfg: Cfg, ckpt: str, M, E, tokenizer, device: torch.device) 
     idx_dev = all_ids.unsqueeze(0).contiguous().to(device)
     (hook,) = buf.fetch(idx_dev)
     data, sf = hook()
+    # T7c: only prefill steps count against the prefetcher's read-ahead (decode steps / graph prestages do not)
+    class _Count:
+        n = 0
+
+        def consumed(self, k):
+            self.n += k
+    saved, se._PREFETCH = se._PREFETCH, _Count()
+    try:
+        se.set_step_is_prompt(False)
+        [h() for h in buf.fetch(idx_dev)]
+        dec = se._PREFETCH.n
+        se.set_step_is_prompt(True)
+        [h() for h in buf.fetch(idx_dev)]
+        pre = se._PREFETCH.n - dec
+        [h() for h in buf.fetcher.fetch(idx_dev, prefill=False)]
+        stg = se._PREFETCH.n - dec - pre
+    finally:
+        se._PREFETCH = saved
+        se.set_step_is_prompt(None)
+    check("T7c prefill-only consumption", dec == 0 and pre == Tn and stg == 0,
+          f"decode {dec}, prefill {pre} (of {Tn}), prestage-style {stg} tokens counted")
     pack_cols = cols * cfg.head_dim // 128
     layout_ok = (tuple(data.shape) == (Tn, cols * cfg.head_dim) and data.dtype == torch.float8_e4m3fn
                  and tuple(sf.shape) == (Tn, pack_cols) and sf.dtype == torch.int32

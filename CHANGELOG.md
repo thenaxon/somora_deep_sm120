@@ -6,6 +6,14 @@ before 1.0 any minor release may change interfaces.
 ## [Unreleased]
 
 ### Fixed
+- `SM120_MOE_DETERMINISTIC=1` (also on with `DEEPINFER_BATCH_INVARIANT=1` or `B12X_DYNAMIC_DETERMINISTIC_OUTPUT=1`) gave
+  wrong MoE outputs in two cases, both b12x 1.5.1 `deterministic_output` bugs:
+  - plans with `dynamic_tile_m` < 64 (b12x's own choice, e.g. E=16 at 5-64 tokens, E=96 at 65-512): cos ~0 against
+    the default path. The shim now uses at least 64 rows per tile in deterministic mode.
+  - masked routes (id -1) summed stale scratch rows. With `--dp` every rank masks the routes to the other ranks'
+    experts, so real tokens were wrong (single GPU: only discarded padding rows). They now go to a local expert with
+    weight 0.
+  The default b12x MoE and `--deterministic` (torch MoE) were not affected. New tests in `tests/test_gemm_moe_graphs.py`.
 - `--dp > 1`: TTFT of about 2 s even for short prompts. With several DP ranks DeepInfer votes the step type, and a
   prefill happens at the `DEEPINFER_PREFILL_ATTEMPT_INTERVAL` points only if every rank has a waiting prompt. A
   request that only one rank holds waited for the next `DEEPINFER_PREFILL_ANY_ATTEMPT_INTERVAL` point (default 100

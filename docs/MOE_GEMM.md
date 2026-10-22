@@ -140,6 +140,17 @@ around this by forcing `"grouped"`
 (`patches/repro_b12x_deterministic_direct.py` reproduces it standalone). The tiny-decode path always uses bf16 atomic
 adds and has no deterministic variant.
 
+Two more b12x 1.5.1 `deterministic_output` bugs, worked around in `sm120_moe` (tests `test_moe_deterministic_tile`,
+`test_moe_deterministic_vs_default` in `tests/test_gemm_moe_graphs.py`; each fails with its workaround removed):
+- With `dynamic_tile_m` < 64 the result is wrong (5090: cos ~0 against the default path, top-6, E=16 at 5-64 tokens,
+  E=96 at 65-512; also with b12x's own choice, `decode_config=None`). Deterministic plans use `dynamic_tile_m >= 64`.
+- A masked route (`topk_ids == -1`) leaves its per-route output row unwritten, and the top-k sum adds stale scratch
+  from an earlier call (cos 0.5-0.85; rows without any route not zero). An EP rank masks the routes to the other ranks'
+  experts, so under `--dp` real tokens were wrong. Masked routes go to a local expert (spread round-robin) with
+  weight 0 instead; that adds exactly 0 but costs expert work for them (deterministic mode only).
+On the RTX 5090 test model (single GPU) deterministic decode teacher-forced on torch-MoE tokens has the same per-step
+KL as the default path (5.6e-3 vs 6.3e-3); free-running greedy tokens part at a near-tie.
+
 Cost (RTX 5090, CUDA graphs, prompt 256, 128 generated tokens, TPOT ms default -> deterministic):
 
 | model | B=1 | B=8 | B=32 |

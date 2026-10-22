@@ -24,6 +24,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SHIMS = os.path.join(os.path.dirname(HERE), "sm120")
 if SHIMS not in sys.path:
     sys.path.insert(0, SHIMS)
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
 os.environ.setdefault("B12X_AUTOTUNE", "0")
 
 CUDA = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 12
@@ -229,3 +231,65 @@ def test_moe_determinism(det):
             assert n_diff == 0
     finally:
         os.environ.pop("SM120_MOE_DETERMINISTIC", None)
+
+
+@pytest.mark.parametrize("masked", [False, True])
+@pytest.mark.parametrize("T", [7, 64, 300])
+def test_moe_deterministic_vs_default(T, masked):
+    """SM120_MOE_DETERMINISTIC=1 must give the default path's result (within its atomics noise), exact zeros for rows
+    without a route, bit-identical repeats. Two b12x 1.5.1 deterministic_output bugs (sm120_moe works around both):
+    dynamic_tile_m < 64 gave wrong rows (here T=7 and 64: cos ~0), and masked routes (-1, an EP rank masks the
+    routes to the other ranks' experts) summed stale scratch."""
+    import sm120_moe
+
+    os.environ["B12X_W4A8_TINY_DECODE"] = "0"
+    moe, _ = _fake_moe()
+    twin = types.SimpleNamespace(**vars(moe))  # B12xRoutedExperts may take the weights' storage: give each its own
+    for name in ("gate_up_proj_weight", "down_proj_weight"):
+        src = getattr(moe, name)
+        t = src.clone()
+        t.sf = src.sf.clone()
+        setattr(twin, name, t)
+    g = torch.Generator(device="cpu").manual_seed(T)
+    x = (torch.randn(T, K_MOE, generator=g) * 4).to(torch.bfloat16).to(DEV)
+    ids, w = _routes(T)
+    if masked:
+        ids[torch.rand(ids.shape, generator=g).to(DEV) < 0.6] = -1  # most routes on other ranks
+        ids[: T // 8] = -1  # some rows without any local route
+    try:
+        os.environ["SM120_MOE_DETERMINISTIC"] = "0"
+        ref = sm120_moe.B12xRoutedExperts(twin)(x, ids, w)
+        os.environ["SM120_MOE_DETERMINISTIC"] = "1"
+        experts = sm120_moe.B12xRoutedExperts(moe)
+        experts(x, torch.randint(0, E, ids.shape, device=DEV), w)  # fill the per-route scratch with valid rows first
+        outs = [experts(x, ids, w).clone() for _ in range(3)]
+        torch.cuda.synchronize()
+    finally:
+        os.environ.pop("SM120_MOE_DETERMINISTIC", None)
+    none = (ids < 0).all(-1)
+    assert all(torch.equal(outs[0].view(torch.int16), o.view(torch.int16)) for o in outs[1:])
+    assert bool((outs[0][none] == 0).all()), "rows without a route must be 0"
+    assert _cos(outs[0], ref) > 0.9999, _cos(outs[0], ref)
+
+
+@pytest.mark.parametrize("E_,T", [(16, 7), (16, 64), (96, 100)])
+def test_moe_deterministic_tile(E_, T):
+    """V4.1 top-6 shapes where b12x picks dynamic_tile_m=32: deterministic_output gave cos ~0 there (b12x 1.5.1);
+    sm120_moe uses tile_m >= 64 in deterministic mode. No masked routes."""
+    import sm120_moe
+    import test_ep_moe as TE
+
+    TE.E, TE.K, TE.N, TE.TOPK = E_, 5120, 2048, 6
+    wts = TE.make_weights(2)
+    a = sm120_moe.B12xRoutedExperts(TE.make_moe(wts, range(0, E_), DEV))
+    b = sm120_moe.B12xRoutedExperts(TE.make_moe(wts, range(0, E_), DEV))
+    del wts
+    x, ids, w = TE.make_tokens(T, T, DEV)
+    try:
+        os.environ["SM120_MOE_DETERMINISTIC"] = "1"
+        det = a(x, ids, w)
+        os.environ["SM120_MOE_DETERMINISTIC"] = "0"
+        ref = b(x, ids, w)
+    finally:
+        os.environ.pop("SM120_MOE_DETERMINISTIC", None)
+    assert _cos(det, ref) > 0.9999, _cos(det, ref)

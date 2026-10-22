@@ -107,10 +107,12 @@ class Endpoint:
                         out[f"prefix_cache.{k}"] = v
                 if isinstance((h.get("config") or {}).get("nextn"), int):
                     out["config.nextn"] = h["config"]["nextn"]
+                if (h.get("config") or {}).get("mtp_varlen"):
+                    out["config.mtp_varlen"] = 1
                 # behind the --dp proxy: per-rank counters. All ranks step in lockstep (idle ranks run placeholder
                 # steps), so the step count of a request's rank is the step count of any rank, not the sum.
                 for i, r in enumerate(h.get("ranks") or []):
-                    for k in ("steps", "added", "tokens", "emit_steps"):
+                    for k in ("steps", "added", "tokens", "emit_steps", "mtp_verified", "mtp_accepted", "mtp_seq_steps"):
                         if isinstance((r.get("stats") or {}).get(k), (int, float)):
                             out[f"rank{i}.{k}"] = r["stats"][k]
         except Exception:  # noqa: BLE001
@@ -188,8 +190,17 @@ def stats_delta(before: dict, after: dict) -> dict:
             out["engine_requests"] = d["engine.added"]
         if "engine.emit_steps" in d:
             out["engine_emit_steps"] = d["engine.emit_steps"]
+        # this repo's server (sm120_patches P12): draft tokens the engine verified / accepted. With adaptive MTP
+        # (--mtp-varlen) the number verified per step varies, so acceptance must be accepted / verified, not
+        # (tokens_per_step - 1) / nextn
+        if d.get("engine.mtp_verified"):
+            out["draft_acceptance"] = d.get("engine.mtp_accepted", 0) / d["engine.mtp_verified"]
+            if d.get("engine.mtp_seq_steps"):
+                out["drafts_verified_per_step"] = d["engine.mtp_verified"] / d["engine.mtp_seq_steps"]
     if "config.nextn" in after:
         out["nextn"] = after["config.nextn"]
+    if after.get("config.mtp_varlen"):
+        out["mtp_varlen"] = 1
     for k in ("prefix_cache.hits", "prefix_cache.lookups", "prefix_cache.hit_tokens", "prefix_cache.prompt_tokens"):
         if k in d:
             out[k.replace(".", "_")] = d[k]
@@ -348,12 +359,12 @@ def sc_realistic(ep, a):
                 toks, nreq = row.get("engine_tokens", 0), row.get("engine_requests") or len(res)
                 if row["engine_emit_steps"] > nreq:
                     row["tokens_per_step"] = (toks - nreq) / (row["engine_emit_steps"] - nreq)
-                    if row.get("nextn"):
+                    if row.get("nextn") and not row.get("mtp_varlen"):
                         row["draft_acceptance_est"] = (row["tokens_per_step"] - 1) / row["nextn"]
             rows.append(row)
             show(row, ["set", "concurrency", "requests", "errors", "output_tok_s", "output_tokens_mean", "tpot_p50_ms",
                        "tpot_p99_ms", "ttft_p50", "ttft_p99", "tokens_per_step", "draft_acceptance_est",
-                       "spec_acceptance"])
+                       "draft_acceptance", "drafts_verified_per_step", "spec_acceptance"])
     return rows
 
 
@@ -542,7 +553,8 @@ def sc_capacity(ep, a):
 
 MD_COLUMNS = {
     "realistic": ["set", "concurrency", "requests", "errors", "output_tok_s", "output_tokens_mean", "tpot_p50_ms",
-                  "tpot_p99_ms", "ttft_p50", "ttft_p99", "tokens_per_step", "draft_acceptance_est", "spec_acceptance"],
+                  "tpot_p99_ms", "ttft_p50", "ttft_p99", "tokens_per_step", "draft_acceptance_est", "draft_acceptance",
+                  "drafts_verified_per_step", "spec_acceptance"],
     "prefill": ["prompt_len", "concurrency", "errors", "prompt_tokens_mean", "ttft_p50", "ttft_p99", "ttft_max",
                 "time_to_last_s", "prefill_tok_s", "total_tok_s"],
     "shared-prefix": ["variant", "turn", "requests", "errors", "prompt_tokens_mean", "ttft_p50", "ttft_p99", "tpot_p50_ms",

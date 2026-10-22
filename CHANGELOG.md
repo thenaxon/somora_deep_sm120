@@ -13,6 +13,13 @@ before 1.0 any minor release may change interfaces.
   - Lookups are GPU gathers from it, also inside CUDA graphs, and never touch the NVMe.
   - The start-up fails with the numbers when tables + ranks' memory + headroom do not fit.
   - `tests/test_engram_pinned.py` checks one copy for two ranks, bit-exact rows and graph replay.
+- Adaptive speculative decoding: `server.py --mtp-varlen` (with `--graphs --nextn K`) enables DeepInfer's
+  cost-model draft trimming (`DEEPINFER_ENABLE_MTP_VARLEN`). The decode graphs are profiled at start-up (cached in
+  `/cache/decode_perf`); each step verifies only as many drafts per sequence (≤ K) as the profiled step cost and the
+  DSpark confidence head justify. Measured on the RTX 5090 test model: K=5/7 is +35-45 % output tok/s over K=3 at one
+  user; the trimming itself is neutral at ≤ 8 users (docs/MTP_YOCO.md §9).
+- `/health` reports verified / accepted draft tokens (`stats.mtp_verified`, `stats.mtp_accepted`, runtime patch P12);
+  `eval/scenarios.py realistic` reports `draft_acceptance` (accepted / verified) and `drafts_verified_per_step`.
 
 ## [0.2.2] - unreleased
 

@@ -31,7 +31,8 @@ Inside the image (`PYTHONPATH=/opt/sm120/sm120:/opt/deepinfer` is preset):
 python3 /opt/sm120/server/server.py --ckpt /work/ckpt3 --port 8000 --max-num-seqs 8     # b12x backends (fast)
 python3 /opt/sm120/server/server.py --ckpt /work/ckpt3 --port 8000 --deterministic      # reproducible outputs
 # options: --max-model-len 16384 --max-num-batched-tokens 4096 --gpu-memory-utilization 0.9 --max-blocks 256
-#          --nextn N (MTP, needs mtp.* layers) --graphs (CUDA graphs) --zos 0|1 --prefill-interval 1 --model-name ID
+#          --nextn N (MTP, needs mtp.* layers) --graphs (CUDA graphs) --mtp-varlen (adaptive draft length, needs
+#          --graphs and --nextn > 0; docs/MTP_YOCO.md §9) --zos 0|1 --prefill-interval 1 --model-name ID
 #          --prefix-cache [--prefix-cache-grain 512 --prefix-cache-checkpoint-stride 0 (= --max-num-batched-tokens)
 #                          --prefix-cache-entries 64 --prefix-cache-max-block-frac 0.5]
 #          (tool-calling workloads with short shared system prompts: --prefix-cache-checkpoint-stride 1024 or 2048, see PREFIX_CACHE.md)
@@ -66,7 +67,7 @@ The OpenAI Python client works with `base_url="http://host:8000/v1"` and any `ap
 | endpoint | supported |
 |---|---|
 | `GET /v1/models` | the one model (`--model-name`, default the checkpoint directory name) and its `max_model_len` |
-| `GET /health` | `{"status": "ok" \| "dead", "stats": {...}, "config": {"nextn": N}}`: engine steps, flushes, added, aborted, finished, max_running, busy_s, tokens (generated), emit_steps (per request, the steps in which it got tokens: (tokens - added) / (emit_steps - added) = tokens per decode step) (+ `prefix_cache` stats when enabled). Behind the `--dp` proxy: summed over ranks, except the lockstep counters steps / flushes (per rank), plus each rank's own report under `ranks` |
+| `GET /health` | `{"status": "ok" \| "dead", "stats": {...}, "config": {"nextn": N}}`: engine steps, flushes, added, aborted, finished, max_running, busy_s, tokens (generated), emit_steps (per request, the steps in which it got tokens: (tokens - added) / (emit_steps - added) = tokens per decode step) (+ `prefix_cache` stats when enabled). With MTP also `mtp_verified` / `mtp_accepted` (draft tokens verified / accepted, without each sequence's first token), `mtp_seq_steps`, `mtp_decode_steps`; `config.mtp_varlen`. Behind the `--dp` proxy: summed over ranks, except the lockstep counters steps / flushes (per rank), plus each rank's own report under `ranks` |
 | `POST /v1/completions` | `prompt`: a string, a one-element list of strings, or a list of token ids. `max_tokens`, `temperature`, `top_p`, `top_k`, `stop` (string or up to 4 strings), `seed`, `ignore_eos`, `stream`, `stream_options.include_usage`. Extension: `return_token_ids` (non-streaming) |
 | `POST /v1/chat/completions` | `messages` rendered with the checkpoint's `encoding/encoding.py` (`encode_messages`, `thinking_mode="chat"`). `"thinking": true` or `reasoning_effort` select `thinking` mode, also inside `chat_template_kwargs` (`thinking`, `enable_thinking`, `reasoning_effort`, `drop_thinking`; top-level fields win); the text before `</think>` is returned as `message.reasoning_content` (streaming: `delta.reasoning_content`). Same sampling fields, plus `max_completion_tokens`. `tools`, `tool_choice`, `parallel_tool_calls`, `response_format`: see [Tool calling and structured output](#tool-calling-and-structured-output); `image_url` content parts: see [Image input](#image-input) |
 

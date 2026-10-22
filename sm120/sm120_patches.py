@@ -556,6 +556,44 @@ def _patch_mm_pool_unlink(mod):
     _note("P11 MultimodalProcessor._start_workers: multimodal pool shm name unlinked after the worker fork")
 
 
+MTP_STATS = {"mtp_decode_steps": 0, "mtp_seq_steps": 0, "mtp_verified": 0, "mtp_accepted": 0}
+
+
+def mtp_stats() -> dict:
+    """Speculative decoding counters since start (P12): decode steps, sequence-steps (one per sequence per decode
+    step), draft tokens verified and accepted (excluding each sequence's always-accepted first token)."""
+    return dict(MTP_STATS)
+
+
+@when_imported("deepinfer.engine.llm_engine")
+def _patch_mtp_stats(mod):
+    """P12: count verified / accepted draft tokens per decode step from the sampler output's num_verified_tokens /
+    num_generated_tokens ([num_seqs, n_at_position_1, ...]), which DeepInfer only aggregates in its stats logger
+    (off in the server). LLMEngine.post_process is bound into the worker callbacks at construction: patch the class."""
+    cls = mod.LLMEngine
+    orig = cls.post_process
+    if getattr(orig, "_sm120", False):
+        return
+
+    def post_process(self, step_state):
+        try:
+            out = None if step_state.is_placeholder else step_state.sampler_output
+            gen = getattr(out, "num_generated_tokens", None) if out is not None else None
+            ver = getattr(out, "num_verified_tokens", None) if out is not None else None
+            if not step_state.is_prompt and gen and ver and len(gen) > 1:
+                MTP_STATS["mtp_decode_steps"] += 1
+                MTP_STATS["mtp_seq_steps"] += int(gen[0])
+                MTP_STATS["mtp_accepted"] += int(sum(gen[1:]))
+                MTP_STATS["mtp_verified"] += int(sum(ver[1:]))
+        except Exception:  # noqa: BLE001  statistics only
+            pass
+        return orig(self, step_state)
+
+    post_process._sm120 = True
+    cls.post_process = post_process
+    _note("P12 LLMEngine.post_process: MTP verified/accepted draft counters (sm120_patches.mtp_stats)")
+
+
 @when_imported("deepinfer")
 def _patch_attn_agent(mod):
     """Hand-off point for the attention shim's own DeepInfer patches (optional module)."""

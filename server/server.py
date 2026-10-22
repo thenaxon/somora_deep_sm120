@@ -181,8 +181,10 @@ class Handler(BaseHTTPRequestHandler):
         if self.path in ("/health", "/v1/health"):
             ok = self.app.engine.alive
             pc = self.app.engine.prefix_cache
-            return self._json(200 if ok else 503, {"status": "ok" if ok else "dead", "stats": self.app.engine.stats,
-                                                   "config": {"nextn": getattr(self.app.engine, "nextn", None)},
+            return self._json(200 if ok else 503, {"status": "ok" if ok else "dead",
+                                                   "stats": {**self.app.engine.stats, **_mtp_stats()},
+                                                   "config": {"nextn": getattr(self.app.engine, "nextn", None),
+                                                              "mtp_varlen": bool(self.app.args.mtp_varlen)},
                                                    "prefix_cache": pc.summary() if pc is not None else None})
         if self.path == "/v1/models":
             return self._json(200, {"object": "list", "data": [
@@ -483,6 +485,7 @@ class App:
                                  nextn=args.nextn, graphs=args.graphs, zos=args.zos,
                                  prefill_interval=args.prefill_interval, deterministic=args.deterministic,
                                  dp_size=args.dp, dp_rank=args.dp_rank or 0, ep_size=args.ep,
+                                 mtp_varlen=args.mtp_varlen,
                                  prefix_cache=dict(grain=args.prefix_cache_grain, checkpoint_stride=args.prefix_cache_checkpoint_stride,
                                                    max_entries=args.prefix_cache_entries,
                                                    max_block_frac=args.prefix_cache_max_block_frac)
@@ -490,6 +493,12 @@ class App:
 
 
 _MAIN_PID = os.getpid()
+
+
+def _mtp_stats() -> dict:
+    """P12 counters (mtp_verified / mtp_accepted draft tokens, mtp_seq_steps); empty if the patches are not loaded."""
+    mod = sys.modules.get("sm120_patches")
+    return mod.mtp_stats() if mod is not None and hasattr(mod, "mtp_stats") else {}
 
 
 _CACHE_POLICY: dict = {}
@@ -538,6 +547,9 @@ def main() -> int:
     ap.add_argument("--max-blocks", type=int, default=256, help="SM120_MAX_GPU_BLOCKS")
     ap.add_argument("--nextn", type=int, default=0, help="MTP/DSpark draft tokens (needs mtp.* layers)")
     ap.add_argument("--graphs", action="store_true", help="CUDA graphs (default eager)")
+    ap.add_argument("--mtp-varlen", action="store_true",
+                    help="adaptive MTP: per step, verify only as many drafts (<= --nextn per request) as the profiled "
+                         "cost curve and the draft confidences pay for (DEEPINFER_ENABLE_MTP_VARLEN); needs --graphs")
     ap.add_argument("--zos", choices=("default", "0", "1"), default="default")
     ap.add_argument("--prefill-interval", type=int, default=1,
                     help="DEEPINFER_PREFILL_ATTEMPT_INTERVAL (DeepInfer default 70 decode steps; 1 = lowest TTFT)")
@@ -575,6 +587,8 @@ def main() -> int:
     # docker stop / kill -TERM: run the finally blocks (engine shutdown here, rank shutdown in the dp proxy) instead
     # of dying in place; the default SIGTERM action skips them.
     signal.signal(signal.SIGTERM, _sigterm)
+    if args.mtp_varlen and (args.nextn <= 0 or not args.graphs):
+        ap.error("--mtp-varlen needs --nextn > 0 and --graphs (DeepInfer profiles the decode graphs for its cost model)")
     logging.basicConfig(level=args.log_level, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     if args.dp_rank is None:  # once per server, not in the per-GPU children of --dp
         import banner

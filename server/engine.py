@@ -85,13 +85,13 @@ class EngineLoop:
                  max_num_batched_tokens: int = 4096, gpu_memory_utilization: float = 0.90, max_blocks: int = 256,
                  nextn: int = 0, graphs: bool = False, zos: str = "default", chunked_prefill: bool = True,
                  prefill_interval: int = 1, deterministic: bool = False, prefix_cache: dict | None = None,
-                 dp_size: int = 1, dp_rank: int = 0, ep_size: int | None = None):
+                 dp_size: int = 1, dp_rank: int = 0, ep_size: int | None = None, mtp_varlen: bool = False):
         self.ckpt = ckpt
         self.cfg = dict(max_num_seqs=max_num_seqs, max_model_len=max_model_len,
                         max_num_batched_tokens=max_num_batched_tokens, gpu_memory_utilization=gpu_memory_utilization,
                         max_blocks=max_blocks, nextn=nextn, graphs=graphs, zos=zos, chunked_prefill=chunked_prefill,
                         prefill_interval=prefill_interval, deterministic=deterministic, prefix_cache=prefix_cache,
-                        dp_size=dp_size, dp_rank=dp_rank, ep_size=ep_size or dp_size)
+                        dp_size=dp_size, dp_rank=dp_rank, ep_size=ep_size or dp_size, mtp_varlen=mtp_varlen)
         # has_unfinished_requests() is an all-reduce over the DP group: with several ranks, an idle rank must keep
         # polling quickly or it delays the other ranks' steps (docs/MULTI_GPU.md)
         self.idle_poll = 0.5 if dp_size == 1 else 0.005
@@ -174,6 +174,16 @@ class EngineLoop:
         # idle/placeholder steps included (csrc/engine/scheduler.hpp:296-330): ~2.3 s of TTFT at 32 ms/step on the
         # RTX 5090 test machine. 1 = prefill whenever a prompt waits (one decode step stalls per prefill; chunked prefill caps it).
         os.environ.setdefault("DEEPINFER_PREFILL_ATTEMPT_INTERVAL", str(c["prefill_interval"]))
+        if c["mtp_varlen"]:
+            # DeepInfer's adaptive speculative decoding (csrc/engine/mtp_varlen.hpp): after graph capture the worker
+            # replays every decode graph to get a (graph size -> ms) curve (model_runner.profile_decode_perf, cached in
+            # DEEPINFER_DECODE_PERF_CACHE_DIR for DEEPINFER_DECODE_PERF_CACHE_TTL_SEC); each step the scheduler picks
+            # the total verify size that maximizes expected tokens / ms from the DFlash confidence head and gives the
+            # draft slots to the most confident sequences (per-request K <= nextn). Needs CUDA graphs and nextn > 0.
+            os.environ["DEEPINFER_ENABLE_MTP_VARLEN"] = "1"
+            root = os.environ.get("SM120_CACHE_ROOT", "/cache")
+            if os.path.isdir(root) and os.access(root, os.W_OK):
+                os.environ.setdefault("DEEPINFER_DECODE_PERF_CACHE_DIR", os.path.join(root, "decode_perf"))
         if c["deterministic"]:
             # b12x fused_moe is not run-to-run deterministic (diag_repeat.py); the torch MoE reference is
             os.environ["SM120_MOE_IMPL"] = "torch"

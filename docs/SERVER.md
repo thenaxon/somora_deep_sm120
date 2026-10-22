@@ -32,7 +32,7 @@ python3 /opt/sm120/server/server.py --ckpt /work/ckpt3 --port 8000 --max-num-seq
 python3 /opt/sm120/server/server.py --ckpt /work/ckpt3 --port 8000 --deterministic      # reproducible outputs
 # options: --max-model-len 16384 --max-num-batched-tokens 4096 --gpu-memory-utilization 0.9 --max-blocks 256
 #          --nextn N (MTP, needs mtp.* layers) --graphs (CUDA graphs) --mtp-varlen (adaptive draft length, needs
-#          --graphs and --nextn > 0; docs/MTP_YOCO.md §9) --zos 0|1 --prefill-interval 1 --prefill-any-interval 1 --model-name ID
+#          --graphs and --nextn > 0; docs/MTP_YOCO.md §9) --zos 0|1 --prefill-interval auto --prefill-any-interval auto --model-name ID
 #          --prefix-cache [--prefix-cache-grain 512 --prefix-cache-checkpoint-stride 0 (= --max-num-batched-tokens)
 #                          --prefix-cache-entries 64 --prefix-cache-max-block-frac 0.5]
 #          (tool-calling workloads with short shared system prompts: --prefix-cache-checkpoint-stride 1024 or 2048, see PREFIX_CACHE.md)
@@ -258,8 +258,8 @@ Every DeepInfer and CUDA call happens on that thread. HTTP handler threads only 
 
 **`DEEPINFER_PREFILL_ATTEMPT_INTERVAL`:** the NORMAL scheduler only tries a prefill every N decode steps (default 70), and idle
 placeholder steps count (`scheduler.hpp:296-330`, built for DP-wide prefill voting). At about 32 ms per eager step that alone is
-about 2.3 s of TTFT. The server sets it to `--prefill-interval 1`. The cost is that one decode step of the running requests waits
-for each prefill chunk (bounded by chunked prefill, `max_num_batched_tokens`).
+about 2.3 s of TTFT. With `--dp 1` the server sets it to 1 (`--prefill-interval auto`). The cost is that one decode step of
+the running requests waits for each prefill chunk (bounded by chunked prefill, `max_num_batched_tokens`).
 
 **`DEEPINFER_PREFILL_ANY_ATTEMPT_INTERVAL` (`--dp > 1`):** with several DP ranks, the step type is voted across the
 ranks (MIN all-reduce, `scheduler.hpp:296-340`).
@@ -268,9 +268,20 @@ ranks (MIN all-reduce, `scheduler.hpp:296-340`).
   (default 100).
 - Up to v0.2.4 the server left this at 100. With `--dp 4` a single request then waited up to 100 decode steps (about
   2 s of TTFT at 20 ms per step, even for a 58-token prompt).
-- The server now sets `--prefill-any-interval 1`: an ANY point at every step except the one right after a prefill.
-- Cost: while any rank has a waiting prompt, the decode of all ranks pauses for that prefill chunk (the other ranks run
-  an empty prompt step in lockstep). A larger value batches prefills across ranks at the price of TTFT.
+- Every prompt step resets the decode-step counter. With both intervals at 1, almost every step is a prefill attempt.
+  While any rank has prompt chunks waiting, the decoders of all ranks got about one token per chunk (about 1.1 s for
+  4096 tokens on the 4-GPU host: mixed-load TPOT p99 401 ms). When every rank has prompts waiting, the chunks ran
+  back to back.
+- **Default (`auto`) with `--dp > 1`: 8 for both intervals.** Between two prefill chunks at least 8 decode steps run, and
+  a request that only one rank holds waits at most 8 decode steps.
+- The trade-off per value N, with about 25 ms per decode step and a chunk time t:
+  - Decoders during a long prefill: TPOT ≈ (t + N × 25 ms) / N.
+  - A short prompt waits up to N × 25 ms extra.
+  - A prompt of k chunks takes about (k − 1) × N × 25 ms longer.
+  - Smaller chunks (`--max-num-batched-tokens 2048`) halve t but double k.
+- DeepInfer cannot put decode tokens into a prefill step: a step is either prompt or decode for the whole DP group.
+  vLLM-style mixed batches would need a scheduler change.
+- `--dp 1`: `auto` = 1 / 1 (the vote is trivial; no extra delay).
 
 ## Profiling a prefill (`SM120_PROFILE_PREFILL`)
 

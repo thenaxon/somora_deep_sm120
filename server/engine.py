@@ -78,13 +78,29 @@ class GenRequest:
     done: bool = False
 
 
+# Prefill attempt interval used by "auto" with DP > 1 (decode steps between two prefill chunks when several ranks
+# share the step-type vote). Placeholder until the 4-GPU measurements pick it.
+DP_AUTO_INTERVAL = 8
+
+
+def resolve_prefill_interval(value, dp_size: int) -> int:
+    """--prefill-interval / --prefill-any-interval: an int >= 1, or "auto" (1 for dp 1, DP_AUTO_INTERVAL otherwise)."""
+    if value is None or str(value).strip().lower() == "auto":
+        return 1 if int(dp_size) <= 1 else DP_AUTO_INTERVAL
+    v = int(value)
+    if v < 1:
+        raise ValueError(f"prefill interval must be >= 1 or 'auto', got {value!r}")
+    return v
+
+
 class EngineLoop:
     """Owns the DeepInfer LLM on a dedicated thread; thread-safe submit()/abort()."""
 
     def __init__(self, ckpt: str, *, max_num_seqs: int = 8, max_model_len: int = 16384,
                  max_num_batched_tokens: int = 4096, gpu_memory_utilization: float = 0.90, max_blocks: int = 256,
                  nextn: int = 0, graphs: bool = False, zos: str = "default", chunked_prefill: bool = True,
-                 prefill_interval: int = 1, prefill_any_interval: int = 1, deterministic: bool = False,
+                 prefill_interval: int | str = "auto", prefill_any_interval: int | str = "auto",
+                 deterministic: bool = False,
                  prefix_cache: dict | None = None,
                  dp_size: int = 1, dp_rank: int = 0, ep_size: int | None = None, mtp_varlen: bool = False):
         self.ckpt = ckpt
@@ -175,14 +191,19 @@ class EngineLoop:
         # The NORMAL scheduler only tries a prefill every DEEPINFER_PREFILL_ATTEMPT_INTERVAL (default 70) decode steps,
         # idle/placeholder steps included (csrc/engine/scheduler.hpp:296-330): ~2.3 s of TTFT at 32 ms/step on the
         # RTX 5090 test machine. 1 = prefill whenever a prompt waits (one decode step stalls per prefill; chunked prefill caps it).
-        os.environ.setdefault("DEEPINFER_PREFILL_ATTEMPT_INTERVAL", str(c["prefill_interval"]))
+        os.environ.setdefault("DEEPINFER_PREFILL_ATTEMPT_INTERVAL",
+                              str(resolve_prefill_interval(c["prefill_interval"], c["dp_size"])))
         # With DP > 1 that interval only marks "ALL" points, where a prefill step happens only if EVERY DP rank has a
         # waiting prompt (MIN all-reduce of the ranks' votes). A rank alone with a prompt waits for an "ANY" point,
         # every DEEPINFER_PREFILL_ANY_ATTEMPT_INTERVAL decode steps (default 100; scheduler.hpp:296-340). With
         # --dp 4 a single request waited up to 100 decode steps (~2 s TTFT at 20 ms per step). 1 = an ANY point at
         # every step except the one right after a prefill step. Cost: while any rank has a waiting prompt, every
         # rank's decode pauses for that prefill chunk (the other ranks run an empty prompt step).
-        os.environ.setdefault("DEEPINFER_PREFILL_ANY_ATTEMPT_INTERVAL", str(c["prefill_any_interval"]))
+        # "auto" (default): 1 / 1 with one rank, where the vote is trivial; with DP > 1 an interval of DP_AUTO_INTERVAL
+        # for both, which guarantees that many decode steps between two prefill chunks (with 1, every step could be a
+        # prefill step and the decoders got ~1 token per chunk; docs/SERVER.md). An explicit -e DEEPINFER_* wins.
+        os.environ.setdefault("DEEPINFER_PREFILL_ANY_ATTEMPT_INTERVAL",
+                              str(resolve_prefill_interval(c["prefill_any_interval"], c["dp_size"])))
         if c["mtp_varlen"]:
             # DeepInfer's adaptive speculative decoding (csrc/engine/mtp_varlen.hpp): after graph capture the worker
             # replays every decode graph to get a (graph size -> ms) curve (model_runner.profile_decode_perf, cached in

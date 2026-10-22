@@ -11,6 +11,14 @@ with is_prompt=True. Checks: both ranks pick the same graph size every decode st
 sizes)), both selects inside a step agree, every prefill layer pads to the step's DP-max token count without a
 per-layer count exchange, one all-reduce per step, the start-up capture (no step synced yet) uses the graph size as
 EP rows, and the EP output of the real rows matches a full-expert run.
+
+Adaptive MTP (--mtp-varlen) cases: each rank's scheduler picks its own decode token count from its cost model
+(sequences + a variable number of drafts, not a multiple of 1 + nextn), against an idle rank; the sync only sees the
+counts, so these are ordinary steps. At the end, both ranks run the lockstep part of DeepInfer's profile_decode_perf
+(model_runner.py:562): every graph size in reversed(batch_sizes), warm-up + measured replays at exactly that row
+count (no select, no step sync: the graphs replayed there were captured at their own size, i.e. EP rows = T), then
+one all-reduce of the measured time. Checks: no hang, EP rows equal the graph size, outputs match the full-expert
+run, both ranks get the same averaged curve.
 """
 
 from __future__ import annotations
@@ -28,8 +36,11 @@ os.environ.setdefault("B12X_AUTOTUNE", "0")
 os.environ.setdefault("B12X_W4A8_TINY_DECODE", "0")
 
 # (kind, n): kind "d" decode with n tokens, "p" prefill with seqlen_q list n; n None = placeholder step
-STEPS = {0: [("d", 1), ("d", 5), ("d", None), ("p", [300, 20]), ("d", 3), ("p", None), ("d", 8), ("d", 16)],
-         1: [("d", 7), ("d", 2), ("d", 4), ("p", None), ("d", None), ("p", [50]), ("d", 8), ("d", 1)]}
+STEPS = {0: [("d", 1), ("d", 5), ("d", None), ("p", [300, 20]), ("d", 3), ("p", None), ("d", 8), ("d", 16),
+             ("d", 11), ("d", 13), ("d", None)],   # varlen: e.g. 3 seqs + 8 / + 10 drafts (nextn 7), then idle
+         1: [("d", 7), ("d", 2), ("d", 4), ("p", None), ("d", None), ("p", [50]), ("d", 8), ("d", 1),
+             ("d", None), ("d", 6), ("d", 9)]}      # idle, then 2 seqs + 4 drafts, 1 seq + 8 drafts
+PROFILE_REPLAYS = 3  # profile_decode_perf: NUM_WARMUP 1 + NUM_MEASURE 5 (fewer here)
 PREFILL_LAYERS = 3
 
 
@@ -162,8 +173,27 @@ def _worker(rank: int, world: int, init_file: str, q):
         else:
             YWorker().execute_model_step(True, True, None, None)
         os.environ.pop("DEEPINFER_YOCO_PREFILL_TRUNCATION_MODE", None)
+        dp_sync._STATE["yoco_boundary"] = None
+        counts_yoco = seen["counts"] - counts_before
+        # profile_decode_perf lockstep: replay every graph size directly (graph.replay(), no execute_model_step). The
+        # graphs were captured at their own size (EP rows = T); synced = b takes that same rows = T branch without a
+        # capture. Then one all-reduce of the measured time per size.
+        import time
+        prof = []
+        for b in reversed(runner.batch_sizes):
+            dp_sync._STATE["synced"] = b
+            x, ids, w = T.make_tokens(b, 1000 + 13 * rank + b, dev)
+            seen["rows"].clear()
+            t0 = time.perf_counter()
+            for _ in range(PROFILE_REPLAYS):
+                out = ep(x, ids, w, is_prompt=False)
+            torch.cuda.synchronize()
+            ms = torch.tensor([(time.perf_counter() - t0) * 1e3 / PROFILE_REPLAYS])
+            dist.all_reduce(ms, group=group)
+            prof.append((b, out.shape[0], tuple(sorted(set(seen["rows"]))), T.cos(out, full(x, ids, w)),
+                         float(ms) / world))
         q.put((rank, "ok", res, runner.batch_sizes, (sync_before, counts_before,
-                                                     yres, seen["counts"] - counts_before, cap)))
+                                                     yres, counts_yoco, cap, prof)))
         dist.barrier()
     except Exception:  # noqa: BLE001
         import traceback
@@ -221,11 +251,21 @@ def main():
     print(f"all-reduces per rank: {n_sync} (one per step, {len(STEPS[0])} steps); per-layer count exchanges: {n_counts}")
     ok &= n_sync == len(STEPS[0]) and n_counts == 0
     for r in range(world):
-        _, _, (n, kept, rows, c), n_cc, _cap = results[r][3]
+        _, _, (n, kept, rows, c), n_cc, _cap, _prof = results[r][3]
         good = rows == (300, 140, 140) and n_cc == 1 and c > 0.9999
         print(f"YOCO compact, rank {r}: tokens {n} kept {kept}: EP rows per layer {rows} (expected (300, 140, 140)), "
               f"consumer count exchanges {n_cc} (expected 1), cos {c:.6f}  {'OK' if good else 'MISMATCH'}")
         ok &= good
+    profs = [results[r][3][5] for r in range(world)]
+    for r, prof in enumerate(profs):
+        good = (all(orows == b and eprows == (b,) and c > 0.9999 for b, orows, eprows, c, _ms in prof)
+                and [p[0] for p in prof] == list(reversed(bs)))
+        print(f"profile_decode_perf lockstep, rank {r}: " + "  ".join(f"bs={b}:ep_rows={eprows},cos={c:.6f}"
+                                                                 for b, _o, eprows, c, _ms in prof) + f"  {'OK' if good else 'MISMATCH'}")
+        ok &= good
+    same = all(abs(a[4] - b[4]) < 1e-6 for a, b in zip(profs[0], profs[1]))
+    print(f"averaged curve identical on both ranks: {same}")
+    ok &= same
     print("ALL OK" if ok else "FAILED")
     sys.exit(0 if ok else 1)
 

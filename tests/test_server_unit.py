@@ -312,8 +312,9 @@ def test_validation_before_submit():
         for raw in (b'{"prompt": "x", "temperature": NaN}', b'{"prompt": "x", "top_p": Infinity}', b"\xff\xfe", b"{"):
             st, r = srv.post("/v1/completions", raw)
             assert st == 400, (raw, st, r)
-        body = json.dumps({"prompt": "x" * (1 << 17)}).encode()
-        st, r = srv.post("/v1/completions", body)
+        # over --max-request-bytes: answered from the headers alone, the body is never read
+        st, r = srv.raw(b"POST /v1/completions HTTP/1.1\r\nHost: x\r\nContent-Length: " + str(1 << 17).encode()
+                        + b"\r\n\r\n")
         assert st == 413, (st, r)
         for cl in (b"-5", b"abc"):
             st, r = srv.raw(b"POST /v1/completions HTTP/1.1\r\nHost: x\r\nContent-Length: " + cl + b"\r\n\r\n{}")

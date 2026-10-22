@@ -130,8 +130,9 @@ def test_route_allowlist_and_framing():
         for cl in (b"-1", b"abc"):
             assert raw(port, b"POST /v1/completions HTTP/1.1\r\nHost: x\r\nContent-Length: " + cl + b"\r\n\r\n{}") == 400
         assert raw(port, b"POST /v1/completions HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n") == 400
-        st, _ = request(port, "POST", "/v1/completions", b"x" * (2 << 20))
-        assert st == 413
+        # over the limit: answered from the headers alone (the body is never read; sending it could hit a closed socket)
+        assert raw(port, b"POST /v1/completions HTTP/1.1\r\nHost: x\r\nContent-Length: " + str(2 << 20).encode()
+                   + b"\r\n\r\n") == 413
         assert len(r.calls) == n
     finally:
         httpd.shutdown()

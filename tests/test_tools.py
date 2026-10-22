@@ -153,6 +153,9 @@ CASES = [
     ("content + calls", [("get_weather", {"city": "Wien <Innere Stadt>", "opts": {"hourly": True}}),
                          ("now", {})], "Let me check."),
     ("no-arg call", [("now", {})], ""),
+    ("no-arg call first", [("now", {}), ("get_weather", {"city": "Wien"})], ""),
+    ("no-arg call in the middle", [("get_weather", {"city": "a"}), ("now", {}), ("get_weather", {"city": "b"})], ""),
+    ("several no-arg calls", [("now", {}), ("now", {}), ("get_weather", {"city": "c", "days": 2}), ("now", {})], "x"),
     ("unicode + quotes", [("get_weather", {"city": 'São "Paulo"\nBR', "unit": "celsius"})], "Olá"),
 ]
 
@@ -246,6 +249,19 @@ def test_streaming_malformed():
     # truncated (max_tokens) mid-call: same
     c, _, calls, _ = stream_all(good[:good.index("days")], plan(), False, 2)
     assert len(calls) == 1 and json.loads(calls[0]["args"]) == {"city": "Vienna"}
+
+
+def test_streaming_duplicate_parameter():
+    # parse_final rejects the block (encoding.parse_tool_calls: duplicate parameter name). The stream cannot take back
+    # what it already sent, but it must never emit a duplicate JSON key: the call is closed before it, streaming stops.
+    good = completion_of([("get_weather", {"city": "Vienna", "days": 2}), ("now", {})])
+    dup = good.replace('string="false">2</｜DSML｜ parameter>',
+                       'string="false">2</｜DSML｜ parameter>\n<｜DSML｜ parameter name="days" string="false">3</｜DSML｜ parameter>')
+    assert tools.parse_final(enc(), dup, False, plan())[2] == []
+    for sizes in (1, 3, None):
+        _, _, calls, _ = stream_all(dup, plan(), False, sizes)
+        assert len(calls) == 1 and json.loads(calls[0]["args"]) == {"city": "Vienna", "days": 2}, (sizes, calls)
+        assert calls[0]["args"].count('"days"') == 1
 
 
 def test_streaming_reasoning_without_tools():

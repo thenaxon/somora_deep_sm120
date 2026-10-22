@@ -211,12 +211,16 @@ def main() -> int:
     oks = [r is not None and r[3] and r[0][-1]["choices"][0]["finish_reason"] == "length" for r in res]
     firsts = [r[1] - t0 for r in res]
     ends = [r[2] - t0 for r in res]
-    overlap = max(firsts) < min(ends)  # every stream had produced a token before the first one ended
+    # streams that run at the same time: the most of them that had produced a token and not yet ended at one instant.
+    # (Not "every stream started before the first one ended": with CUDA graphs and MTP the shortest stream, 16
+    # tokens, ends after ~0.2 s, and one late-admitted prefill makes that check flaky on any version.)
+    peak = max(sum(f <= t < e for f, e in zip(firsts, ends)) for t in firsts)
+    overlap = peak >= max(2, N // 2)
     st, h = cl.get("/health")
     check(f"{N} concurrent streams finish", all(oks), f"wall {wall:.1f}s; ttft {min(firsts):.2f}-{max(firsts):.2f}s; "
           f"end {min(ends):.2f}-{max(ends):.2f}s")
     check("concurrent streams overlap (continuous batching)", overlap and h["stats"]["max_running"] > 1,
-          f"engine max_running {h['stats']['max_running']}")
+          f"engine max_running {h['stats']['max_running']}, peak {peak}/{N} streams at once")
 
     # 6. a short request submitted while a long one decodes finishes first. The short one is sent once the long
     # one has streamed a few tokens (not after a fixed sleep: with CUDA graphs a small model decodes 200 tokens

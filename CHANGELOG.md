@@ -3,7 +3,7 @@
 All notable changes to this project are documented here. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0 any minor release may change interfaces.
 
-## [0.2.3] - unreleased
+## [0.2.3] - 2026-10-22
 
 0.2.2 was tested but not tagged; its changes ship with 0.2.3.
 

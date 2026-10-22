@@ -12,6 +12,8 @@
             SM120_EP_B12X_MAX_ROWS (default 4096 = --max-num-batched-tokens) rows per rank; prefill rows are
             padded to multiples of 256 (one prepared plan per size). UNTESTED on 4 GPUs so far: run
             tests/bench_ep_comm.py there first (docs/MULTI_GPU.md).
+
+all_gather_v / reduce_v (nccl, gloo): exact-size prefill collectives for SM120_EP_VARLEN (moe.py).
 """
 
 from __future__ import annotations
@@ -46,6 +48,31 @@ class NcclTransport:
         """inp [world*n, ...] -> out [n, ...] = sum over ranks of their inp[rank*n:(rank+1)*n]."""
         dist.reduce_scatter_tensor(out, inp, op=dist.ReduceOp.SUM, group=self.group)
 
+    def all_gather_v(self, out: torch.Tensor, inp: torch.Tensor, counts: list[int]) -> None:
+        """Exact-size all-gather: inp [counts[rank], ...] -> out [sum(counts), ...] (rank-major, no padding), one ring
+        broadcast per rank with rows (each link carries every source's rows once, not world-1 padded segments)."""
+        off = 0
+        for r, c in enumerate(counts):
+            if c:
+                buf = out[off:off + c]
+                if r == self.rank:
+                    buf.copy_(inp[:c])
+                dist.broadcast(buf, src=dist.get_global_rank(self.group, r), group=self.group)
+            off += c
+
+    def reduce_v(self, inp: torch.Tensor, counts: list[int]) -> torch.Tensor:
+        """Exact-size reduce-scatter: inp [sum(counts), ...] (rank-major) -> this rank's [counts[rank], ...] summed over
+        ranks, one reduce per rank with rows (in place in inp)."""
+        off, mine = 0, None
+        for r, c in enumerate(counts):
+            if c:
+                dist.reduce(inp[off:off + c], dst=dist.get_global_rank(self.group, r), op=dist.ReduceOp.SUM,
+                            group=self.group)
+            if r == self.rank:
+                mine = inp[off:off + c]
+            off += c
+        return mine
+
     def all_gather_counts(self, n: int, device) -> list[int]:
         t = torch.tensor([n], dtype=torch.int64, device=device)
         out = torch.empty((self.world,), dtype=torch.int64, device=device)
@@ -75,6 +102,26 @@ class GlooTransport:
         dist.all_reduce(full, op=dist.ReduceOp.SUM, group=self.group)
         n = out.shape[0]
         out.copy_(full[self.rank * n:(self.rank + 1) * n].to(out.dtype))
+
+    def all_gather_v(self, out: torch.Tensor, inp: torch.Tensor, counts: list[int]) -> None:
+        off = 0
+        for r, c in enumerate(counts):
+            if c:
+                buf = inp[:c].cpu() if r == self.rank else torch.empty((c, *inp.shape[1:]), dtype=inp.dtype)
+                dist.broadcast(buf, src=r, group=self.group)
+                out[off:off + c].copy_(buf)
+            off += c
+
+    def reduce_v(self, inp: torch.Tensor, counts: list[int]) -> torch.Tensor:
+        full = inp.float().cpu()  # fp32 sum, one rounding (as reduce_scatter_sum)
+        off, mine = 0, None
+        for r, c in enumerate(counts):
+            if c:
+                dist.reduce(full[off:off + c], dst=r, op=dist.ReduceOp.SUM, group=self.group)
+            if r == self.rank:
+                mine = full[off:off + c].to(inp.dtype).to(inp.device)
+            off += c
+        return mine
 
     def all_gather_counts(self, n: int, device) -> list[int]:
         parts = [torch.zeros((1,), dtype=torch.int64) for _ in range(self.world)]

@@ -28,7 +28,13 @@ as all ranks are eager or all are captured).
 
 Switches: SM120_EP_IMPL = allgather (default when the EP group has > 1 rank) | off;
           SM120_EP_TRANSPORT = nccl | gloo | b12x (see transport.py); SM120_EP_DECODE_ROWS = <int>;
-          SM120_EP_COMPACT = 1 (default) | 0 (prefill experts on the padded rows too, for A/B).
+          SM120_EP_COMPACT = 1 (default) | 0 (prefill experts on the padded rows too, for A/B);
+          SM120_EP_VARLEN = 0 (default) | ag | 1 | force: exact-size prefill collectives (prototype). The rows of the
+          ranks travel without padding: one ring broadcast per rank instead of the padded all-gather ("ag": the
+          experts then see exactly the rows they see today; the partials go back through the padded reduce-scatter,
+          bit-identical), plus one reduce per rank instead of the padded reduce-scatter ("1"). Used when it moves
+          fewer bytes per link: sum(counts) < (world - 1) * max(counts), e.g. one busy rank of four ("force": always,
+          tests). nccl and gloo transports only.
 """
 
 from __future__ import annotations
@@ -216,10 +222,13 @@ class EPRoutedExperts:
             rows = max(counts)
         if counts is not None and hasattr(self.transport, "round_rows"):
             rows = self.transport.round_rows(rows)  # b12x: plan bucket (padding rows are skipped by the experts)
+        compact = os.environ.get("SM120_EP_COMPACT", "1") != "0"  # 0: experts see the padding rows (A/B only)
+        varlen = _varlen_mode(counts, self.world, self.transport) if compact else "0"
+        if varlen != "0":
+            return self._call_varlen(x, topk_idx, topk_weights, counts, rows, varlen)[:T]
         send = self._pack(x, topk_idx, topk_weights, rows)
         recv = torch.empty((self.world * rows, self.row_bytes), dtype=torch.uint8, device=x.device)
         self.transport.all_gather(recv, send)
-        compact = os.environ.get("SM120_EP_COMPACT", "1") != "0"  # 0: experts see the padding rows (A/B only)
         real = None if (counts is None or not compact or sum(counts) == self.world * rows) \
             else _real_rows(counts, rows, x.device)
         if real is None:
@@ -235,6 +244,34 @@ class EPRoutedExperts:
         out = torch.empty((rows, self.hidden), dtype=part.dtype, device=x.device)
         self.transport.reduce_scatter_sum(out, part.contiguous())
         return out[:T]
+
+    def _call_varlen(self, x, topk_idx, topk_weights, counts, rows: int, mode: str) -> torch.Tensor:
+        """Prefill with exact-size collectives: the experts get the ranks' real rows, rank-major, exactly as the
+        compacted padded path gives them (recv.index_select(0, real rows)), so their output is bit-identical."""
+        send = self._pack(x, topk_idx, topk_weights, counts[self.rank])
+        recv = torch.empty((sum(counts), self.row_bytes), dtype=torch.uint8, device=x.device)
+        self.transport.all_gather_v(recv, send, counts)
+        xg, idl, wg = self._unpack_local(recv)
+        sub = self.inner(xg, idl, wg)  # bf16 [sum(counts), H]
+        if mode == "1":
+            return self.transport.reduce_v(sub.contiguous(), counts)
+        part = torch.zeros((self.world * rows, sub.shape[1]), dtype=sub.dtype, device=x.device)
+        part.index_copy_(0, _real_rows(counts, rows, x.device), sub)
+        out = torch.empty((rows, self.hidden), dtype=part.dtype, device=x.device)
+        self.transport.reduce_scatter_sum(out, part)
+        return out
+
+
+def _varlen_mode(counts, world: int, transport) -> str:
+    """SM120_EP_VARLEN for this prefill call: "0" (padded collectives), "ag" or "1" (see the module docstring)."""
+    v = os.environ.get("SM120_EP_VARLEN", "0").strip().lower()
+    if v in ("0", "", "off") or counts is None or getattr(transport, "name", "") not in ("nccl", "gloo"):
+        return "0"
+    if v not in ("ag", "1", "force"):
+        raise ValueError(f"SM120_EP_VARLEN must be 0|ag|1|force, got {v!r}")
+    if v == "force":
+        return "1"
+    return v if sum(counts) < (world - 1) * max(counts) else "0"
 
 
 _REAL_ROWS: dict = {}

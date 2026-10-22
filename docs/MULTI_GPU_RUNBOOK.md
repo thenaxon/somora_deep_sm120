@@ -188,11 +188,63 @@ curl -s localhost:8100/health | python3 -m json.tool
 - Memory per GPU (estimate): about 73 GB of routed experts (384/4 per layer x 40 layers) plus about 10 GB replicated
   (attention, mHC, embed/head, vision, MTP). That leaves about 10 GB for KV and activations at `0.92`. If it does not
   start, lower `--max-num-batched-tokens` to 2048 first.
-- With CUDA graphs, the DP-wide decode graph-size sync (`SM120_EP_DP_SYNC`, default on) keeps the EP row count at the
-  synced graph size. Measure eager first.
-- `--nextn 5` (DSpark/MTP) can be tried after the plain run.
+- With CUDA graphs, the DP-wide decode graph-size sync (`SM120_EP_DP_SYNC`, default on) makes every rank replay the
+  same graph size in each step. The graphs are captured before any step has been synced, so their EP collectives use
+  the fixed decode capacity (`max_num_seqs` × (1 + nextn) rows per rank); only eager decode uses the synced size.
+  Measure eager first.
+- DSpark/MTP after the plain run: smoke `--nextn 7`, then `--nextn 7 --mtp-varlen`, before any benchmark (§5a).
 - `--max-blocks` caps the KV cache in 128-token blocks. The server default of 256 (32k tokens) is sized for the
   single-GPU test machine; at 4k prompts it queues requests.
+
+## 5a. MTP / DSpark on `--dp 4`
+
+Start the server as in §5 with CUDA graphs (no `--no-graphs`) plus the MTP flags below. Speculative decoding has run
+with CUDA graphs on one GPU (`--dp 1`). On `--dp 4`, each new combination of flags gets a smoke run first.
+
+**Smoke order.** Run each step once, with a 10-minute start-up timeout, before any benchmark:
+1. `--nextn 7` (fixed draft length).
+2. `--nextn 7 --mtp-varlen` (adaptive draft length, [MTP_YOCO.md](MTP_YOCO.md) §9).
+
+For each step:
+- Wait for `/health` with a timeout instead of an unbounded loop, e.g.
+  `timeout 600 sh -c 'until curl -sf localhost:8100/health >/dev/null; do sleep 5; done'`.
+- Then send one chat request with `max_tokens` 64 and a concurrent burst of 16. `eval/scenarios.py realistic
+  --concurrency 1,16 --min-requests 16` does both.
+
+**Expected log lines** (`docker logs`), per rank, in this order:
+- `[sm120_patches] CudaGraphRunner capture done in ...` (main decode graphs)
+- with `--mtp-varlen` only:
+  - `Decode performance curve profiled in ...s: (bs=1 ms=...) ...`: all ranks replay every graph size in lockstep
+    and average the times.
+  - Or `Loaded cached decode performance curve` within one hour of a previous start: rank 0 reads the cache in
+    `/cache/decode_perf` and broadcasts it, so all ranks agree.
+- `[sm120_patches] DFlashCudaGraphRunner capture done in ...` (draft graphs)
+- `engine ready` with `'nextn': 7` (and `'mtp_varlen': True`)
+
+**Hang symptom.** The log stops after `CudaGraphRunner capture done` on some or all ranks, `/health` never answers, and
+the GPUs sit at 100 % utilization with no progress (ranks waiting in a collective). Stop the container
+(`docker stop`; the server shuts down on SIGTERM). Keep the `docker logs` of all ranks (each line is prefixed with the
+rank's port) and report which rank stopped where. A hang during serving shows as `/health` timing out or TPOT
+growing without bound; the same applies.
+
+**Fallback.**
+- If `--mtp-varlen` hangs or errors, drop it: fixed `--nextn 7` is the recommended setting anyway.
+- If `--nextn 7` itself fails, try `--nextn 3`, the configuration measured before.
+- Both are plain server flags; no image change is needed.
+
+**A/B on real text** (after both smokes pass). Same image, same flags otherwise, one server per row:
+
+| run | flags |
+|---|---|
+| n5 | `--nextn 5` |
+| n7 | `--nextn 7` |
+| n7v | `--nextn 7 --mtp-varlen` |
+
+- Command per run: `python3 eval/scenarios.py realistic --url http://host:8100 --concurrency 1,16 --max-tokens 256 --label <run> --out results/<run>`.
+- Compare `output_tok_s`, `tpot_p50_ms` and `tpot_p99_ms`. Also compare `draft_acceptance` (accepted / verified drafts)
+  and `drafts_verified_per_step` (below nextn with `--mtp-varlen`, which trims drafts per step).
+- Prefer `--mtp-varlen` as the default only if n7v beats n7 at concurrency 16 without losing at 1. On the single-GPU test
+  machine they were within noise at ≤ 8 sequences (MTP_YOCO.md §9).
 
 ## 6. Evaluation (`eval/`, from any machine that reaches the ports)
 

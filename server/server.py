@@ -682,6 +682,7 @@ def main() -> int:
                 continue
             rest.append(a)
         return dp_proxy.run(rest, args.dp, args.host, args.port)
+    os.environ["SM120_ENGRAM_SHM_RANK"] = str(args.dp_rank or 0)  # SM120_ENGRAM_PINNED_ALLOC=vmm: rank 0 allocates
     if args.dp_rank is None:  # SM120_ENGRAM_MODE=pinned: the shared table segment exists before the engine starts
         try:
             import sm120_engram

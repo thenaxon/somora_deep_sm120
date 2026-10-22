@@ -796,12 +796,14 @@ def create_shared_tables(ckpt_dir: str, ranks: int = 1) -> int | None:
     layout, size = shared_layout(ckpt_dir)
     per_rank = float(_env("SM120_ENGRAM_RANK_HOST_GB", "5")) * 2**30
     reg = size * _REG_HOST_PER_GIB / 2**30
+    reg_ranks = 1 if _env("SM120_ENGRAM_PINNED_ALLOC", "register") == "vmm" else ranks  # vmm: only the creator pays it
     headroom = float(_env("SM120_ENGRAM_PIN_HEADROOM_GB", "6")) * 2**30
     avail = _mem_available()
-    if avail is not None and size + ranks * (per_rank + reg) + headroom > avail:
+    if avail is not None and size + ranks * per_rank + reg_ranks * reg + headroom > avail:
         raise EngramResidencyError(
-            f"SM120_ENGRAM_MODE=pinned: engram tables {size / 2**30:.1f} GiB + {ranks} ranks x ({per_rank / 2**30:.0f} GiB "
-            f"(SM120_ENGRAM_RANK_HOST_GB) + {reg / 2**30:.1f} GiB registration) + headroom {headroom / 2**30:.0f} GiB "
+            f"SM120_ENGRAM_MODE=pinned: engram tables {size / 2**30:.1f} GiB + {ranks} ranks x {per_rank / 2**30:.0f} GiB "
+            f"(SM120_ENGRAM_RANK_HOST_GB) + {reg_ranks} x {reg / 2**30:.1f} GiB registration + headroom "
+            f"{headroom / 2**30:.0f} GiB "
             f"(SM120_ENGRAM_PIN_HEADROOM_GB) > "
             f"MemAvailable {avail / 2**30:.1f} GiB; pinned tables could OOM the host without swap. Free host memory or "
             f"use SM120_ENGRAM_MODE=host / uring (docs/MULTI_GPU_RUNBOOK.md section 3)")
@@ -811,6 +813,8 @@ def create_shared_tables(ckpt_dir: str, ranks: int = 1) -> int | None:
     os.environ["SM120_ENGRAM_SHM_SIZE"] = str(size)
     os.environ["SM120_ENGRAM_SHM_CKPT"] = os.path.abspath(ckpt_dir)  # the ranks compute the same layout from it
     os.environ["SM120_ENGRAM_SHM_PID"] = str(os.getpid())
+    os.environ["SM120_ENGRAM_SHM_RANKS"] = str(ranks)
+    os.environ["SM120_ENGRAM_SHM_TOKEN"] = os.urandom(8).hex()
     print(f"[sm120_engram] pinned mode: shared segment for {len(layout)} engram tables, {size / 2**30:.1f} GiB "
           f"(memfd {fd}); MemAvailable {(avail or 0) / 2**30:.1f} GiB", flush=True)
     return fd
@@ -820,7 +824,7 @@ def create_shared_tables(ckpt_dir: str, ranks: int = 1) -> int | None:
 # driver vmalloc + 2 MiB of page tables for 4 KiB pages; not reclaimable while registered)
 _REG_HOST_PER_GIB = 14 << 20
 
-_SHM = {}  # this process' mapping of the shared segment: {"mm", "base", "size", "registered"}
+_SHM = {}  # this process' mapping of the shared segment: {"mm", "base", "size", "registered", "alloc", ...}
 
 
 def _shared_mapping() -> dict:
@@ -836,6 +840,198 @@ def _shared_mapping() -> dict:
         base = np.frombuffer(mm, dtype=np.uint8, count=1).ctypes.data
         _SHM.update(mm=mm, base=base, size=size, registered=False)
     return _SHM
+
+
+# SM120_ENGRAM_PINNED_ALLOC=vmm (opt-in): instead of every rank registering the memfd, the creating rank (dp rank 0)
+# allocates the segment once as pinned host memory with cuMemCreate (HOST_NUMA, exportable as a POSIX fd), maps it for
+# its GPU and the CPU (the fill), and hands the fd to the other ranks over a Unix socket; they map it for their GPU
+# only. The driver's per-page bookkeeping (~12 MiB per GiB) then exists once, and the other ranks need no CPU page
+# tables for it (~2 MiB per GiB): 2.6 GiB less host memory per extra rank for the full tables (RTX 5090: a second
+# rank's attach costs 0 MiB VmallocUsed / VmPTE instead of 193 / 32 MiB for 16 GiB). GPU memory and the gather are
+# unchanged. Process exit frees it (no file, nothing in /dev/shm). If the allocation fails, the creating rank
+# registers the memfd instead and tells the other ranks to do the same.
+def _cu_ok(r, what: str):
+    from cuda.bindings import driver as cu
+
+    err = r[0] if isinstance(r, tuple) else r
+    if err != cu.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(f"{what}: {err}")
+    return r[1] if isinstance(r, tuple) and len(r) > 1 else None
+
+
+def _vmm_sock_name() -> str:
+    # abstract socket: per network namespace, so containers on the host network share the names; the random token
+    # of this server's segment keeps them apart
+    return f"\0sm120-engram-vmm-{os.environ['SM120_ENGRAM_SHM_TOKEN']}"
+
+
+def _vmm_map(handle, size: int, device: torch.device, cpu_numa: int | None) -> int:
+    from cuda.bindings import driver as cu
+
+    ptr = _cu_ok(cu.cuMemAddressReserve(size, 2 << 20, 0, 0), "cuMemAddressReserve")
+    _cu_ok(cu.cuMemMap(ptr, size, 0, handle, 0), "cuMemMap")
+    acc = []
+    for lt, lid in [(cu.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE, device.index)] + (
+            [] if cpu_numa is None else [(cu.CUmemLocationType.CU_MEM_LOCATION_TYPE_HOST_NUMA, cpu_numa)]):
+        d = cu.CUmemAccessDesc()
+        d.location.type, d.location.id = lt, lid
+        d.flags = cu.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
+        acc.append(d)
+    _cu_ok(cu.cuMemSetAccess(ptr, size, acc, len(acc)), "cuMemSetAccess")
+    return int(ptr)
+
+
+def _vmm_create(sh: dict, device: torch.device) -> None:
+    """Creating rank: the pinned host allocation, mapped for this GPU and the CPU, exported as a POSIX fd."""
+    import ctypes
+
+    from cuda.bindings import driver as cu
+
+    _cu_ok(cu.cuInit(0), "cuInit")
+    if _env("SM120_ENGRAM_VMM_TEST_FAIL", "0") == "1":  # tests only: exercise the memfd fallback
+        raise RuntimeError("SM120_ENGRAM_VMM_TEST_FAIL=1")
+    try:  # the GPU's NUMA node (one allocation for all ranks: the creating rank's GPU decides)
+        numa = int(_cu_ok(cu.cuDeviceGetAttribute(cu.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID,
+                                                  device.index), "host NUMA id"))
+    except Exception:  # noqa: BLE001
+        numa = 0
+    numa = max(numa, 0)
+    prop = cu.CUmemAllocationProp()
+    prop.type = cu.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
+    prop.location.type, prop.location.id = cu.CUmemLocationType.CU_MEM_LOCATION_TYPE_HOST_NUMA, numa
+    prop.requestedHandleTypes = cu.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+    size = _align(sh["size"], 2 << 20)
+    handle = _cu_ok(cu.cuMemCreate(size, prop, 0), "cuMemCreate")
+    try:
+        ptr = _vmm_map(handle, size, device, numa)
+        fd = int(_cu_ok(cu.cuMemExportToShareableHandle(
+            handle, cu.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0), "export"))
+    except Exception:
+        cu.cuMemRelease(handle)
+        raise
+    sh.update(alloc="vmm", vmm_handle=handle, vmm_fd=fd, vmm_size=size, device_base=ptr, base=ptr,
+              host=np.ctypeslib.as_array(ctypes.cast(ptr, ctypes.POINTER(ctypes.c_uint8)), shape=(sh["size"],)))
+
+
+def _vmm_serve(sock, msg: dict, fd: int | None) -> None:
+    """Creating rank, daemon thread: tell every connecting rank how the segment is shared (and pass the fd)."""
+    import socket
+
+    data = json.dumps(msg).encode()
+    while True:
+        try:
+            conn, _ = sock.accept()
+            with conn:
+                if fd is None:
+                    conn.sendall(data)
+                else:
+                    socket.send_fds(conn, [data], [fd])
+        except OSError:
+            time.sleep(0.1)
+
+
+def _vmm_receive() -> tuple[dict, int | None]:
+    """Other ranks: wait for the creating rank's answer (it may still be loading its weights)."""
+    import socket
+
+    deadline = time.time() + float(_env("SM120_ENGRAM_VMM_WAIT_S", "1800"))
+    while True:
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
+                c.connect(_vmm_sock_name())
+                data, fds, _, _ = socket.recv_fds(c, 4096, 1)
+                return json.loads(data.decode()), (fds[0] if fds else None)
+        except (FileNotFoundError, ConnectionRefusedError):
+            if time.time() > deadline:
+                raise EngramResidencyError("SM120_ENGRAM_PINNED_ALLOC=vmm: the creating rank (dp rank 0) did not share "
+                                           "the engram segment in time (SM120_ENGRAM_VMM_WAIT_S)") from None
+            time.sleep(0.5)
+
+
+def _register_memfd(sh: dict, device: torch.device) -> None:
+    err = torch.cuda.cudart().cudaHostRegister(sh["base"], sh["size"], 0x01 | 0x02)  # Portable | Mapped
+    if int(getattr(err, "value", err)) != 0:
+        raise EngramResidencyError(f"pinned mode: cudaHostRegister of the {sh['size'] / 2**30:.1f} GiB shared "
+                                   f"segment failed: {err} (needs --ulimit memlock=-1)")
+    sh["alloc"] = "memfd"
+    sh["device_base"] = _device_pointer(sh["base"])
+
+
+def _attach_segment(sh: dict, device: torch.device) -> None:
+    """Make the shared segment readable by this rank's GPU: cudaHostRegister of the memfd (default), or with
+    SM120_ENGRAM_PINNED_ALLOC=vmm the one cuMemCreate allocation of the creating rank."""
+    import socket
+
+    t0 = time.time()
+    with torch.cuda.device(device):
+        torch.empty(0, device=device)  # this rank's context is current for the driver calls
+        free0, mi0, pte0 = torch.cuda.mem_get_info(device)[0], _meminfo(), _meminfo("/proc/self/status").get("VmPTE", 0)
+        how = "registered"
+        if _env("SM120_ENGRAM_PINNED_ALLOC", "register") != "vmm":
+            _register_memfd(sh, device)
+        else:
+            rank, sock = os.environ.get("SM120_ENGRAM_SHM_RANK"), None
+            if rank in (None, "0"):  # dp rank 0 creates (unset: the first rank to bind the socket)
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                try:
+                    sock.bind(_vmm_sock_name())
+                    sock.listen(64)
+                except OSError as exc:
+                    sock.close()
+                    sock = None
+                    if rank == "0":
+                        raise EngramResidencyError(f"pinned mode: SM120_ENGRAM_PINNED_ALLOC=vmm: cannot bind the "
+                                                   f"segment's socket ({exc})") from exc
+            if sock is not None:
+                try:
+                    _vmm_create(sh, device)
+                    how, msg = "allocated (cuMemCreate, shared with the other ranks)", {"alloc": "vmm", "size": sh["vmm_size"]}
+                except Exception as exc:  # noqa: BLE001 - fall back to the memfd, for every rank
+                    print(f"[sm120_engram] pinned mode: SM120_ENGRAM_PINNED_ALLOC=vmm failed ({exc}); registering the "
+                          f"memfd instead", flush=True)
+                    ranks = int(os.environ.get("SM120_ENGRAM_SHM_RANKS", "1"))
+                    need = ranks * sh["size"] * _REG_HOST_PER_GIB / 2**30 + float(_env("SM120_ENGRAM_PIN_HEADROOM_GB", "6")) * 2**30
+                    avail = _mem_available()
+                    if avail is not None and sh["size"] + need > avail:
+                        sock.close()
+                        raise EngramResidencyError(
+                            f"pinned mode: the memfd fallback needs {(sh['size'] + need) / 2**30:.1f} GiB, MemAvailable "
+                            f"{avail / 2**30:.1f} GiB; unset SM120_ENGRAM_PINNED_ALLOC") from exc
+                    _register_memfd(sh, device)
+                    msg = {"alloc": "memfd"}
+                threading.Thread(target=_vmm_serve, args=(sock, msg, sh.get("vmm_fd")), name="sm120-engram-vmm",
+                                 daemon=True).start()
+            else:
+                msg, fd = _vmm_receive()
+                if msg.get("alloc") != "vmm":
+                    _register_memfd(sh, device)
+                else:
+                    from cuda.bindings import driver as cu
+
+                    try:
+                        _cu_ok(cu.cuInit(0), "cuInit")
+                        handle = _cu_ok(cu.cuMemImportFromShareableHandle(
+                            fd, cu.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR), "import")
+                        ptr = _vmm_map(handle, int(msg["size"]), device, None)
+                    except Exception as exc:  # noqa: BLE001 - the creating rank filled nothing else: cannot fall back
+                        raise EngramResidencyError(f"pinned mode: importing the shared engram segment failed ({exc}); "
+                                                   f"unset SM120_ENGRAM_PINNED_ALLOC") from exc
+                    finally:
+                        os.close(fd)
+                    sh.update(alloc="vmm", vmm_handle=handle, device_base=ptr)
+                    how = "imported (cuMemCreate)"
+        sh["registered"] = True
+        # the driver's GPU page tables for the mapping (~2 MiB per GiB of 4 KiB host pages) come out of the KV budget
+        cost = free0 - torch.cuda.mem_get_info(device)[0]
+    sh["gpu_cost"] = cost
+    # host side, besides the segment itself: this process' page tables for the mapping (~2 MiB per GiB) and the
+    # driver's per-page bookkeeping in vmalloc (~12 MiB per GiB, RTX 5090); VmallocUsed is system-wide, so ranks
+    # registering at the same time see each other's
+    pte = _meminfo("/proc/self/status").get("VmPTE", 0) - pte0
+    vm = _meminfo().get("VmallocUsed", 0) - mi0.get("VmallocUsed", 0)
+    print(f"[sm120_engram] pinned mode: {how} the shared segment ({sh['size'] / 2**30:.1f} GiB) for "
+          f"{device} in {time.time() - t0:.1f} s, {cost / 2**20:.0f} MiB of GPU memory; host: page tables "
+          f"+{pte / 2**20:.0f} MiB, driver vmalloc +{vm / 2**20:.0f} MiB", flush=True)
 
 
 def open_shared_table(ckpt_dir: str | None, layer_id: int, wloc: TensorLoc, sloc: TensorLoc,
@@ -856,28 +1052,14 @@ def open_shared_table(ckpt_dir: str | None, layer_id: int, wloc: TensorLoc, sloc
     if device.index is None:
         device = torch.device("cuda", torch.cuda.current_device())
     if not sh["registered"]:
-        t0 = time.time()
-        free0, mi0, pte0 = torch.cuda.mem_get_info(device)[0], _meminfo(), _meminfo("/proc/self/status").get("VmPTE", 0)
-        err = torch.cuda.cudart().cudaHostRegister(sh["base"], sh["size"], 0x01 | 0x02)  # Portable | Mapped
-        if int(getattr(err, "value", err)) != 0:
-            raise EngramResidencyError(f"pinned mode: cudaHostRegister of the {sh['size'] / 2**30:.1f} GiB shared "
-                                       f"segment failed: {err} (needs --ulimit memlock=-1)")
-        sh["registered"] = True
-        sh["device_base"] = _device_pointer(sh["base"])
-        # the driver's GPU page tables for the mapping (~2 MiB per GiB of 4 KiB host pages) come out of the KV budget
-        cost = free0 - torch.cuda.mem_get_info(device)[0]
-        sh["gpu_cost"] = cost
-        # host side, besides the segment itself: this process' page tables for the mapping (~2 MiB per GiB) and the
-        # driver's per-page bookkeeping in vmalloc (~12 MiB per GiB, RTX 5090); VmallocUsed is system-wide, so ranks
-        # registering at the same time see each other's
-        pte = _meminfo("/proc/self/status").get("VmPTE", 0) - pte0
-        vm = _meminfo().get("VmallocUsed", 0) - mi0.get("VmallocUsed", 0)
-        print(f"[sm120_engram] pinned mode: registered the shared segment ({sh['size'] / 2**30:.1f} GiB) for "
-              f"{device} in {time.time() - t0:.1f} s, {cost / 2**20:.0f} MiB of GPU memory; host: page tables "
-              f"+{pte / 2**20:.0f} MiB, driver vmalloc +{vm / 2**20:.0f} MiB", flush=True)
+        _attach_segment(sh, device)
 
     def views(off: int, width: int):
-        host = torch.frombuffer(sh["mm"], dtype=torch.uint8, count=rows * width, offset=off).view(rows, width)
+        host = None
+        if sh.get("host") is not None:  # SM120_ENGRAM_PINNED_ALLOC=vmm: only the creating rank maps it for the CPU
+            host = torch.from_numpy(sh["host"][off : off + rows * width]).view(rows, width)
+        elif sh.get("alloc") != "vmm":
+            host = torch.frombuffer(sh["mm"], dtype=torch.uint8, count=rows * width, offset=off).view(rows, width)
         st = torch._C._construct_storage_from_data_pointer(sh["device_base"] + off, device, rows * width)
         dev = torch.empty(0, dtype=torch.uint8, device=device).set_(st, 0, (rows, width), (width, 1))
         return host, dev
@@ -899,6 +1081,9 @@ def fill_shared_tables(threads: int = 8, chunk: int = 64 << 20) -> dict:
     """Read every shared table from its shard into the segment (one process, after load): buffered preads in parallel,
     straight into the shared pages; the shard pages are dropped from the page cache behind the reads."""
     tables = {t.name: t for t in _SHARED_TABLES}.values()
+    if any(t.host_weight is None for t in tables):
+        raise EngramResidencyError("pinned mode: SM120_ENGRAM_PINNED_ALLOC=vmm maps the segment for the CPU only in the "
+                                   "creating rank (dp rank 0), which must run the fill")
     jobs = []
     for t in tables:
         for loc, host in ((t.source[0], t.host_weight), (t.source[1], t.host_scale)):

@@ -76,6 +76,17 @@ with `cudaErrorNotSupported` (measured on the RTX 5090 test machine), so `mlock`
   vmalloc +Y MiB"). Only 2 MiB host pages would shrink it, and those need hugetlbfs or shmem THP, i.e. host settings.
 - The start-up check uses `SM120_ENGRAM_RANK_HOST_GB=5` per rank plus the registration cost above per rank and
   `SM120_ENGRAM_PIN_HEADROOM_GB=6`: tables + 4 x (5 + 2.6) + 6 = 225 GiB for `--dp 4`.
+- **Opt-in, less host memory: `-e SM120_ENGRAM_PINNED_ALLOC=vmm`.** Rank 0 allocates the segment once as pinned host
+  memory (`cuMemCreate`) and passes it to the other ranks over a Unix socket; they map it for their GPU only. The
+  driver's bookkeeping then exists once and the other ranks need no CPU page tables for it: about 2.6 GiB more
+  MemAvailable per extra rank, 7.8 GiB for `--dp 4` (RTX 5090: a second rank's attach costs 0 MiB of vmalloc and page
+  tables instead of 193 + 32 MiB for 16 GiB). The start-up check then counts the registration once: tables + 4 x 5 +
+  2.6 + 6 = 217 GiB for `--dp 4`. Lookups and GPU memory are unchanged (same gather speed inside CUDA graphs, rows
+  bit-exact, still about 0.4 GiB of GPU memory per rank, so keep `--gpu-memory-utilization 0.95`). The tables no
+  longer show up as `Shmem` but as a MemAvailable drop. Process exit frees them; nothing is left in `/dev/shm`, also
+  after SIGKILL. If rank 0 cannot allocate it, every rank falls back to the memfd registration (log line "vmm failed
+  ... registering the memfd instead"; the start-up stops instead if MemAvailable cannot take the fallback). The log
+  says "allocated (cuMemCreate ...)" on rank 0 and "imported (cuMemCreate)" on the other ranks.
 - After the fill the server prints where the host memory is ("read ... GiB of engram tables ... MemAvailable X GiB
   (Shmem, AnonPages, VmallocUsed, PageTables, page cache, SUnreclaim)"). On the 4-GPU host about 14 GiB stay
   available after the fill: about 232 GiB before start - 188.8 GiB tables - 4 x (about 4.5 GiB per rank + 2.6 GiB

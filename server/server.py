@@ -550,7 +550,56 @@ def _sigterm(signum, frame):
     traceback from inside their queue read."""
     if os.getpid() != _MAIN_PID:
         os._exit(0)
+    if _TERM_AT:  # already shutting down: a second SIGTERM must not interrupt the shutdown itself
+        return
+    _TERM_AT.append(time.monotonic())
     raise KeyboardInterrupt
+
+
+_TERM_AT: list[float] = []  # when the first SIGTERM arrived (time.monotonic)
+# seconds the shutdown waits for the engine thread (stop at the next loop iteration, then LLM.close); a step in
+# flight finishes first. With --dp the proxy kills a rank that is not gone after SM120_SHUTDOWN_TIMEOUT.
+_ENGINE_STOP_TIMEOUT = 5.0
+
+
+def _shutdown(httpd, app, dp_rank) -> None:
+    """Stop serving, stop and close the engine, then leave with os._exit: the interpreter teardown after that only
+    frees what process exit frees anyway (CUDA context, the cudaHostRegister of a pinned engram segment, the
+    caching allocator), and with a pinned segment of 100+ GiB it takes seconds. atexit handlers still run first
+    (multiprocessing finalizers and children, stats dumps), under a watchdog. SM120_FAST_EXIT=0: the normal
+    interpreter exit instead (for comparisons)."""
+    t0 = _TERM_AT[0] if _TERM_AT else time.monotonic()
+    who = "" if dp_rank is None else f"rank {dp_rank}: "
+    log.info("shutdown: %sstopping (%s)", who, "SIGTERM" if _TERM_AT else "interrupted")
+    httpd.server_close()
+    clean = app.engine.shutdown(timeout=_ENGINE_STOP_TIMEOUT)
+    fast = os.environ.get("SM120_FAST_EXIT", "1") != "0"
+    log.info("shutdown: %s%s exit %.2f s after %s", who, "fast" if fast else "interpreter",
+             time.monotonic() - t0, "SIGTERM" if _TERM_AT else "the interrupt")
+    if not fast:
+        return
+    _fast_exit(0 if clean else 1)
+
+
+def _fast_exit(code: int) -> None:
+    """atexit handlers (under a watchdog), flush, os._exit(code)."""
+    if os.environ.get("SM120_FAST_EXIT", "1") == "0":
+        sys.exit(code)
+    threading.Timer(3.0, os._exit, (code,)).start()  # an atexit handler stuck behind a hung engine thread
+    try:
+        import atexit
+
+        atexit._run_exitfuncs()
+    except BaseException:  # noqa: BLE001
+        pass
+    for h in logging.getLogger().handlers:
+        try:
+            h.flush()
+        except Exception:  # noqa: BLE001
+            pass
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)
 
 
 def _exit_start_failed(exc: BaseException, dp_rank) -> None:
@@ -695,7 +744,17 @@ def main() -> int:
             if a == "--force-proxy" or a.startswith(("--host=", "--port=", "--dp=")):
                 continue
             rest.append(a)
-        return dp_proxy.run(rest, args.dp, args.host, args.port)
+        try:
+            rc = dp_proxy.run(rest, args.dp, args.host, args.port)
+        except SystemExit as exc:  # start-up failure, after the ranks were stopped
+            if exc.code is None or isinstance(exc.code, int):
+                rc = exc.code or 0
+            else:
+                print(exc.code, file=sys.stderr)
+                rc = 1
+        # the ranks are gone and the segment is released: skip the interpreter teardown (torch etc.), see _shutdown
+        log.info("shutdown: proxy exiting with %d", rc)
+        _fast_exit(rc)
     os.environ["SM120_ENGRAM_SHM_RANK"] = str(args.dp_rank or 0)  # SM120_ENGRAM_PINNED_ALLOC=vmm: rank 0 allocates
     if args.dp_rank is None:  # SM120_ENGRAM_MODE=pinned: the shared table segment exists before the engine starts
         try:
@@ -724,8 +783,7 @@ def main() -> int:
     except KeyboardInterrupt:
         pass
     finally:
-        httpd.server_close()
-        app.engine.shutdown()
+        _shutdown(httpd, app, args.dp_rank)
     return 0
 
 

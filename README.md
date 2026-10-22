@@ -47,7 +47,7 @@ Pinned versions are listed in [COMPATIBILITY.md](COMPATIBILITY.md).
 git clone <this repository> somora_deep_sm120 && cd somora_deep_sm120
 docker build -t somora_deep_sm120:0.3.0 -f docker/Dockerfile .      # ~6 min; clones DeepInfer at the pinned commit
 
-docker run -d --name sm120-serve --gpus all --ipc=host --shm-size=32g --ulimit memlock=-1 --stop-timeout 120 \
+docker run -d --name sm120-serve --gpus all --ipc=host --shm-size=32g --ulimit memlock=-1 --stop-timeout 30 \
   -p 8000:8000 -v /models/DeepSeek-V4.1-Flash-1017:/models/ds41:ro -v sm120-cache:/cache \
   -e SM120_EP_IMPL=allgather -e SM120_ENGRAM_MODE=pinned -e DEEPINFER_MULTIMODAL_POOL_SIZE_GB=1 \
   somora_deep_sm120:0.3.0 --model /models/ds41 --served-model-name deepseek-v4.1-flash \
@@ -60,9 +60,9 @@ curl -s localhost:8000/v1/chat/completions -H 'content-type: application/json' \
 ```
 
 - Mount a volume on `/cache`: the first start compiles many kernels (b12x, TileLang, Triton), and later starts reuse them.
-- `--stop-timeout 120` gives the four ranks time to shut down on `docker stop`. With Docker's default of 10 s they are
-  killed instead; that leaves nothing behind (GPU memory, pinned RAM and `/dev/shm` are freed), but skips the orderly
-  shutdown.
+- `--stop-timeout 30` gives the four ranks time to shut down on `docker stop`. Freeing the pinned engram tables
+  takes several seconds, close to Docker's default of 10 s. If the timeout runs out, Docker kills the ranks; that
+  leaves nothing behind (GPU memory, pinned RAM and `/dev/shm` are freed), but skips the orderly shutdown.
 - Read [docs/MULTI_GPU_RUNBOOK.md](docs/MULTI_GPU_RUNBOOK.md) before the first start: preflight checks, engram modes by
   free RAM, NCCL P2P, what the start log should show, and how to evaluate against another endpoint.
 - `--help` lists all options. CUDA graphs are on by default (`--no-graphs` turns them off).

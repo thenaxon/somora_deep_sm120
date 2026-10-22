@@ -11,6 +11,18 @@ before 1.0 any minor release may change interfaces.
   `--dp` (docs/SERVER.md).
 
 ### Fixed
+- `docker stop` with `--dp`: the ranks no longer leave their engine loops one by one. Up to v0.3.0 the first rank to
+  get SIGTERM left, and the others waited for it in the DP all-reduce of `has_unfinished_requests()` until Docker
+  killed them (on the 4-GPU host every `docker stop` ended with exit 137 after 15-20 s). The stop request now
+  travels in that all-reduce, so all ranks stop at the same iteration and close together.
+  - After `LLM.close()` the processes leave with `os._exit` and skip the interpreter teardown.
+  - The proxy stops all ranks against one 7 s deadline (`SM120_SHUTDOWN_TIMEOUT`) and then kills the rest with
+    their process group.
+  - It frees the pinned engram segment from parallel threads: the segment is now several memfds,
+    `SM120_ENGRAM_SHM_CHUNK_GB` (default 8). One memfd took about 12 s to free for the full tables.
+  - Every stage logs a `shutdown: ...` line.
+  - Test machine, one rank, 39.3 GiB pinned: 5.9 -> 2.9 s; `docker run` examples now use `--stop-timeout 30`
+    (docs/SERVER.md).
 - b12x's deterministic MoE: `SM120_MOE_DETERMINISTIC=1` (also on with `DEEPINFER_BATCH_INVARIANT=1` or `B12X_DYNAMIC_DETERMINISTIC_OUTPUT=1`) gave
   wrong MoE outputs in two cases, both b12x 1.5.1 `deterministic_output` bugs:
   - plans with `dynamic_tile_m` < 64 (b12x's own choice, e.g. E=16 at 5-64 tokens, E=96 at 65-512): cos ~0 against

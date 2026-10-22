@@ -293,6 +293,31 @@ ranks (MIN all-reduce, `scheduler.hpp:296-340`).
   vLLM-style mixed batches would need a scheduler change.
 - `--dp 1`: `auto` = 1 / 1 (the vote is trivial; no extra delay).
 
+**Shutdown (SIGTERM, `docker stop`).** The server is PID 1 in the image. Every stage logs one `shutdown: ...` line
+with its time:
+1. The `--dp` proxy sends SIGTERM to all ranks at once.
+2. Each rank stops its engine loop. With `--dp > 1` the stop request travels in the same DP all-reduce as
+   `has_unfinished_requests()`, so all ranks stop at the same iteration and close their engines together. Up to v0.3.0
+   a rank left the loop on its own, and the others waited in the collective until they were killed.
+3. `LLM.close()`, then the atexit handlers, then `os._exit`. The interpreter teardown would only free what process
+   exit frees anyway.
+4. The proxy waits for the ranks against one deadline, `SM120_SHUTDOWN_TIMEOUT` (default 7 s). A rank still there
+   is killed together with its process group (its multimodal workers).
+5. The proxy frees the pinned engram segment, one memfd per thread (`SM120_ENGRAM_SHM_CHUNK_GB`, docs/ENGRAM.md), and
+   exits.
+
+Requests in flight are dropped. `SM120_FAST_EXIT=0` keeps the normal interpreter exit (for comparisons).
+
+Measured on the RTX 5090 test machine with one rank behind the proxy:
+- engram host: `docker stop` 1.2 s;
+- pinned, 9.8 / 19.7 / 39.3 GiB segment: 1.9 / 1.9 / 2.9 s;
+- vmm: 1.3 / 1.4 / 2.6 s;
+- v0.3.0 with 39.3 GiB: 5.9 s.
+
+Stages at 39.3 GiB: engine stop and close 0.6 s, rank process exit 1.6 s, segment release 0.5 s. With the segment in
+one memfd the release takes 2.3 s. The rank exit grows by about 0.03 s per GiB of pinned segment (the driver's
+unregister / free).
+
 ## Profiling a prefill (`SM120_PROFILE_PREFILL`)
 
 `-e SM120_PROFILE_PREFILL=N` makes every engine process profile the N-th request it admits (torch profiler, CPU +

@@ -28,6 +28,7 @@ import http.client
 import json
 import logging
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -179,14 +180,14 @@ def nccl_p2p_env(dp: int) -> dict:
 def run(argv: list[str], dp: int, host: str, port: int) -> int:
     """argv: server.py arguments without --dp/--host/--port. Spawns the ranks and serves the proxy until interrupted."""
     ports = [port + 1 + r for r in range(dp)]
-    shm_fd = None
+    shm_fds = None
     if os.environ.get("SM120_ENGRAM_MODE") == "pinned":  # one shared, pinned copy of the engram tables for all ranks
         ckpt = argv[argv.index("--ckpt") + 1] if "--ckpt" in argv else next(
             (a.split("=", 1)[1] for a in argv if a.startswith("--ckpt=")), None)
         import sm120_engram
 
         try:
-            shm_fd = sm120_engram.create_shared_tables(ckpt, ranks=dp)
+            shm_fds = sm120_engram.create_shared_tables(ckpt, ranks=dp)
         except sm120_engram.EngramResidencyError as exc:
             raise SystemExit(f"engram tables cannot be pinned: {exc}") from None
     env = dict(os.environ, **nccl_p2p_env(dp))
@@ -195,7 +196,8 @@ def run(argv: list[str], dp: int, host: str, port: int) -> int:
         cmd = [sys.executable, __file__.replace("dp_proxy.py", "server.py"), *argv, "--dp", str(dp), "--dp-rank", str(r),
                "--host", "127.0.0.1", "--port", str(p)]
         log.info("rank %d: %s", r, " ".join(cmd))
-        procs.append(subprocess.Popen(cmd, env=env, pass_fds=(shm_fd,) if shm_fd is not None else ()))
+        # own process group: a rank that has to be killed takes its children (multimodal workers) with it
+        procs.append(subprocess.Popen(cmd, env=env, pass_fds=shm_fds or (), start_new_session=True))
     start_failed = False
     try:
         t0 = time.time()
@@ -232,13 +234,44 @@ def run(argv: list[str], dp: int, host: str, port: int) -> int:
     except KeyboardInterrupt:
         pass
     finally:
-        for p in procs:
-            p.terminate()
-        for p in procs:
-            try:  # a failed start-up: ranks blocked in NCCL do not unwind on SIGTERM, do not wait a minute each
-                p.wait(timeout=10 if start_failed else 60)
-            except subprocess.TimeoutExpired:
-                log.warning("rank pid %d did not exit after SIGTERM: killing it", p.pid)
-                p.kill()
-                p.wait()
+        _stop_ranks(procs, start_failed)
+        if shm_fds:  # the last references to the pinned segment: the kernel frees its pages here, one memfd per thread
+            import sm120_engram
+
+            log.info("shutdown: engram segment (%d memfds) released in %.2f s", len(shm_fds),
+                     sm120_engram.release_shared_fds(shm_fds))
     return 0
+
+
+def _stop_ranks(procs: list, start_failed: bool) -> None:
+    """SIGTERM every rank at once, wait for all of them against one deadline, then SIGKILL the rest. The ranks agree
+    on the stop in their engine loops (EngineLoop._poll) and close together; one that is still there at the
+    deadline (blocked in a collective, e.g. after a failed start-up) is killed. SM120_SHUTDOWN_TIMEOUT (default 7 s)
+    keeps the whole stop inside docker stop's default 10 s grace period."""
+    t0 = time.monotonic()
+    timeout = float(os.environ.get("SM120_SHUTDOWN_TIMEOUT", "7"))
+    log.info("shutdown: stopping %d ranks (SIGTERM, %.0f s until SIGKILL)", len(procs), timeout)
+    for p in procs:
+        if p.poll() is None:
+            p.terminate()
+    deadline = t0 + timeout
+    left = dict(enumerate(procs))
+    while left:
+        for r, p in list(left.items()):
+            if p.poll() is not None:
+                log.info("shutdown: rank %d exited with %s after %.2f s", r, p.returncode, time.monotonic() - t0)
+                del left[r]
+        if not left or time.monotonic() >= deadline:
+            break
+        time.sleep(0.05)
+    for r, p in left.items():
+        log.warning("shutdown: rank %d (pid %d) still running after %.1f s: killing it%s", r, p.pid,
+                    time.monotonic() - t0, " (failed start-up)" if start_failed else "")
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except OSError:
+            p.kill()
+    for r, p in left.items():
+        p.wait()
+        log.info("shutdown: rank %d killed, gone after %.2f s", r, time.monotonic() - t0)
+    log.info("shutdown: all ranks stopped after %.2f s", time.monotonic() - t0)

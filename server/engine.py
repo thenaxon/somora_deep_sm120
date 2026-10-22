@@ -113,6 +113,8 @@ class EngineLoop:
         # has_unfinished_requests() is an all-reduce over the DP group: with several ranks, an idle rank must keep
         # polling quickly or it delays the other ranks' steps (docs/MULTI_GPU.md)
         self.idle_poll = 0.5 if dp_size == 1 else 0.005
+        self.dp_size = dp_size
+        self._poll_group = None  # (group, device) of the DP-wide unfinished/stop all-reduce, see _poll
         self.prefix_cache = None
         self.max_model_len = max_model_len
         self._inbox: "queue.Queue[tuple]" = queue.Queue()
@@ -158,10 +160,18 @@ class EngineLoop:
         if eng is not None:
             eng.prefetch_cancel(request_id)
 
-    def shutdown(self) -> None:
+    def shutdown(self, timeout: float = 60.0) -> bool:
+        """Stop the loop and close the engine on its thread; False if that did not finish within timeout (e.g. a rank
+        of the DP group is gone and the engine thread waits in a collective for it)."""
+        t0 = time.perf_counter()
         self._stop.set()
         self._inbox.put(("noop", None))
-        self._thread.join(timeout=60)
+        self._thread.join(timeout=timeout)
+        if self._thread.is_alive():
+            log.warning("shutdown: engine thread still running after %.1f s, not waiting for it", timeout)
+            return False
+        log.info("shutdown: engine thread done after %.2f s", time.perf_counter() - t0)
+        return True
 
     @property
     def vision(self) -> bool:
@@ -268,8 +278,10 @@ class EngineLoop:
         log.info("engine ready: %s", self.cfg)
         pending_flush = False
         try:
-            while not self._stop.is_set():
-                unfinished = self.engine.has_unfinished_requests()
+            while True:
+                unfinished, stop = self._poll()
+                if stop:
+                    break
                 self._drain(block=not unfinished and not pending_flush)
                 unfinished = self.engine.has_unfinished_requests()
                 if unfinished:
@@ -300,10 +312,43 @@ class EngineLoop:
         # Orderly shutdown: close the engine here, on its own thread, while the interpreter is intact. Left to
         # LLMEngine.__del__ at interpreter exit, unpinning the multimodal pool fails (ImportError: sys.meta_path
         # is None) and the still exported pool mapping raises BufferError in SharedMemory.__del__.
+        log.info("shutdown: engine loop stopped (%d running requests dropped)", len(self._live))
+        t0 = time.perf_counter()
         try:
             self.llm.close()
         except Exception:  # noqa: BLE001
             log.exception("engine close failed")
+        log.info("shutdown: engine closed in %.2f s", time.perf_counter() - t0)
+
+    def _poll(self) -> tuple[bool, bool]:
+        """(has_unfinished_requests(), stop), both agreed over the DP group.
+
+        With DP > 1, LLMEngine.has_unfinished_requests() is an all-reduce (MAX) over the DP group, and every rank's
+        loop makes the same calls in the same order. A rank that left its loop on its own SIGTERM would leave the
+        others waiting in that all-reduce (and in the step after it) until they are killed. So the stop request
+        goes into the same all-reduce as a second element: every rank stops at the same iteration, and closes its
+        engine with the others. Same group and device as DeepInfer's has_unfinished_requests."""
+        stop = self._stop.is_set()
+        if self.dp_size <= 1:
+            return self.engine.has_unfinished_requests(), stop
+        import torch
+        import torch.distributed as dist
+
+        if self._poll_group is None:
+            from deepinfer import envs
+            from deepinfer.model_executor.parallel_utils.parallel_state import PG
+
+            self._poll_group = ((PG.cpu_data_parallel_group(), "cpu") if envs.DEEPINFER_ZERO_OVERHEAD_SCHEDULING
+                                else (PG.data_parallel_group(), "cuda"))
+        group, device = self._poll_group
+        e = self.engine
+        unfinished = e.scheduler.has_unfinished_seqs() or e.so_builder_has_pending()
+        if group.size() <= 1:
+            return unfinished, stop
+        t = torch.tensor([int(unfinished), int(stop)], dtype=torch.int64, device=device)
+        dist.all_reduce(t, op=dist.ReduceOp.MAX, group=group)
+        u, s = t.tolist()
+        return u > 0, s > 0
 
     def _drain(self, block: bool) -> None:
         """Apply queued commands; block (with a timeout, so shutdown is seen) only when the engine is idle."""

@@ -1,4 +1,4 @@
-"""SM120_ENGRAM_MODE=pinned check: one memfd segment (both tables truncated to SM120_ENGRAM_SHM_MAX_ROWS rows),
+"""SM120_ENGRAM_MODE=pinned check: one shared segment of memfds (both tables truncated to SM120_ENGRAM_SHM_MAX_ROWS rows),
 two rank processes register it and gather on the GPU; memory counted once; rows bit-exact against the shard files."""
 import multiprocessing as mp, os, sys, time
 # usage (container, GPU): SM120_ENGRAM_MODE=pinned [SM120_ENGRAM_SHM_MAX_ROWS=32000000] [SM120_ENGRAM_PINNED_ALLOC=vmm]
@@ -66,7 +66,7 @@ def rank(r, q, filled, done):
 if __name__ == "__main__":
     import sm120_engram as E
     print("before:", mi(), flush=True)
-    fd = E.create_shared_tables(CKPT, ranks=2)
+    fds = E.create_shared_tables(CKPT, ranks=2)
     print("segment created:", mi(), flush=True)
     ctx = mp.get_context("spawn")
     q, filled, done = ctx.Queue(), ctx.Event(), ctx.Event()
@@ -88,6 +88,6 @@ if __name__ == "__main__":
     print("both ranks done:", mi(), flush=True)
     done.set()
     for p in ps: p.join()
-    os.close(fd)
+    print(f"segment released in {E.release_shared_fds(fds):.2f} s ({len(fds)} memfds)", flush=True)
     print("after exit:", mi(), flush=True)
     sys.exit(0 if all_ok else 1)

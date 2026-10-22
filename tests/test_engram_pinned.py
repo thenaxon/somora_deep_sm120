@@ -1,7 +1,8 @@
 """SM120_ENGRAM_MODE=pinned check: one memfd segment (both tables truncated to SM120_ENGRAM_SHM_MAX_ROWS rows),
 two rank processes register it and gather on the GPU; memory counted once; rows bit-exact against the shard files."""
 import multiprocessing as mp, os, sys, time
-# usage (container, GPU): SM120_ENGRAM_MODE=pinned [SM120_ENGRAM_SHM_MAX_ROWS=32000000] python3 tests/test_engram_pinned.py [CKPT]
+# usage (container, GPU): SM120_ENGRAM_MODE=pinned [SM120_ENGRAM_SHM_MAX_ROWS=32000000] [SM120_ENGRAM_PINNED_ALLOC=vmm]
+#   python3 tests/test_engram_pinned.py [CKPT]
 #   --ulimit memlock=-1; SM120_ENGRAM_SHM_MAX_ROWS truncates the tables so that they fit a small machine.
 #   Prints: memory before/after (the segment must count once for both ranks), registration and fill times, GPU gather
 #   speed, and "exact (True, True, ...)" per rank: rows bit-identical to preads of the shard, graph replay == eager.
@@ -12,6 +13,7 @@ def mi():
     d = {l.split(":")[0]: int(l.split()[1]) / 2**20 for l in open("/proc/meminfo")}
     return " ".join(f"{k} {d[k]:.1f}" for k in ("MemAvailable", "Shmem", "Mlocked", "AnonPages", "Cached"))
 def rank(r, q, filled, done):
+    os.environ["SM120_ENGRAM_SHM_RANK"] = str(r)  # SM120_ENGRAM_PINNED_ALLOC=vmm: rank 0 allocates, rank 1 imports
     import torch, numpy as np, sm120_engram as E
     from deep_ep._engram import EngramBuffer
     torch.cuda.set_device(0)

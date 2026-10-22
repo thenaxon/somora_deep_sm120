@@ -9,7 +9,8 @@ experts, gloo transport) on graph-size rows with is_prompt=False. Ranks get diff
 placeholder steps. Prefill steps (real or placeholder, one dummy token) run the EP layer PREFILL_LAYERS times
 with is_prompt=True. Checks: both ranks pick the same graph size every decode step (= select(max of local
 sizes)), both selects inside a step agree, every prefill layer pads to the step's DP-max token count without a
-per-layer count exchange, one all-reduce per step, and the EP output of the real rows matches a full-expert run.
+per-layer count exchange, one all-reduce per step, the start-up capture (no step synced yet) uses the graph size as
+EP rows, and the EP output of the real rows matches a full-expert run.
 """
 
 from __future__ import annotations
@@ -107,6 +108,20 @@ def _worker(rank: int, world: int, init_file: str, q):
         dp_sync.patch_graph_runner(CudaGraphRunner)
         dp_sync._STATE["active"] = True
         wk = Worker()
+        # start-up capture: no step synced yet, every rank captures the same graph sizes in the same order, so the EP
+        # layer must take the graph size as rows (not the fixed capacity, here 10**6)
+        import sm120_ep.moe as M
+        cap, cap_orig = [], M._capturing
+        assert dp_sync._STATE["synced"] is None
+        M._capturing = lambda: True
+        try:
+            for g in reversed(runner.batch_sizes):
+                x, ids, w = T.make_tokens(g, 5 * rank + g, dev)
+                seen["rows"].clear()
+                out = ep(x, ids, w, is_prompt=False)
+                cap.append((g, tuple(seen["rows"]), T.cos(out, full(x, ids, w))))
+        finally:
+            M._capturing = cap_orig
         res = []
         for kind, n in STEPS[rank]:
             prompt = kind == "p"
@@ -148,7 +163,7 @@ def _worker(rank: int, world: int, init_file: str, q):
             YWorker().execute_model_step(True, True, None, None)
         os.environ.pop("DEEPINFER_YOCO_PREFILL_TRUNCATION_MODE", None)
         q.put((rank, "ok", res, runner.batch_sizes, (sync_before, counts_before,
-                                                     yres, seen["counts"] - counts_before)))
+                                                     yres, seen["counts"] - counts_before, cap)))
         dist.barrier()
     except Exception:  # noqa: BLE001
         import traceback
@@ -195,11 +210,18 @@ def main():
             good = all(g == want and rows == want and (gz is None or gz == g) and c > 0.9999 for _n, g, gz, c, rows in row)
             print(f"step {i}: expected graph {want}: {line}  {'OK' if good else 'MISMATCH'}")
         ok &= good
-    n_sync, n_counts, _, _ = results[0][3]
+    for r in range(world):
+        cap = results[r][3][4]
+        good = all(rows == (g,) and c > 0.9999 for g, rows, c in cap)
+        print(f"capture (no step synced), rank {r}: graph size -> EP rows "
+              f"{', '.join(f'{g}->{rows[0] if rows else None}' for g, rows, _c in cap)}, "
+              f"min cos {min(c for *_x, c in cap):.6f}  {'OK' if good else 'MISMATCH'}")
+        ok &= good
+    n_sync, n_counts, *_ = results[0][3]
     print(f"all-reduces per rank: {n_sync} (one per step, {len(STEPS[0])} steps); per-layer count exchanges: {n_counts}")
     ok &= n_sync == len(STEPS[0]) and n_counts == 0
     for r in range(world):
-        _, _, (n, kept, rows, c), n_cc = results[r][3]
+        _, _, (n, kept, rows, c), n_cc, _cap = results[r][3]
         good = rows == (300, 140, 140) and n_cc == 1 and c > 0.9999
         print(f"YOCO compact, rank {r}: tokens {n} kept {kept}: EP rows per layer {rows} (expected (300, 140, 140)), "
               f"consumer count exchanges {n_cc} (expected 1), cos {c:.6f}  {'OK' if good else 'MISMATCH'}")

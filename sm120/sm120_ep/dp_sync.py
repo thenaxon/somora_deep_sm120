@@ -15,8 +15,8 @@ Mechanism (one gloo all-reduce MAX per decode step on DeepInfer's cpu_data_paral
     graph, and DeepInfer pads the batch with its own padding_seq_metadata_list as usual;
   * DFlashCudaGraphRunner.select(req_cnt) (MTP draft graph; its MoE layers are EP too) all-reduces its request
     count the same way.
-Capture is unaffected (all ranks capture the same batch-size list in the same order); replay picks the synced
-size. The extra cost is one localhost gloo all-reduce of an int (~tens of us) per decode step (+1 with MTP).
+Capture needs no sync: all ranks capture the same batch-size list in the same order, so the EP layer captures
+each graph with its own size as rows (moe.py, while dp_sync is active); replay picks the synced size. The extra cost is one localhost gloo all-reduce of an int (~tens of us) per decode step (+1 with MTP).
 
 Prefill steps (eager) are synced the same way: the step's token count (sum of seqlen_q, 1 for a placeholder
 step, whose forward runs DeepInfer's one-token placeholder sequence) is all-gathered once per step, and every

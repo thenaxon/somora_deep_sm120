@@ -116,7 +116,39 @@ def _worker(rank: int, world: int, init_file: str, q):
                 res.append((n,) + wk.execute_model_step(True, False, [_Seq(m) for m in n], _SchedOut(sum(n))))
             else:
                 res.append((n,) + wk.execute_model_step(False, False, None, _SchedOut(n)))
-        q.put((rank, "ok", res, runner.batch_sizes, (dp_sync._STATE["n_sync"], seen["counts"])))
+        counts_before, sync_before = seen["counts"], dp_sync._STATE["n_sync"]
+        # YOCO compact truncation: layers >= n_prefill_layer (here 20) see only the kept rows (rank 0: the last 140
+        # of 300; rank 1: its 1-token placeholder). One row-count exchange at the first consumer layer, then the
+        # consumer layers pad to the kept rows.
+        os.environ["DEEPINFER_YOCO_PREFILL_TRUNCATION_MODE"] = "compact"
+        dp_sync._STATE["yoco_boundary"] = 20
+        hi = sm120_moe.B12xRoutedExperts(T.make_moe(wts, range(rank * nl, (rank + 1) * nl), dev, layer_idx=25))
+        ep_hi = EPRoutedExperts(hi, group=None, num_local_experts=nl, ep_rank=rank, hidden=T.K, topk=T.TOPK,
+                                decode_rows=10 ** 6, transport=tr)
+        yres = None
+
+        class YWorker(Worker):
+            def execute_model_step(self, is_prompt, is_placeholder, seq_metadata_list=None, scheduler_outputs=None):
+                nonlocal yres
+                n = 1 if is_placeholder else sum(sq.seqlen_q for sq in seq_metadata_list)
+                kept = min(n, 140)
+                x, ids, w = T.make_tokens(n, 13 * rank + n, dev)
+                seen["rows"].clear()
+                c_lo = T.cos(ep(x, ids, w, is_prompt=True), full(x, ids, w))
+                xk, ik, wk_ = x[-kept:], ids[-kept:], w[-kept:]
+                ref_k = full(xk, ik, wk_)
+                c_hi = min(T.cos(ep_hi(xk, ik, wk_, is_prompt=True), ref_k) for _ in range(2))
+                yres = (n, kept, tuple(seen["rows"]), min(c_lo, c_hi))
+                return None
+
+        dp_sync.patch_worker(YWorker, group)
+        if rank == 0:
+            YWorker().execute_model_step(True, False, [_Seq(300)], _SchedOut(300))
+        else:
+            YWorker().execute_model_step(True, True, None, None)
+        os.environ.pop("DEEPINFER_YOCO_PREFILL_TRUNCATION_MODE", None)
+        q.put((rank, "ok", res, runner.batch_sizes, (sync_before, counts_before,
+                                                     yres, seen["counts"] - counts_before)))
         dist.barrier()
     except Exception:  # noqa: BLE001
         import traceback
@@ -163,9 +195,15 @@ def main():
             good = all(g == want and rows == want and (gz is None or gz == g) and c > 0.9999 for _n, g, gz, c, rows in row)
             print(f"step {i}: expected graph {want}: {line}  {'OK' if good else 'MISMATCH'}")
         ok &= good
-    n_sync, n_counts = results[0][3]
+    n_sync, n_counts, _, _ = results[0][3]
     print(f"all-reduces per rank: {n_sync} (one per step, {len(STEPS[0])} steps); per-layer count exchanges: {n_counts}")
     ok &= n_sync == len(STEPS[0]) and n_counts == 0
+    for r in range(world):
+        _, _, (n, kept, rows, c), n_cc = results[r][3]
+        good = rows == (300, 140, 140) and n_cc == 1 and c > 0.9999
+        print(f"YOCO compact, rank {r}: tokens {n} kept {kept}: EP rows per layer {rows} (expected (300, 140, 140)), "
+              f"consumer count exchanges {n_cc} (expected 1), cos {c:.6f}  {'OK' if good else 'MISMATCH'}")
+        ok &= good
     print("ALL OK" if ok else "FAILED")
     sys.exit(0 if ok else 1)
 

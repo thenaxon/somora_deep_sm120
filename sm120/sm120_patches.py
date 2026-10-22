@@ -471,6 +471,28 @@ def _wrap_graph_capture(cls, label: str) -> None:
     cls.capture = capture
 
 
+@when_imported("deepinfer.hugging_face.config")
+def _patch_yoco_boundary(mod):
+    """P13 (EP + YOCO compact): record n_prefill_layer, the first YOCO consumer layer, for sm120_ep (its consumer
+    layers exchange the kept-row counts once per prefill step instead of padding to the step's tokens)."""
+    orig = getattr(mod, "_n_prefill_layer", None)
+    if orig is None or getattr(orig, "_sm120", False):
+        return
+
+    def _n_prefill_layer(*args, **kwargs):
+        n = orig(*args, **kwargs)
+        try:
+            from sm120_ep import dp_sync
+            dp_sync._STATE["yoco_boundary"] = int(n) if n is not None else None
+        except Exception:  # noqa: BLE001
+            pass
+        return n
+
+    _n_prefill_layer._sm120 = True
+    mod._n_prefill_layer = _n_prefill_layer
+    _note("P13 hugging_face.config._n_prefill_layer: YOCO boundary recorded for sm120_ep")
+
+
 @when_imported("deepinfer.worker.cuda_graph_runner")
 def _patch_graph_runner(mod):
     """P9 (logging only): CudaGraphRunner.capture reports the b12x plans created by the warm-up runs."""

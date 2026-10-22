@@ -12,7 +12,7 @@ prefix cache needs one extra read-only C++ binding, added by a one-line patch at
 
 Target model: DeepSeek-V4.1-Flash (MoE, FP4 experts, compressed sparse attention, mHC, Engram, MTP/DSpark).
 
-> **Status: experimental (v0.2.2).** DeepInfer runs the full DeepSeek-V4.1-Flash on 4× RTX PRO 6000 Blackwell Max-Q
+> **Status: experimental (v0.2.3).** DeepInfer runs the full DeepSeek-V4.1-Flash on 4× RTX PRO 6000 Blackwell Max-Q
 > over PCIe: stable, with quality on par with a tuned vLLM deployment, but not yet competitive on speed (decode about
 > 2-3× and prefill about 15× behind as of v0.2.0, see [docs/RESULTS.md](docs/RESULTS.md)). On a single RTX 5090 it is
 > validated layer by layer against DeepSeek's reference implementation with truncated test checkpoints. Not affiliated
@@ -32,11 +32,11 @@ NVIDIA driver >= 595 is required (CUDA 13.2). Pinned versions are listed in [COM
 
 ```bash
 git clone <this repo> somora_deep_sm120 && cd somora_deep_sm120
-docker build -t somora_deep_sm120:0.2.2 -f docker/Dockerfile .      # clones DeepInfer at the pinned commit
+docker build -t somora_deep_sm120:0.2.3 -f docker/Dockerfile .      # clones DeepInfer at the pinned commit
 
 docker run --rm --gpus all --ipc=host --shm-size=16g -p 8000:8000 \
   -v /models:/models:ro -v sm120-cache:/cache \
-  somora_deep_sm120:0.2.2 --model /models/<checkpoint> --prefix-cache
+  somora_deep_sm120:0.2.3 --model /models/<checkpoint> --prefix-cache
 
 curl -s localhost:8000/v1/chat/completions -H 'content-type: application/json' \
   -d '{"model": "<checkpoint>", "messages": [{"role": "user", "content": "Hello"}], "max_tokens": 32}'
@@ -160,7 +160,7 @@ use the container paths `/work` (work dir), `/ckpt` (original HF shards, read-on
 ## Running the tests
 
 ```bash
-docker run --rm --gpus all --ipc=host --shm-size=16g --entrypoint bash somora_deep_sm120:0.2.2 -c '
+docker run --rm --gpus all --ipc=host --shm-size=16g --entrypoint bash somora_deep_sm120:0.2.3 -c '
   cd /opt/sm120/tests && pytest -q test_attn_shims.py test_mhc_einsum.py test_gemm_moe_graphs.py test_ep_moe.py \
   && python3 test_ep_dp_sync.py && bash run_runtime_unit.sh'
 ```

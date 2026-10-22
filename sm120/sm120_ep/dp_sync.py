@@ -36,8 +36,8 @@ import sm120_prof
 import torch
 import torch.distributed as dist
 
-_STATE = {"active": False, "synced": None, "prefill_rows": None, "prefill_counts": None, "group": None,
-          "n_sync": 0}
+_STATE = {"active": False, "synced": None, "prefill_rows": None, "prefill_counts": None, "consumer_counts": None,
+          "group": None, "n_sync": 0, "yoco_boundary": None}
 
 
 def enabled_by_env() -> bool:
@@ -73,7 +73,7 @@ def patch_worker(cls, group) -> None:
 
     def execute_model_step(self, is_prompt, is_placeholder, seq_metadata_list=None, scheduler_outputs=None):
         mr = getattr(self, "model_runner", None)
-        _STATE["synced"] = _STATE["prefill_rows"] = _STATE["prefill_counts"] = None
+        _STATE["synced"] = _STATE["prefill_rows"] = _STATE["prefill_counts"] = _STATE["consumer_counts"] = None
         if is_prompt:
             local = 1 if is_placeholder or not seq_metadata_list else sum(int(s.seqlen_q) for s in seq_metadata_list)
             counts = dp_counts(local, group)

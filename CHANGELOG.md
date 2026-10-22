@@ -5,6 +5,16 @@ before 1.0 any minor release may change interfaces.
 
 ## [0.2.3] - unreleased
 
+0.2.2 was tested but not tagged; its changes ship with 0.2.3.
+
+### Fixed
+- `eval/scenarios.py realistic`: `tokens_per_step` divided by every engine step, and behind the `--dp` proxy by the
+  sum over all ranks (which step in lockstep), so speculative decoding read 0.3-0.6 instead of above 1. The server now
+  counts, per request, the steps in which it received tokens (`/health` `stats.emit_steps`, plus `stats.tokens` and
+  `config.nextn`), and the scenario reports tokens per decode step of a sequence at any concurrency, with
+  `draft_acceptance_est` = (tokens_per_step - 1) / nextn. The `--dp` proxy reports `steps` / `flushes` per rank
+  instead of summing them.
+
 ### Added
 - `SM120_ENGRAM_MODE=pinned`: the engram tables are kept once in shared, pinned host memory for all ranks, the way the
   baseline keeps them in RAM.
@@ -20,18 +30,12 @@ before 1.0 any minor release may change interfaces.
   user; the trimming itself is neutral at ≤ 8 users (docs/MTP_YOCO.md §9).
 - `/health` reports verified / accepted draft tokens (`stats.mtp_verified`, `stats.mtp_accepted`, runtime patch P12);
   `eval/scenarios.py realistic` reports `draft_acceptance` (accepted / verified) and `drafts_verified_per_step`.
-
-## [0.2.2] - unreleased
-
-### Fixed
-- `eval/scenarios.py realistic`: `tokens_per_step` divided by every engine step, and behind the `--dp` proxy by the
-  sum over all ranks (which step in lockstep), so speculative decoding read 0.3-0.6 instead of above 1. The server now
-  counts, per request, the steps in which it received tokens (`/health` `stats.emit_steps`, plus `stats.tokens` and
-  `config.nextn`), and the scenario reports tokens per decode step of a sequence at any concurrency, with
-  `draft_acceptance_est` = (tokens_per_step - 1) / nextn. The `--dp` proxy reports `steps` / `flushes` per rank
-  instead of summing them.
-
-### Added
+- YOCO compact prefill truncation, opt-in: `server.py --yoco-compact [KEEP]` (KEEP default 140, ≥ 128 + nextn + 1)
+  runs the YOCO consumer half (layers 20-39) on only the last KEEP rows of each prefill (DeepInfer's
+  `DEEPINFER_YOCO_PREFILL_TRUNCATION_MODE=compact`). TTFT on the RTX 5090 test model: 4k 1.04-1.11 s → 0.65-0.77 s,
+  32k 6.68-6.97 s → 4.34-4.70 s; greedy tokens identical. With `--dp` the consumer half's EP layers exchange the kept-row
+  counts once per step (runtime patch P13). Not exact with `--prefix-cache`, so the server refuses the combination
+  (docs/MTP_YOCO.md §8a).
 - `SM120_ENGRAM_PIN=mlock`: after load, rank 0 prefaults the engram tables and locks them. All ranks share that one
   locked page-cache copy (memory counted once), so the tables stay fully in RAM like the baseline's pinned copy.
   - The server refuses to start, with a message naming the numbers, if the tables plus

@@ -123,6 +123,14 @@ class EPRoutedExperts:
         self.row_bytes = 2 * self.hidden + 8 * self.topk
         assert self.row_bytes % 4 == 0
 
+    def _yoco_consumer(self) -> bool:
+        """True in the YOCO consumer half (layer >= n_prefill_layer) when compact prefill truncation is on."""
+        if os.environ.get("DEEPINFER_YOCO_PREFILL_TRUNCATION_MODE", "off") != "compact":
+            return False
+        b = dp_sync._STATE.get("yoco_boundary")
+        idx = getattr(self.inner, "layer_idx", None)
+        return b is not None and idx is not None and int(idx) >= int(b)
+
     # ----------------------------------------------------------------------------------------- pack/unpack
     def _fused_ok(self, x) -> bool:
         return triton is not None and x.is_cuda and os.environ.get("SM120_EP_FUSED_PACK", "1") != "0"
@@ -188,6 +196,13 @@ class EPRoutedExperts:
             counts = None
         elif dp_sync.active() and dp_sync._STATE["prefill_counts"] is not None:
             counts = dp_sync._STATE["prefill_counts"]
+            if self._yoco_consumer():
+                # YOCO compact truncation: layers >= n_prefill_layer see only the kept rows. Every rank reaches the
+                # first consumer layer in the same step, so all exchange their row counts there once (one host sync
+                # per step) and the consumer layers pad to the kept rows instead of the step's tokens.
+                if dp_sync._STATE["consumer_counts"] is None:
+                    dp_sync._STATE["consumer_counts"] = self.transport.all_gather_counts(T, x.device)
+                counts = dp_sync._STATE["consumer_counts"]
             rows = max(counts)
             if T > counts[self.rank]:  # the step's token count bounds every layer's T (else the collectives desync)
                 raise RuntimeError(f"EP prefill layer has {T} rows > the step's token count {counts[self.rank]}")

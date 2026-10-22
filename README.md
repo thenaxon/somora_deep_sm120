@@ -155,7 +155,9 @@ Details and more tables: [docs/VALIDATION.md](docs/VALIDATION.md), [docs/ATTENTI
 - **Layer 0 deviates from the reference** beyond the noise floor (about 12-20× noise, not at other layers). This is a
   known rounding property of DeepInfer's `fused_transform` path, not a port bug ([docs/VALIDATION.md](docs/VALIDATION.md)).
 - **b12x `fused_moe` (the default MoE) is not run-to-run deterministic.** The same prompt can decode different tokens
-  after a few steps. For reproducible outputs use `--deterministic` (`SM120_MOE_IMPL=torch`, exact but slower).
+  after a few steps. For reproducible outputs on **one GPU** use `--deterministic` (`SM120_MOE_IMPL=torch`, exact but
+  slower). **Not with `--dp > 1`:** in v0.3.0 that combination computes wrong MoE outputs (fixed in 0.3.1, which
+  refuses it).
 - **Do not use b12x's deterministic MoE mode** (`SM120_MOE_DETERMINISTIC=1`, also turned on by
   `DEEPINFER_BATCH_INVARIANT=1`): b12x 1.5.1's `deterministic_output` gives wrong rows for some batch sizes and with
   expert parallelism. The server refuses it; the single-GPU results below that use it were not affected (their

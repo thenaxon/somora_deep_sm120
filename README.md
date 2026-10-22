@@ -149,12 +149,12 @@ Details and more tables: [docs/VALIDATION.md](docs/VALIDATION.md), [docs/ATTENTI
 - `--yoco-compact` (opt-in, about 1.15–1.2× faster prefill at 32k) cannot be combined with `--prefix-cache`.
 - **Layer 0 deviates from the reference** beyond the noise floor (about 12-20× noise, not at other layers). This is a
   known rounding property of DeepInfer's `fused_transform` path, not a port bug ([docs/VALIDATION.md](docs/VALIDATION.md)).
-- **b12x's deterministic MoE mode (`SM120_MOE_DETERMINISTIC=1`) is wrong with `--dp > 1`** (a b12x bug with masked
-  routes); the server refuses that combination. Use `--deterministic` (torch MoE) for reproducible multi-GPU runs.
 - **b12x `fused_moe` (the default MoE) is not run-to-run deterministic.** The same prompt can decode different tokens
-  after a few steps. `--deterministic` / `SM120_MOE_IMPL=torch` is exact but slower, and `SM120_MOE_DETERMINISTIC=1`
-  gives a deterministic b12x mode, recommended when reproducibility matters but 2-2.9x slower in decode
-  ([docs/VALIDATION.md](docs/VALIDATION.md), [docs/RUNTIME.md](docs/RUNTIME.md)).
+  after a few steps. For reproducible outputs use `--deterministic` (`SM120_MOE_IMPL=torch`, exact but slower).
+- **Do not use b12x's deterministic MoE mode** (`SM120_MOE_DETERMINISTIC=1`, also turned on by
+  `DEEPINFER_BATCH_INVARIANT=1`): b12x 1.5.1's `deterministic_output` gives wrong rows for some batch sizes and with
+  expert parallelism. The server refuses it; the single-GPU results below that use it were not affected (their
+  batch sizes avoid the faulty tiles), but it is not safe in general.
 - **MTP known issue:** nextn 1 together with `DEEPINFER_SAMPLER_FORCE_TOPK=1024` at batch > 1 accepts no drafts (output
   correct, no speed-up). Other combinations are fine; the server defaults (nextn 0, no forced top-k) are not affected.
 - The b12x tiny-decode MoE kernel misses the SwiGLU clamp

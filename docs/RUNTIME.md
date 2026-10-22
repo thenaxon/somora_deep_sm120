@@ -68,7 +68,7 @@ rows / `mtp_info_read_rows`) or the MTP info pool with several requests. The ser
 
 ### Deterministic MoE: cost
 
-`SM120_MOE_DETERMINISTIC=1` (or `tools/run_deepinfer.py --batch-invariant`) makes b12x `fused_moe` bit-exact run to run
+**Warning (0.3.0):** b12x 1.5.1's `deterministic_output` is wrong for some batch sizes (dynamic tiles below 64) and with expert parallelism (masked routes); the server refuses it; use the torch MoE for reproducible outputs. `SM120_MOE_DETERMINISTIC=1` (or `tools/run_deepinfer.py --batch-invariant`) makes b12x `fused_moe` bit-exact run to run
 ([MOE_GEMM.md](MOE_GEMM.md) section 5). CUDA graphs, prompt 256, 128 generated tokens, TPOT ms default -> deterministic:
 
 | model | B=1 | B=8 | B=32 |

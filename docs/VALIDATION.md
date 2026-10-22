@@ -266,8 +266,8 @@ Logits:
   capture/replay introduces no error. The deterministic tokens
   (`[304, 270, 1840, 5090, 294, 270, 14108, 3554, 33, 455, ...]`) leave the torch-kernel reference at position 2
   (1840 vs 3072), a near-tie decided only by the MoE combine order.
-- For reproducible outputs use `SM120_MOE_DETERMINISTIC=1` (keeps b12x) or the exact torch MoE
-  (`SM120_MOE_IMPL=torch`, which the server's `--deterministic` sets).
+- For reproducible outputs use the exact torch MoE (`SM120_MOE_IMPL=torch`, which the server's `--deterministic`
+  sets). Since 0.3.0: do not rely on `SM120_MOE_DETERMINISTIC=1`; b12x 1.5.1's `deterministic_output` is wrong for some batch sizes (dynamic tiles below 64) and with expert parallelism (masked routes); the server refuses it.
 
 Speed (327-token prompt, 16 decode steps, single request; step times from `meta.step_timing`):
 
@@ -299,8 +299,8 @@ MTP acceptance (real DSpark targets, but 16/384 backbone experts and 32/128 draf
 
 ## 7. Open points
 
-- The default b12x `fused_moe` is not run-to-run deterministic; use `SM120_MOE_DETERMINISTIC=1` when bit-reproducibility
-  across runs and between nextn settings matters.
+- The default b12x `fused_moe` is not run-to-run deterministic; use the torch MoE (`--deterministic`) when
+  bit-reproducibility matters. `SM120_MOE_DETERMINISTIC=1` is not safe: b12x 1.5.1's `deterministic_output` is wrong for some batch sizes (dynamic tiles below 64) and with expert parallelism (masked routes); the server refuses it.
 - Longer decodes (hundreds of steps) are needed for stable acceptance and step-time numbers.
 - No validation of the full (untruncated) model yet: it does not fit one 32 GB GPU and needs the multi-GPU path
   ([MULTI_GPU.md](MULTI_GPU.md)).

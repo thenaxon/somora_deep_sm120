@@ -8,11 +8,13 @@ before 1.0 any minor release may change interfaces.
 Release candidate for the first public version. 0.2.5 was not tagged; its changes are listed here.
 
 ### Fixed
-- `--dp > 1` with b12x's deterministic MoE (`SM120_MOE_DETERMINISTIC=1`, or `DEEPINFER_BATCH_INVARIANT=1` /
-  `B12X_DYNAMIC_DETERMINISTIC_OUTPUT=1`, which turn it on) gave wrong outputs: b12x 1.5.1's `deterministic_output`
-  does not zero the rows of masked routes (`topk_ids` -1) and sums stale scratch into them, and with expert
-  parallelism every rank masks the routes to the other ranks' experts. The server now refuses this combination at
-  start-up. `--deterministic` (torch MoE), the default b12x MoE and a single GPU are not affected.
+- b12x's deterministic MoE (`SM120_MOE_DETERMINISTIC=1`, or `DEEPINFER_BATCH_INVARIANT=1` /
+  `B12X_DYNAMIC_DETERMINISTIC_OUTPUT=1`, which turn it on) gives wrong outputs with b12x 1.5.1: `deterministic_output`
+  writes wrong rows when the dynamic tile is below 64 (b12x's own choice for some batch sizes, also on one GPU), and it
+  does not zero the rows of masked routes (`topk_ids` -1), which every expert-parallel rank uses for the other ranks'
+  experts. The server now refuses it at start-up (`SM120_ALLOW_B12X_DETERMINISTIC=1` overrides, for tests).
+  `--deterministic` (torch MoE) and the default b12x MoE are not affected. The docs no longer recommend the mode.
+- The start log shows the effective prefill intervals (`prefill intervals: ...`).
 
 ### Changed
 - Documentation for a public release: the README states the hardware the full model needs (4× RTX PRO 6000, about

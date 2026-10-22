@@ -204,6 +204,10 @@ class EngineLoop:
         # prefill step and the decoders got ~1 token per chunk; docs/SERVER.md). An explicit -e DEEPINFER_* wins.
         os.environ.setdefault("DEEPINFER_PREFILL_ANY_ATTEMPT_INTERVAL",
                               str(resolve_prefill_interval(c["prefill_any_interval"], c["dp_size"])))
+        log.info("prefill intervals: DEEPINFER_PREFILL_ATTEMPT_INTERVAL=%s DEEPINFER_PREFILL_ANY_ATTEMPT_INTERVAL=%s "
+                 "(--prefill-interval %s, --prefill-any-interval %s, dp %s)",
+                 os.environ["DEEPINFER_PREFILL_ATTEMPT_INTERVAL"], os.environ["DEEPINFER_PREFILL_ANY_ATTEMPT_INTERVAL"],
+                 c["prefill_interval"], c["prefill_any_interval"], c["dp_size"])
         if c["mtp_varlen"]:
             # DeepInfer's adaptive speculative decoding (csrc/engine/mtp_varlen.hpp): after graph capture the worker
             # replays every decode graph to get a (graph size -> ms) curve (model_runner.profile_decode_perf, cached in

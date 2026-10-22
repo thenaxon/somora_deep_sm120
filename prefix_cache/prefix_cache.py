@@ -70,6 +70,16 @@ def _digest(ids: np.ndarray, k: int) -> bytes:
     return hashlib.blake2b(np.ascontiguousarray(ids[:k], dtype=np.int32).tobytes(), digest_size=16).digest()
 
 
+def _prefix_digests(ids: np.ndarray, ks) -> dict[int, bytes]:
+    """_digest(ids, k) for every k in ks (ascending), in one pass: blake2b is a stream hash, a copy of the running
+    state at k digests exactly ids[:k]."""
+    h, prev, out = hashlib.blake2b(digest_size=16), 0, {}
+    for k in ks:
+        h.update(np.ascontiguousarray(ids[prev:k], dtype=np.int32).tobytes())
+        out[k], prev = h.copy().digest(), k
+    return out
+
+
 @dataclass
 class Entry:
     k: int
@@ -131,10 +141,12 @@ class PrefixCache:
         self.lookup = self.snapshot = self.checkpoints = True
         self.extra_checkpoints: list[int] = []  # tests: also split every prefill here (chunk-aligned baselines)
         self._pending: list[tuple] = []  # (Sequence, k) whose prefill chunk ends at k in the step being executed
-        self._live: dict[str, object] = {}  # request_id -> Sequence, for generation-end snapshots
+        # request_id -> Sequence, for generation-end snapshots; least recently scheduled first (trimmed from there)
+        self._live: "OrderedDict[str, object]" = OrderedDict()
+        self._pin_refs: dict[int, int] = {}  # block id -> number of entries pinning it (len = pinned blocks)
         self.snapshot_gen_end = True
         self.stats = dict(lookups=0, hits=0, hit_tokens=0, prompt_tokens=0, snapshots=0, gen_end_snapshots=0,
-                          evictions=0, snapshot_skipped=0)
+                          evictions=0, snapshot_skipped=0, snapshot_errors=0)
         from deepinfer._C.engine import RequestOutput
 
         self._RO = RequestOutput
@@ -155,7 +167,19 @@ class PrefixCache:
         return int(getattr(cc, "num_state_seqs", -1)) if cc is not None else -1
 
     def _pinned_blocks(self) -> int:
-        return len({b for e in self.entries.values() for b in e.blocks})
+        return len(self._pin_refs)
+
+    def _new_blocks(self, blocks) -> int:
+        """Blocks of a snapshot that no entry pins yet (shared prefix blocks cost nothing more)."""
+        return len({b for b in blocks if b not in self._pin_refs})
+
+    def _ref(self, blocks, d: int) -> None:
+        for b in blocks:
+            n = self._pin_refs.get(b, 0) + d
+            if n > 0:
+                self._pin_refs[b] = n
+            else:
+                self._pin_refs.pop(b, None)
 
     def _evict_one(self) -> bool:
         if not self.entries:
@@ -163,6 +187,7 @@ class PrefixCache:
         _, e = self.entries.popitem(last=False)
         self.engine.block_manager.unpin_blocks(e.blocks)
         self.engine.state_manager.unpin_blocks([e.state_id])
+        self._ref(e.blocks, -1)
         self.stats["evictions"] += 1
         return True
 
@@ -247,9 +272,10 @@ class PrefixCache:
 
     def _lookup(self, ids: np.ndarray) -> Entry | None:
         L = int(ids.size)
-        ks = sorted({k for k, _ in self.entries if k <= L - 2}, reverse=True)
-        for k in ks:
-            e = self.entries.get((k, _digest(ids, k)))
+        ks = sorted({k for k, _ in self.entries if k <= L - 2})
+        digests = _prefix_digests(ids, ks)  # one pass over the prompt
+        for k in reversed(ks):  # the longest cached prefix
+            e = self.entries.get((k, digests[k]))
             if e is not None:
                 return e
         return None
@@ -260,9 +286,10 @@ class PrefixCache:
         if self.snapshot_gen_end:
             for seq in scheduler_outputs.scheduled_seqs:
                 self._live[seq.request_id] = seq
-            if len(self._live) > 4096:  # aborted requests never report a normal finish
-                for rid in list(self._live)[:2048]:
-                    del self._live[rid]
+                self._live.move_to_end(seq.request_id)
+            if len(self._live) > 4096:  # aborted requests never report a normal finish: drop the longest unscheduled
+                for _ in range(2048):
+                    self._live.popitem(last=False)
         if not scheduler_outputs.prompt_run:
             return
         for seq, md in zip(scheduler_outputs.scheduled_seqs, seq_metadata_list):
@@ -315,21 +342,32 @@ class PrefixCache:
                 self.stats["snapshot_skipped"] += 1
                 continue
             if self.max_blocks is not None:
-                while self.entries and self._pinned_blocks() + nblk > self.max_blocks:
-                    self._evict_one()
-                if nblk > self.max_blocks:
+                if nblk > self.max_blocks:  # can never fit: do not evict anything for it
                     self.stats["snapshot_skipped"] += 1
                     continue
+                while self.entries and self._pinned_blocks() + self._new_blocks(blocks) > self.max_blocks:
+                    self._evict_one()
             sid = self._alloc_state()
             if sid is None:
                 self.stats["snapshot_skipped"] += 1
                 continue
-            self.engine.block_manager.pin_blocks(blocks)
-            self.engine._run_workers(
-                "clone_and_zero_states_and_blocks_on_default_stream",
-                clone_states=np.asarray([[int(seq.state_id), sid]], dtype=np.int32),
-                clone_blocks=np.zeros((0, 2), dtype=np.int32), zero_states=np.zeros((0,), dtype=np.int32))
+            pinned = False
+            try:
+                self.engine.block_manager.pin_blocks(blocks)
+                pinned = True
+                self.engine._run_workers(
+                    "clone_and_zero_states_and_blocks_on_default_stream",
+                    clone_states=np.asarray([[int(seq.state_id), sid]], dtype=np.int32),
+                    clone_blocks=np.zeros((0, 2), dtype=np.int32), zero_states=np.zeros((0,), dtype=np.int32))
+            except Exception:  # noqa: BLE001 - give the blocks and the state slot back, keep serving
+                log.exception("prefix cache: snapshot of %d tokens failed", k)
+                if pinned:
+                    self.engine.block_manager.unpin_blocks(blocks)
+                self.engine.state_manager.unpin_blocks([sid])
+                self.stats["snapshot_errors"] += 1
+                continue
             self.entries[key] = Entry(k=k, digest=key[1], blocks=blocks, state_id=sid)
+            self._ref(blocks, +1)
             self.stats["snapshots"] += 1
             self.stats["gen_end_snapshots"] += gen_end
 

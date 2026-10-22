@@ -5,7 +5,7 @@
 #   --no-graphs                  eager mode (CUDA graphs are ON by default)
 #   --host/--port                default 0.0.0.0:8000
 #   everything else goes to server.py: --gpu-memory-utilization --max-model-len --max-num-seqs --max-num-batched-tokens
-#   --prefix-cache [--prefix-cache-grain 512 ...] --nextn N --deterministic --prefill-interval ...
+#   --prefix-cache [--prefix-cache-grain 512 ...] --nextn N --deterministic (with --no-graphs) --prefill-interval ...
 #   --help                       this text + server.py --help
 set -euo pipefail
 SERVER="${SM120_ROOT:-/opt/sm120}/server/server.py"

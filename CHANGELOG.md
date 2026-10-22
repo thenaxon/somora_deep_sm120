@@ -49,6 +49,9 @@ before 1.0 any minor release may change interfaces.
   budget).
 
 ### Fixed
+- `--deterministic` / `SM120_MOE_IMPL=torch` with CUDA graphs (the docker image's default) loaded the whole model and
+  then exited at the graph capture (the torch MoE reference is not capturable). The server now refuses it at argument
+  parsing: add `--no-graphs`, or use `SM120_MOE_DETERMINISTIC=1` (deterministic b12x MoE; graphs and `--dp` work).
 - Tool calling, streaming: an argument-less tool call ended the stream, so later calls of the same answer were lost
   (non-stream was correct). A repeated parameter key now ends the call instead of emitting invalid JSON.
 - `SM120_ENGRAM_MODE=pinned`: a failure while filling the shared tables, or a lost reply from rank 0, now stops the

@@ -3,7 +3,10 @@
 All notable changes to this project are documented here. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0 any minor release may change interfaces.
 
-## [Unreleased]
+## [0.3.1-rc1] - 2026-10-23
+
+Release candidate. Opt-in additions (vmm engram allocation, exact-size EP collectives, decode profiler), a faster
+`docker stop`, deterministic b12x MoE usable again, and fixes from an external code review of 0.3.0.
 
 ### Added
 - `SM120_PROFILE_DECODE=N` (diagnostics, off by default): every engine process that holds requests profiles N decode

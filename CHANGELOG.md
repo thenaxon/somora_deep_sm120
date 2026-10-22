@@ -5,7 +5,62 @@ before 1.0 any minor release may change interfaces.
 
 ## [Unreleased]
 
+### Added
+- `SM120_PROFILE_DECODE=N` (diagnostics, off by default): every engine process that holds requests profiles N decode
+  steps once (torch profiler; same per-category GPU and host tables as `SM120_PROFILE_PREFILL`), also per rank with
+  `--dp` (docs/SERVER.md).
+- `SM120_ENGRAM_PINNED_ALLOC=vmm` (opt-in, default `register`): with `SM120_ENGRAM_MODE=pinned` rank 0 allocates
+  the engram tables once as pinned host memory (`cuMemCreate`) and the other ranks import it, so only one rank pays
+  the driver's registration cost. About 2.6 GiB less host memory per extra rank (7.8 GiB with `--dp 4`), start-up
+  check 217 instead of 225 GiB; same lookup speed; falls back to the memfd registration if the allocation fails
+  (docs/ENGRAM.md, docs/MULTI_GPU_RUNBOOK.md §3).
+- `SM120_EP_VARLEN=ag|1` (experimental, default 0): EP prefill collectives sized to the real token counts instead of
+  padding every rank to the busiest one (with one busy rank the all-gather moves about a quarter of the rows).
+  Bit-identical to the padded path in the tests; its speed on 4 GPUs is not measured yet.
+- Proxy and server options: `--start-timeout` (default 3600 s), `--max-request-bytes` (413 above it).
+- `SM120_ENGRAM_GRAPH_WAIT_S` (default 30): time budget of the in-graph engram wait (`host` / `uring` modes).
+
+### Changed
+- Eval method (`eval/measure.py`, docs/EVAL.md): a per-run nonce at the start of every prompt (no prefix-cache
+  help, also across runs), an unmeasured warm-up per level with the same lengths, 3 repeats per level (median and
+  range), steady-state throughput, tails as p99 only from >= 100 samples (else the maximum, labelled),
+  `output_tokens_mean` and per-user tok/s always reported. `scenarios.py`: `ignore_eos` by default (`--allow-eos`),
+  `mixed` counts short requests only within the phase. `loadgen.py`: requests per level max(16, 3 x concurrency).
+- MoE epilogue: the shared-expert output is added in place in bf16 (bit-identical to the fp32 round trip, fewer
+  kernels and temporaries in prefill). FlashMLA decode shim: no `repeat_interleave` copy of the top-k lengths at
+  one query token per sequence.
+- The server no longer refuses b12x's deterministic MoE (0.3.0 did). It logs one start-up line (bit-exact, slower
+  decode, with `--dp N` the masked routes computed at weight 0) and a warning if the installed b12x is not 1.5.1,
+  the version the workarounds were validated on. `SM120_ALLOW_B12X_DETERMINISTIC`, the 0.3.0 override, is still
+  accepted and has no effect.
+- Deterministic MoE cost (full-depth test model, RTX 5090, CUDA graphs, TPOT B=1/8/32): 16.1/20.8/25.4 ->
+  19.1/23.4/27.0 ms, 1.06-1.19x (0.2.x: 2-2.9x with the small tiles that gave wrong rows).
+- b12x linear: the E4M3 activation dequant runs as one kernel. On the RTX 5090 test model: decode about 11 % faster
+  at batch 1, TTFT 4k / 32k 5–8 % lower; bit-identical outputs.
+- DP proxy: only the public routes are forwarded (`/v1/completions`, `/v1/chat/completions`, `/v1/models`,
+  `/health`); `/internal/*` gets a 404. A rank that exits or reports a dead engine stops all ranks and the server
+  exits non-zero (so a restart policy can act). Errors before the response headers return 502 / 503 JSON instead of
+  a dropped connection; the ranks' `/health` is queried in parallel.
+- Server: requests are fully validated before they are submitted (non-object JSON, wrong types, NaN / infinity,
+  bad `Content-Length`, chunked bodies: 400; oversize: 413); every request that does not finish normally is aborted.
+  Detokenisation is incremental (O(n) instead of decoding the whole output per token; byte-identical output).
+  `finish_reason` `abort` maps to `stop` (plus `abort_reason`); `logprobs` with `stream` is a 400.
+- Prefix cache: one-pass prefix hashing, per-block pin refcounts (shared prefix blocks count once against the
+  budget).
+
 ### Fixed
+- Tool calling, streaming: an argument-less tool call ended the stream, so later calls of the same answer were lost
+  (non-stream was correct). A repeated parameter key now ends the call instead of emitting invalid JSON.
+- `SM120_ENGRAM_MODE=pinned`: a failure while filling the shared tables, or a lost reply from rank 0, now stops the
+  start-up; 0.3.0 could start serving with incomplete tables. `host` / `uring` with CUDA graphs: a failed or stalled
+  in-graph engram fetch now fails the step (`EngramFetchError`) after `SM120_ENGRAM_GRAPH_WAIT_S` instead of
+  waiting practically forever or using stale rows.
+- Prefix cache: no leaked pinned blocks or state slot when a snapshot fails; an oversize snapshot no longer evicts
+  the whole cache first; `/health` could fail with "OrderedDict mutated during iteration".
+- Engram prefetcher: cancelled requests stayed registered; decode and prestage batches counted as consumed
+  read-ahead.
+- `docker/entrypoint.sh`: `--served-model-name=NAME` (with `=`) was not recognised. The server's HTTP version
+  string named an old version.
 - `eval/loadgen.py`, `eval/scenarios.py`: a streamed request that ended with an error event, a malformed event or
   without `[DONE]` / a finish reason counted as a success; it is now an error, and its tokens are reported separately
   (`partial_out_tokens`). All eval and bench clients (`loadgen`, `scenarios`, `server/bench_client.py`,
@@ -21,20 +76,6 @@ before 1.0 any minor release may change interfaces.
   for the documented layer-0 deviation (`e2e_matrix.sh` passes it, `TEST_KNOWN_DEVIATION` overrides).
   `determinism.sh` never ran its comparison. `mtp_check.sh` printed the wrong `accepted_log` key. Test
   `tests/test_compare_exit.py`.
-
-### Changed
-- Eval method (`eval/measure.py`, docs/EVAL.md): a per-run nonce at the start of every prompt (no prefix-cache
-  help, also across runs), an unmeasured warm-up per level with the same lengths, 3 repeats per level (median and
-  range), steady-state throughput, tails as p99 only from >= 100 samples (else the maximum, labelled),
-  `output_tokens_mean` and per-user tok/s always reported. `scenarios.py`: `ignore_eos` by default (`--allow-eos`),
-  `mixed` counts short requests only within the phase. `loadgen.py`: requests per level max(16, 3 x concurrency).
-
-### Added
-- `SM120_PROFILE_DECODE=N` (diagnostics, off by default): every engine process that holds requests profiles N decode
-  steps once (torch profiler; same per-category GPU and host tables as `SM120_PROFILE_PREFILL`), also per rank with
-  `--dp` (docs/SERVER.md).
-
-### Fixed
 - `--deterministic` (or `SM120_MOE_IMPL=torch`) with `--dp` / `--ep` > 1 computed wrong MoE outputs in 0.3.0: the
   torch MoE reference applied each rank's local expert weights to the global expert ids and skipped the expert-
   parallel collectives. 0.3.0's docs and its start-up message recommended exactly this combination. The server now
@@ -73,17 +114,6 @@ before 1.0 any minor release may change interfaces.
     weight 0.
   The default b12x MoE and `--deterministic` (torch MoE, one GPU) were not affected. New tests in `tests/test_gemm_moe_graphs.py`
   and `tests/sweep_moe_deterministic.py`. Upstream: [flashinfer-ai/flashinfer#7021](https://github.com/flashinfer-ai/flashinfer/issues/7021).
-
-### Changed
-- MoE epilogue: the shared-expert output is added in place in bf16 (bit-identical to the fp32 round trip, fewer
-  kernels and temporaries in prefill). FlashMLA decode shim: no `repeat_interleave` copy of the top-k lengths at
-  one query token per sequence.
-- The server no longer refuses b12x's deterministic MoE (0.3.0 did). It logs one start-up line (bit-exact, slower
-  decode, with `--dp N` the masked routes computed at weight 0) and a warning if the installed b12x is not 1.5.1,
-  the version the workarounds were validated on. `SM120_ALLOW_B12X_DETERMINISTIC`, the 0.3.0 override, is still
-  accepted and has no effect.
-- Deterministic MoE cost (full-depth test model, RTX 5090, CUDA graphs, TPOT B=1/8/32): 16.1/20.8/25.4 ->
-  19.1/23.4/27.0 ms, 1.06-1.19x (0.2.x: 2-2.9x with the small tiles that gave wrong rows).
 
 ## [0.3.0] - 2026-10-22
 

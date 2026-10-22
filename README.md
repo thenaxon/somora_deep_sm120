@@ -25,7 +25,7 @@ As far as we know this is the first port of DeepInfer to SM120 workstation GPUs.
 > - Linux, Docker with the NVIDIA container toolkit, NVIDIA driver >= 595 (CUDA 13.2), the DeepSeek-V4.1-Flash
 >   checkpoint (`deepseek-ai/DeepSeek-V4.1-Flash-1017`, ~300 GB, not included).
 
-> **Status: experimental (v0.3.0).** Stable on 4× RTX PRO 6000, quality on par with a tuned vLLM deployment of the
+> **Status: experimental (v0.3.1).** Stable on 4× RTX PRO 6000, quality on par with a tuned vLLM deployment of the
 > same model. With many concurrent users and long prompts it matches vLLM's throughput and reaches the first token
 > sooner; a single user gets about 55–65 % of vLLM's speed, and a single long prompt is read about 5–6× slower
 > ([docs/RESULTS.md](docs/RESULTS.md)). If you want the fastest single-user serving on this hardware, use vLLM. This
@@ -45,12 +45,12 @@ Pinned versions are listed in [COMPATIBILITY.md](COMPATIBILITY.md).
 
 ```bash
 git clone <this repository> somora_deep_sm120 && cd somora_deep_sm120
-docker build -t somora_deep_sm120:0.3.0 -f docker/Dockerfile .      # ~6 min; clones DeepInfer at the pinned commit
+docker build -t somora_deep_sm120:0.3.1 -f docker/Dockerfile .      # ~6 min; clones DeepInfer at the pinned commit
 
 docker run -d --name sm120-serve --gpus all --ipc=host --shm-size=32g --ulimit memlock=-1 --stop-timeout 30 \
   -p 8000:8000 -v /models/DeepSeek-V4.1-Flash-1017:/models/ds41:ro -v sm120-cache:/cache \
   -e SM120_EP_IMPL=allgather -e SM120_ENGRAM_MODE=pinned -e DEEPINFER_MULTIMODAL_POOL_SIZE_GB=1 \
-  somora_deep_sm120:0.3.0 --model /models/ds41 --served-model-name deepseek-v4.1-flash \
+  somora_deep_sm120:0.3.1 --model /models/ds41 --served-model-name deepseek-v4.1-flash \
     --dp 4 --nextn 7 --prefix-cache --gpu-memory-utilization 0.95 --max-model-len 40960 \
     --max-num-seqs 16 --max-num-batched-tokens 4096 --max-blocks 4096
 docker logs -f sm120-serve      # first start: weights + engram tables load, kernels compile (several minutes)
@@ -196,7 +196,7 @@ use the container paths `/work` (work dir), `/ckpt` (original HF shards, read-on
 ## Running the tests
 
 ```bash
-docker run --rm --gpus all --ipc=host --shm-size=16g --entrypoint bash somora_deep_sm120:0.3.0 -c '
+docker run --rm --gpus all --ipc=host --shm-size=16g --entrypoint bash somora_deep_sm120:0.3.1 -c '
   cd /opt/sm120/tests && pytest -q test_attn_shims.py test_mhc_einsum.py test_gemm_moe_graphs.py test_ep_moe.py \
   && python3 test_ep_dp_sync.py && bash run_runtime_unit.sh'
 ```

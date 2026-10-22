@@ -138,7 +138,7 @@ DeepInfer's only speculative head is DFlash/DSpark (`models/mtp/dflash.py`): `nu
 ```bash
 docker run --rm -it --gpus '"device=0"' --ipc=host --shm-size=16g \
   -v /srv/work:/work -v /srv/hf-shards:/ckpt:ro -v /srv/cache:/cache \
-  --entrypoint bash somora_deep_sm120:0.3.0
+  --entrypoint bash somora_deep_sm120:0.3.1
 cd /opt/sm120
 
 # policy decisions printed at start-up

@@ -78,7 +78,13 @@ chat `logprobs: true, top_logprobs: K` → `{content: [{token, logprob, bytes, t
 `"token_id:<n>"` strings.
 
 **Multi-GPU:** `--dp N [--ep M]` spawns N rank processes (engine_rank r, data_parallel_size N, expert_parallel_size M=N) on ports
-PORT+1..PORT+N. `dp_proxy.py` serves PORT and routes each POST to the least-loaded rank; `/health` aggregates the ranks. Idle
+PORT+1..PORT+N. `dp_proxy.py` serves PORT and routes each POST to the least-loaded rank; `/health` aggregates the ranks
+(queried in parallel). Only the public routes go through the proxy (`POST /v1/completions`, `/v1/chat/completions`,
+`GET /v1/models`, `/health`): anything else, including the ranks' `/internal/*`, gets a 404 at the proxy. A rank that
+cannot be reached before the response headers gives a 502 (503 if its process has exited) JSON error. The proxy
+supervises the ranks: a rank that exits, or reports a dead engine on two health checks in a row, stops the proxy and
+all ranks, and the server exits with 1, so that a restart policy (e.g. `docker run --restart on-failure`) can act; all
+ranks must be up within `--start-timeout` (default 3600 s, 0 = no limit), else the server exits non-zero too. Idle
 ranks poll every 5 ms, because `has_unfinished_requests` is a DP-group all-reduce. Tested only with one rank (`--force-proxy`);
 EP with N=4 has not run on real hardware yet ([MULTI_GPU_RUNBOOK.md](MULTI_GPU_RUNBOOK.md)).
 
@@ -89,12 +95,22 @@ Details:
 
 - **Tokenisation:** raw `tokenizers` with `add_special_tokens=False`. DeepInfer's tokenizer wrapper prepends BOS to plain text
   (`hugging_face/tokenizer.py:26`). The chat template already contains BOS; a plain completion prompt gets exactly what the caller sends.
-- **Detokenisation:** the full output is decoded on every token. A trailing U+FFFD (an incomplete UTF-8 sequence) and the last
+- **Detokenisation:** incremental, O(n) per response (a short window from the last complete-character boundary is decoded
+  per token); the text is exactly the full decode. A trailing U+FFFD (an incomplete UTF-8 sequence) and the last
   `len(longest stop) - 1` characters are held back until they are safe to send.
 - **Stop strings:** matched on the decoded text. The text is cut before the match, `finish_reason="stop"` is returned, and the
   request is **aborted in the engine** so it stops consuming batch slots. EOS ends with `"stop"`, `max_tokens` with `"length"`.
+  `finish_reason` is always an OpenAI value; an engine-side abort ends with `"stop"` and the extension field
+  `"abort_reason": "abort"` in the choice.
+- **Validation:** every request is checked before it reaches the engine: the body must be a JSON object (no `NaN` /
+  `Infinity` literals), fields must have their OpenAI types (numbers finite, flags `true`/`false`), token-id prompts must be
+  in the vocabulary. A missing, malformed or negative `Content-Length` or a chunked body gets a 400, a body over
+  `--max-request-bytes` a 413 (default 0 = enough for `--max-images` base64 images of `--max-image-bytes` plus 16 MiB of
+  text: 229 MiB with the defaults). `logprobs` with `stream: true` gets a 400. Once submitted, every request that does not
+  finish normally (client gone, error, timeout) is aborted in the engine.
 - **Cancellation:** a streaming client that disconnects (the next write raises `BrokenPipe`/`ConnectionReset`) aborts its request
-  (`engine.abort_request`). A non-streaming request whose client goes away runs to completion. A per-token timeout
+  (`engine.abort_request`), also while the response headers are written. A non-streaming request whose client goes away runs to
+  completion. A per-token timeout
   (`--request-timeout`, default 600 s) aborts stuck requests.
 - The listen backlog is 1024 (the stdlib default of 5 hangs closed-loop load tests at concurrency 64).
 

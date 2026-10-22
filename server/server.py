@@ -20,6 +20,7 @@ import argparse
 import importlib.util
 import json
 import logging
+import math
 import os
 import queue
 import signal
@@ -32,6 +33,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+import banner  # noqa: E402
 import images  # noqa: E402
 import tools  # noqa: E402
 from engine import EngineLoop, GenRequest  # noqa: E402
@@ -87,7 +89,12 @@ class TextCodec:
 
 class Detok:
     """Incremental detokenisation with stop strings. emit() returns the text that is safe to send now: it never
-    sends an incomplete UTF-8 sequence (U+FFFD at the end) or a prefix of a stop string that may still complete."""
+    sends an incomplete UTF-8 sequence (U+FFFD at the end) or a prefix of a stop string that may still complete.
+
+    O(n) per response: `text` is always what decoding all ids would give, built from a committed part (the ids up to
+    the last point where the text ended on a complete character) and a short window decoded per token (that point's
+    last piece plus the ids since; the tokenizer's ByteLevel decoding concatenates over such points). Stop strings
+    are searched only where the text can still change."""
 
     def __init__(self, codec: TextCodec, stop: list[str]):
         self.codec, self.stop = codec, [s for s in stop if s]
@@ -96,12 +103,21 @@ class Detok:
         self.text = ""
         self.stopped = False
         self.hold = max((len(s) for s in self.stop), default=1) - 1
+        self.prefix = self.read = 0  # ids[prefix:read]: the last committed piece; ids[read:]: the uncommitted tail
+        self.committed = 0  # len(text) covered by ids[:read]
 
     def push(self, token_id: int) -> None:
         self.ids.append(token_id)
-        self.text = self.codec.decode(self.ids)
-        for s in self.stop:
-            i = self.text.find(s, max(0, self.sent - len(s)))
+        if self.stopped:
+            return
+        head = self.codec.decode(self.ids[self.prefix:self.read])
+        window = self.codec.decode(self.ids[self.prefix:])
+        stable = self.committed
+        self.text = self.text[:stable] + window[len(head):]
+        if len(window) > len(head) and not window.endswith("\ufffd"):
+            self.prefix, self.read, self.committed = self.read, len(self.ids), len(self.text)
+        for s in self.stop:  # matches ending in the part that changed (everything before was searched already)
+            i = self.text.find(s, max(0, stable - len(s) + 1))
             if i >= 0:
                 self.text = self.text[:i]
                 self.stopped = True
@@ -109,7 +125,7 @@ class Detok:
     def emit(self, final: bool = False) -> str:
         end = len(self.text)
         if not (final or self.stopped):
-            while end > self.sent and self.text[end - 1] == "�":
+            while end > self.sent and self.text[end - 1] == "\ufffd":
                 end -= 1
             end = max(self.sent, end - self.hold)
         out = self.text[self.sent:end]
@@ -120,6 +136,44 @@ class Detok:
 # ------------------------------------------------------------------------------------------------ HTTP
 class BadRequest(Exception):
     pass
+
+
+class PayloadTooLarge(BadRequest):
+    pass
+
+
+def _reject_constant(name: str):
+    raise BadRequest(f"invalid JSON number {name}")
+
+
+def _bool(body: dict, key: str, default: bool) -> bool:
+    v = body.get(key)
+    if v is None:
+        return default
+    if not isinstance(v, bool):
+        raise BadRequest(f"{key} must be true or false")
+    return v
+
+
+def _int(body: dict, key: str, default, lo=None, hi=None):
+    v = body.get(key)
+    if v is None:
+        return default
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or (isinstance(v, float) and not v.is_integer()):
+        raise BadRequest(f"{key} must be an integer")
+    v = int(v)
+    if (lo is not None and v < lo) or (hi is not None and v > hi):
+        raise BadRequest(f"{key} must be in [{lo if lo is not None else '-inf'}, {hi if hi is not None else 'inf'}]")
+    return v
+
+
+def _float(body: dict, key: str, default: float) -> float:
+    v = body.get(key)
+    if v is None:
+        return default
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+        raise BadRequest(f"{key} must be a finite number")
+    return float(v)
 
 
 def chat_options(body: dict) -> tuple[bool, object, bool]:
@@ -144,13 +198,19 @@ def chat_options(body: dict) -> tuple[bool, object, bool]:
 
 
 def _finish_reason(di_reason: str, stopped: bool) -> str:
+    """OpenAI finish_reason: "stop" or "length" ("tool_calls" is set by the caller). DeepInfer's other reasons (e.g.
+    "abort") are not OpenAI values; they map to "stop" and are reported in the extension field "abort_reason"."""
     if stopped:
         return "stop"
-    return {"stop": "stop", "length": "length", "abort": "abort"}.get(di_reason, di_reason or "stop")
+    return "length" if di_reason == "length" else "stop"
+
+
+def _abort_reason(di_reason: str, stopped: bool) -> str | None:
+    return None if stopped or di_reason in (None, "", "stop", "length") else di_reason
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "deepinfer-sm120/0.1"
+    server_version = f"somora_deep_sm120/{banner.version()}"
     protocol_version = "HTTP/1.1"
     app: "App"
 
@@ -170,14 +230,48 @@ class Handler(BaseHTTPRequestHandler):
         self._json(code, {"error": {"message": msg, "type": typ, "code": code}})
 
     def _body(self) -> dict:
-        n = int(self.headers.get("Content-Length") or 0)
+        """The JSON object of a POST. Framing errors (no or a bad Content-Length, chunked bodies, a body over
+        --max-request-bytes) leave the body unread: the connection is closed after the error response."""
+        if self.headers.get("Transfer-Encoding"):
+            self.close_connection = True
+            raise BadRequest("chunked request bodies are not supported: send Content-Length")
+        raw_n = self.headers.get("Content-Length")
         try:
-            return json.loads(self.rfile.read(n) or b"{}")
-        except json.JSONDecodeError as exc:
+            n = int(raw_n) if raw_n is not None else 0
+        except ValueError:
+            n = -1
+        if n < 0:
+            self.close_connection = True
+            raise BadRequest(f"invalid Content-Length {raw_n!r}")
+        if n > self.app.max_request_bytes:
+            self.close_connection = True
+            raise PayloadTooLarge(f"request body of {n} bytes exceeds --max-request-bytes {self.app.max_request_bytes}")
+        data = self.rfile.read(n) if n else b""
+        if len(data) != n:
+            self.close_connection = True
+            raise BadRequest("request body shorter than Content-Length")
+        try:
+            body = json.loads(data or b"{}", parse_constant=_reject_constant)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise BadRequest(f"invalid JSON: {exc}") from None
+        if not isinstance(body, dict):
+            raise BadRequest("the request body must be a JSON object")
+        return body
 
     # ---- routes
     def do_GET(self):
+        try:
+            self._get()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as exc:  # noqa: BLE001
+            log.exception("GET %s failed", self.path)
+            try:
+                self._error(500, f"{type(exc).__name__}: {exc}", "server_error")
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _get(self):
         if self.path in ("/health", "/v1/health"):
             ok = self.app.engine.alive
             pc = self.app.engine.prefix_cache
@@ -204,7 +298,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"result": _engram_cache_policy(self.app.args.ckpt)})
             self._error(404, f"no route {self.path}")
         except BadRequest as exc:
-            self._error(400, str(exc))
+            self._error(413 if isinstance(exc, PayloadTooLarge) else 400, str(exc))
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception as exc:  # noqa: BLE001
@@ -215,45 +309,54 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
     # ---- generation
-    def _params(self, body: dict, prompt_len: int, extra_stop: list[str] = ()) -> dict:
-        app = self.app
-        if int(body.get("n", 1)) != 1:
+    def _params(self, body: dict, chat: bool) -> dict:
+        """Sampling parameters and request options, type- and range-checked (BadRequest) before any engine work."""
+        if _int(body, "n", 1) != 1:
             raise BadRequest("only n=1 is supported")
-        max_tokens = body.get("max_completion_tokens", body.get("max_tokens"))
-        room = app.engine.max_model_len - prompt_len - 1
-        if room < 1:
-            raise BadRequest(f"prompt has {prompt_len} tokens; max_model_len is {app.engine.max_model_len}")
-        max_tokens = room if max_tokens is None else int(max_tokens)
-        if max_tokens < 1:
+        max_tokens = _int(body, "max_completion_tokens", None)
+        if max_tokens is None:
+            max_tokens = _int(body, "max_tokens", None)
+        if max_tokens is not None and max_tokens < 1:
             raise BadRequest("max_tokens must be >= 1")
-        stop = body.get("stop") or []
-        stop = [stop] if isinstance(stop, str) else list(stop)
-        if len(stop) > 4 or not all(isinstance(s, str) for s in stop):
+        stop = body.get("stop")
+        stop = [] if stop is None else [stop] if isinstance(stop, str) else stop
+        if not isinstance(stop, list) or len(stop) > 4 or not all(isinstance(x, str) for x in stop):
             raise BadRequest("stop must be a string or a list of up to 4 strings")
-        temperature = float(body.get("temperature", 1.0))
-        top_p = float(body.get("top_p", 1.0))
+        temperature = _float(body, "temperature", 1.0)
+        top_p = _float(body, "top_p", 1.0)
         if temperature < 0 or not 0 < top_p <= 1:
             raise BadRequest("temperature must be >= 0 and top_p in (0, 1]")
-        seed = body.get("seed")
+        top_k = _int(body, "top_k", -1) or -1
+        if top_k < -1:
+            raise BadRequest("top_k must be -1 (off) or >= 1")
+        seed = _int(body, "seed", None)
+        stream = _bool(body, "stream", False)
+        so = body.get("stream_options")
+        if so is not None and not isinstance(so, dict):
+            raise BadRequest("stream_options must be an object")
+        include_usage = _bool(so or {}, "include_usage", False)
         # logprobs: completions `logprobs: int`, chat `logprobs: bool` + `top_logprobs: int` (raw logits, logprob_tap.py)
-        if chat_mode := bool(body.get("messages")):
-            lp = (int(body.get("top_logprobs") or 0) or 1) if body.get("logprobs") else 0
-            top_n = int(body.get("top_logprobs") or 0) if body.get("logprobs") else 0
+        if chat:
+            want = _bool(body, "logprobs", False)
+            top_n = _int(body, "top_logprobs", 0, 0, 20) if want else 0
+            lp = (top_n or 1) if want else 0
         else:
-            lp = body.get("logprobs")
-            top_n = 0 if lp is None else int(lp)
-            lp = 0 if lp is None else max(1, int(lp))
-        if not 0 <= top_n <= 20:
-            raise BadRequest("logprobs / top_logprobs must be in 0..20")
-        if lp and app.engine.nextn > 0:
+            n_lp = None if body.get("logprobs") is False else _int(body, "logprobs", None, 0, 20)  # false: off
+            top_n = n_lp or 0
+            lp = 0 if n_lp is None else max(1, n_lp)
+        if lp and self.app.engine.nextn > 0:
             raise BadRequest("logprobs are not supported with MTP (--nextn > 0)")
-        self._lp = (lp, top_n, bool(body.get("return_tokens_as_token_ids", False)), chat_mode)
-        return dict(max_tokens=min(max_tokens, room), temperature=temperature, top_p=top_p,
-                    top_k=int(body.get("top_k", -1) or -1), seed=None if seed is None else int(seed) % (2 ** 63),
-                    ignore_eos=bool(body.get("ignore_eos", False)), stop=stop + list(extra_stop), logprobs=lp)
+        if lp and stream:
+            raise BadRequest("logprobs are not supported with stream: true")
+        self._lp = (lp, top_n, _bool(body, "return_tokens_as_token_ids", False), chat)
+        return dict(max_tokens=max_tokens, temperature=temperature, top_p=top_p, top_k=top_k,
+                    seed=None if seed is None else seed % (2 ** 63), ignore_eos=_bool(body, "ignore_eos", False),
+                    stop=stop, logprobs=lp, stream=stream, include_usage=include_usage,
+                    return_token_ids=_bool(body, "return_token_ids", False))
 
     def _generate(self, body: dict, chat: bool) -> None:
         app = self.app
+        prm = self._params(body, chat)  # cheap checks first: no image fetch / rendering for a malformed request
         thinking = False
         plan, so, extra_stop, mm, n_image_tokens, n_images = tools.ToolPlan(), None, [], None, 0, 0
         if chat:
@@ -296,26 +399,45 @@ class Handler(BaseHTTPRequestHandler):
                 p = p[0]
             if isinstance(p, str):
                 ids = app.codec.encode(p)
-            elif isinstance(p, list) and p and all(isinstance(x, int) for x in p):
+            elif isinstance(p, list) and p and all(isinstance(x, int) and not isinstance(x, bool) for x in p):
                 ids = list(p)
+                if not all(0 <= x < app.vocab_size for x in ids):
+                    raise BadRequest(f"prompt token ids must be in [0, {app.vocab_size})")
             else:
                 raise BadRequest("prompt must be a string, a one-element list of strings, or a list of token ids")
         if not ids:
             raise BadRequest("empty prompt")
-        prm = self._params(body, len(ids) + n_image_tokens, extra_stop)
-        stop = prm.pop("stop")
-        req = app.engine.submit(GenRequest(prompt_ids=ids, so_args=so, multi_modal_data=mm, **prm))
+        n_prompt = len(ids) + n_image_tokens
+        room = app.engine.max_model_len - n_prompt - 1
+        if room < 1:
+            raise BadRequest(f"prompt has {n_prompt} tokens; max_model_len is {app.engine.max_model_len}")
+        stream, include_usage = prm.pop("stream"), prm.pop("include_usage")
+        return_token_ids = prm.pop("return_token_ids")
+        stop = prm.pop("stop") + list(extra_stop)
+        prm["max_tokens"] = room if prm["max_tokens"] is None else min(prm["max_tokens"], room)
         rid = ("chatcmpl-" if chat else "cmpl-") + uuid.uuid4().hex[:24]
         created = int(time.time())
         detok = Detok(app.codec, stop)
-        stream = bool(body.get("stream", False))
-        include_usage = bool((body.get("stream_options") or {}).get("include_usage", False))
         obj = "chat.completion" if chat else "text_completion"
-        log.info("%s engine-id %s prompt %d tok max_tokens %d stream %s tools %s/%d response_format %s grammar %s "
-                 "images %d (%d tok)", rid, req.request_id, len(ids) + n_image_tokens, prm["max_tokens"], stream,
-                 plan.choice, len(plan.tools), plan.rf_kind, so is not None, n_images, n_image_tokens)
         # chat output -> reasoning_content / content / tool_calls deltas (tools.py); plain text without encoding.py
         parser = tools.StreamParser(app.codec.enc, thinking, plan) if chat and app.codec.enc is not None else None
+        # everything above may raise BadRequest; from submit on, every exit that is not a finished generation aborts
+        req = app.engine.submit(GenRequest(prompt_ids=ids, so_args=so, multi_modal_data=mm, **prm))
+        log.info("%s engine-id %s prompt %d tok max_tokens %d stream %s tools %s/%d response_format %s grammar %s "
+                 "images %d (%d tok)", rid, req.request_id, n_prompt, prm["max_tokens"], stream,
+                 plan.choice, len(plan.tools), plan.rf_kind, so is not None, n_images, n_image_tokens)
+        finished = False
+        try:
+            finished = self._respond(req, rid, created, obj, chat, stream, include_usage, return_token_ids, detok,
+                                     parser, plan, thinking, ids, n_prompt)
+        finally:
+            if not finished:
+                app.engine.abort(req.request_id)
+
+    def _respond(self, req, rid, created, obj, chat, stream, include_usage, return_token_ids, detok, parser, plan,
+                 thinking, ids, n_prompt) -> bool:
+        """Streams or returns the generation. -> True if the engine finished the request (no abort needed)."""
+        app = self.app
 
         def chunk(delta_text: str | None, finish: str | None, role: bool = False, usage=None, delta=None) -> dict:
             if chat:
@@ -345,7 +467,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(b"data: " + json.dumps(d, ensure_ascii=False).encode() + b"\n\n")
             self.wfile.flush()
 
-        finish, n_tok, err, out_ids, lp_rows = None, 0, None, [], []
+        finish, reason, n_tok, err, out_ids, lp_rows, finished = None, None, 0, None, [], [], False
         try:
             if stream and chat:
                 send(chunk(None, None, role=True))
@@ -366,7 +488,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not eos:
                     detok.push(tok)
                 if detok.stopped and not finished:
-                    app.engine.abort(req.request_id)
+                    app.engine.abort(req.request_id)  # a stop string: the engine does not know it
                     finished, reason = True, "stop"
                 if stream:
                     piece = detok.emit(final=finished)
@@ -379,28 +501,41 @@ class Handler(BaseHTTPRequestHandler):
                     finish = _finish_reason(reason, detok.stopped)
                     break
         except (BrokenPipeError, ConnectionResetError):
-            app.engine.abort(req.request_id)  # client went away: cancel the generation
-            log.info("%s client disconnected after %d tokens: aborted", rid, n_tok)
-            return
+            log.info("%s client disconnected after %d tokens%s", rid, n_tok, "" if finished else ": aborted")
+            return finished
         if err is not None:
-            app.engine.abort(req.request_id)
             if stream:
                 send({"error": {"message": err, "type": "server_error"}})
                 self.wfile.write(b"data: [DONE]\n\n")
-                return
-            return self._error(500, err, "server_error")
-        n_prompt = len(ids) + n_image_tokens
+            else:
+                self._error(500, err, "server_error")
+            return False
+        abort_reason = _abort_reason(reason, detok.stopped)
         usage = {"prompt_tokens": n_prompt, "completion_tokens": n_tok, "total_tokens": n_prompt + n_tok}
         t = req.first_token_t
-        log.info("%s done: %d tokens, finish %s, ttft %.3fs, total %.3fs", rid, n_tok, finish,
-                 (t - req.submitted) if t else -1, time.perf_counter() - req.submitted)
+        log.info("%s done: %d tokens, finish %s%s, ttft %.3fs, total %.3fs", rid, n_tok, finish,
+                 f" ({abort_reason})" if abort_reason else "", (t - req.submitted) if t else -1,
+                 time.perf_counter() - req.submitted)
+        try:
+            self._finish_response(chunk, send, stream, include_usage, usage, finish, abort_reason, parser, chat,
+                                  detok, plan, thinking, return_token_ids, out_ids, lp_rows, ids, rid, created, obj)
+        except (BrokenPipeError, ConnectionResetError):
+            log.info("%s client disconnected before the end of the response", rid)
+        return True
+
+    def _finish_response(self, chunk, send, stream, include_usage, usage, finish, abort_reason, parser, chat, detok,
+                         plan, thinking, return_token_ids, out_ids, lp_rows, ids, rid, created, obj) -> None:
+        app = self.app
         if stream:
             if parser is not None:
                 for d in parser.finish():
                     send(chunk(None, None, delta=d))
                 if parser.calls and finish == "stop":
                     finish = "tool_calls"
-            send(chunk(None, finish))
+            last = chunk(None, finish)
+            if abort_reason:
+                last["choices"][0]["abort_reason"] = abort_reason
+            send(last)
             if include_usage:
                 d = chunk(None, None, usage=usage)
                 d["choices"] = []
@@ -425,7 +560,9 @@ class Handler(BaseHTTPRequestHandler):
             choice = {"index": 0, "message": message, "finish_reason": finish}
         else:
             choice = {"index": 0, "text": text, "logprobs": None, "finish_reason": finish}
-        if body.get("return_token_ids"):  # extension (tests): engine token ids incl. EOS, and the prompt ids
+        if abort_reason:
+            choice["abort_reason"] = abort_reason
+        if return_token_ids:  # extension (tests): engine token ids incl. EOS, and the prompt ids
             choice["token_ids"], choice["prompt_token_ids"] = out_ids, ids
         if self._lp[0]:
             choice["logprobs"] = self._logprobs_obj(out_ids, lp_rows, chat)
@@ -468,6 +605,11 @@ def _logprobs_obj(self, out_ids, rows, chat: bool):
 Handler._logprobs_obj = _logprobs_obj
 
 
+def _max_request_bytes(args) -> int:
+    # a chat request carries its images base64-encoded (4/3 of the bytes) in the JSON body
+    return args.max_request_bytes or (args.max_images * args.max_image_bytes * 4 // 3 + (16 << 20))
+
+
 class App:
     def __init__(self, args):
         self.args = args
@@ -475,6 +617,8 @@ class App:
         self.created = int(time.time())
         self.request_timeout = args.request_timeout
         self.codec = TextCodec(args.ckpt)
+        self.vocab_size = self.codec.tok.get_vocab_size(with_added_tokens=True)
+        self.max_request_bytes = _max_request_bytes(args)
         self.image_limits = images.ImageLimits(max_images=args.max_images, max_bytes=args.max_image_bytes,
                                                max_pixels=args.max_image_pixels, fetch_urls=not args.no_image_urls,
                                                fetch_private=args.image_fetch_private,
@@ -703,6 +847,10 @@ def main() -> int:
                     help="data-parallel ranks = GPUs (DP attention + EP MoE, docs/MULTI_GPU.md): one engine process per "
                          "rank on ports PORT+1.., and a least-loaded proxy on --port (dp_proxy.py)")
     ap.add_argument("--ep", type=int, default=None, help="expert-parallel size (default: --dp)")
+    ap.add_argument("--start-timeout", type=float, default=3600.0,
+                    help="--dp: seconds until every rank must answer /health (weights, JIT, graph capture; a cold "
+                         "/cache compiles for a long time), else all ranks are stopped and the server exits non-zero. "
+                         "0 = no limit")
     ap.add_argument("--dp-rank", type=int, default=None, help=argparse.SUPPRESS)  # set by the proxy for its children
     ap.add_argument("--force-proxy", action="store_true", help=argparse.SUPPRESS)  # tests: proxy even with --dp 1
     ap.add_argument("--max-images", type=int, default=8, help="images per chat request")
@@ -712,6 +860,9 @@ def main() -> int:
     ap.add_argument("--image-fetch-private", action="store_true",
                     help="allow image URLs on loopback / private / link-local addresses (off: SSRF protection)")
     ap.add_argument("--image-fetch-timeout", type=float, default=10.0, help="seconds per image URL fetch")
+    ap.add_argument("--max-request-bytes", type=int, default=0,
+                    help="max POST body size (HTTP 413 above it). 0 (default): enough for --max-images base64 images "
+                         "of --max-image-bytes each plus 16 MiB of text (8 x 20 MiB: 229 MiB)")
     ap.add_argument("--log-level", default="INFO")
     args = ap.parse_args()
     _yoco_compact_env(args, ap)
@@ -751,8 +902,9 @@ def main() -> int:
                 continue
             rest.append(a)
         try:
-            rc = dp_proxy.run(rest, args.dp, args.host, args.port)
-        except SystemExit as exc:  # start-up failure, after the ranks were stopped
+            rc = dp_proxy.run(rest, args.dp, args.host, args.port, start_timeout=args.start_timeout,
+                              max_request_bytes=_max_request_bytes(args))
+        except SystemExit as exc:  # start-up failure or a failed rank (watchdog), after the ranks were stopped
             if exc.code is None or isinstance(exc.code, int):
                 rc = exc.code or 0
             else:

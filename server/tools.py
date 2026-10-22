@@ -269,6 +269,7 @@ class StreamParser:
         self.sub = "open"  # open | invoke | body | done | bad
         self.calls: list[dict] = []  # {"id", "name", "args"}
         self.n_params = 0
+        self.keys: set[str] = set()  # parameter names of the current call
 
     # -- public
     def feed(self, text: str) -> list[dict]:
@@ -389,6 +390,7 @@ class StreamParser:
                     call = {"id": new_call_id(), "name": name, "args": ""}
                     self.calls.append(call)
                     self.n_params = 0
+                    self.keys = set()
                     out.append({"tool_calls": [{"index": len(self.calls) - 1, "id": call["id"], "type": "function",
                                                 "function": {"name": name, "arguments": ""}}]})
                     self.sub = "body"
@@ -397,6 +399,15 @@ class StreamParser:
                     return out
                 return out + self._bad()
             elif self.sub == "body":  # parameters, then </invoke>
+                if self.n_params == 0 and rem.startswith("\n"):
+                    # an argument-less call: encoding.py renders the empty argument list as its own line,
+                    # '">\n' + "" + "\n</invoke>"
+                    if rem[1:].startswith(D.invoke_close):
+                        self.pos += 1
+                        continue
+                    if D.invoke_close.startswith(rem[1:]):
+                        return out
+                    return out + self._bad()
                 if rem.startswith(D.param_open):
                     j = rem.find(D.param_close, len(D.param_open))
                     if j < 0 or len(rem) < j + len(D.param_close) + 1:
@@ -413,6 +424,9 @@ class StreamParser:
                             json.loads(v)
                         except ValueError:
                             return out + self._bad()
+                    if key in self.keys:  # encoding.parse_tool_calls rejects it too; never stream a duplicate JSON key
+                        return out + self._bad()
+                    self.keys.add(key)
                     piece = ("{" if self.n_params == 0 else ", ") + f"{D.to_json(key)}: {v}"
                     self.n_params += 1
                     self.calls[-1]["args"] += piece

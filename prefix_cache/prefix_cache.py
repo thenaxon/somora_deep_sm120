@@ -155,7 +155,9 @@ class PrefixCache:
         return int(getattr(cc, "num_state_seqs", -1)) if cc is not None else -1
 
     def _pinned_blocks(self) -> int:
-        return len({b for e in self.entries.values() for b in e.blocks})
+        # list(...) copies the values in one C call: safe against the engine thread inserting / evicting while
+        # summary() runs on an HTTP thread (iterating the OrderedDict itself can raise "mutated during iteration")
+        return len({b for e in list(self.entries.values()) for b in e.blocks})
 
     def _evict_one(self) -> bool:
         if not self.entries:
@@ -348,6 +350,7 @@ class PrefixCache:
         return out
 
     def summary(self) -> dict:
+        """Counters for /health; called from HTTP threads while the engine thread updates the cache."""
         s = dict(self.stats)
         s.update(entries=len(self.entries), pinned_blocks=self._pinned_blocks(), grain=self.grain,
                  checkpoint_stride=self.checkpoint_stride,

@@ -8,9 +8,14 @@ module:
 
 * spawns N copies of server.py (`--dp-rank r --port base+1+r --host 127.0.0.1`, same arguments otherwise); each builds
   its engine with engine_rank r, data_parallel_size = N, expert_parallel_size = --ep (default N);
-* runs a reverse proxy on the public port. POST requests go to the rank with the fewest in-flight requests;
-  `/v1/models` goes to rank 0; `/health` aggregates all ranks. Response bodies are streamed through unchanged (SSE).
-  A client disconnect closes the upstream connection, which makes that rank abort the request.
+* runs a reverse proxy on the public port. Only the public routes are forwarded (PUBLIC_POST / PUBLIC_GET; the
+  ranks' /internal/* routes are not reachable through it). POST requests go to the rank with the fewest in-flight
+  requests; `/v1/models` goes to rank 0; `/health` aggregates all ranks (queried in parallel). Response bodies are
+  streamed through unchanged (SSE). A client disconnect closes the upstream connection, which makes that rank abort
+  the request. A rank that cannot be reached before the response headers gives a 502 / 503 JSON error.
+* supervises the ranks: a rank that has not answered /health within --start-timeout, or that exits during start-up
+  or later (or reports a dead engine), stops the proxy and all other ranks, and the server exits non-zero (the other
+  ranks may be blocked in a collective with it; a restart policy such as docker --restart can then act).
 
 Prefix caches are per rank: the proxy is not prefix-aware.
 
@@ -33,10 +38,17 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 log = logging.getLogger("di_server.dp")
+
+PUBLIC_POST = ("/v1/completions", "/v1/chat/completions")  # forwarded to the least-loaded rank
+PUBLIC_GET = ("/v1/models",)  # forwarded to rank 0 (/health and /v1/health are answered by the proxy)
+UPSTREAM_ERRORS = (OSError, http.client.HTTPException)  # refused, reset, timeout, malformed / no response
 
 
 class Backends:
@@ -56,18 +68,104 @@ class Backends:
             self.inflight[i] -= 1
 
 
+def rank_health(ports: list[int], timeout: float = 5.0) -> list[dict]:
+    """GET /health of every rank, in parallel (a slow or dead rank costs one timeout, not one per rank)."""
+
+    def one(p: int) -> dict:
+        try:
+            return json.loads(urllib.request.urlopen(f"http://127.0.0.1:{p}/health", timeout=timeout).read())
+        except urllib.error.HTTPError as exc:  # 503 from a rank whose engine died: its body says so
+            try:
+                return json.loads(exc.read())
+            except Exception:  # noqa: BLE001
+                return {"status": "dead", "error": repr(exc)[:200]}
+        except Exception as exc:  # noqa: BLE001
+            return {"status": "unreachable", "error": repr(exc)[:200]}
+
+    with ThreadPoolExecutor(max_workers=max(1, len(ports))) as ex:
+        return list(ex.map(one, ports))
+
+
+class Watchdog:
+    """Polls the rank processes (and every `health_every` seconds their /health) after start-up. on_fail(msg) is
+    called once when a rank exits or reports a dead engine (status "dead" twice in a row: the engine thread is gone
+    while the HTTP process lives on). An unreachable or slow /health alone is not a failure (busy rank)."""
+
+    def __init__(self, procs, ports: list[int], on_fail, interval: float = 1.0, health_every: float = 5.0):
+        self.procs, self.ports, self.on_fail = procs, ports, on_fail
+        self.interval, self.health_every = interval, health_every
+        self._stop = threading.Event()
+        self._dead = [0] * len(ports)
+        self.failure: str | None = None
+        self._thread = threading.Thread(target=self._run, name="dp-watchdog", daemon=True)
+
+    def start(self) -> "Watchdog":
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def check(self, with_health: bool) -> str | None:
+        for r, p in enumerate(self.procs):
+            if p.poll() is not None:
+                return f"rank {r} (pid {p.pid}) exited with {p.returncode}"
+        if with_health and self.ports:
+            for r, h in enumerate(rank_health(self.ports)):
+                self._dead[r] = self._dead[r] + 1 if h.get("status") == "dead" else 0
+                if self._dead[r] >= 2:
+                    return f"rank {r} reports a dead engine: {str(h.get('error') or h)[:200]}"
+        return None
+
+    def _run(self) -> None:
+        last_health = time.monotonic()
+        while not self._stop.wait(self.interval):
+            now = time.monotonic()
+            with_health = now - last_health >= self.health_every
+            if with_health:
+                last_health = now
+            msg = self.check(with_health)
+            if msg and not self._stop.is_set():
+                self.failure = msg
+                log.error("%s: stopping the proxy and all ranks", msg)
+                self.on_fail(msg)
+                return
+
+
 class ProxyHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     backends: Backends
+    max_request_bytes: int = 1 << 62
+    procs: list = []  # rank processes (503 instead of 502 for a rank that has exited)
 
     def log_message(self, fmt, *args):
         log.debug("%s %s", self.address_string(), fmt % args)
 
+    def _json(self, code: int, obj) -> None:
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _error(self, code: int, msg: str, typ: str = "invalid_request_error") -> None:
+        self._json(code, {"error": {"message": msg, "type": typ, "code": code}})
+
+    def _route(self) -> str:
+        return urllib.parse.urlsplit(self.path).path
+
     def _forward(self, i: int, method: str, body: bytes | None) -> None:
         c = http.client.HTTPConnection("127.0.0.1", self.backends.ports[i], timeout=3600)
         try:
-            c.request(method, self.path, body, {"Content-Type": self.headers.get("Content-Type", "application/json")})
-            r = c.getresponse()
+            try:
+                c.request(method, self.path, body, {"Content-Type": self.headers.get("Content-Type", "application/json")})
+                r = c.getresponse()
+            except UPSTREAM_ERRORS as exc:  # nothing sent to the client yet: a proper error response
+                gone = i < len(self.procs) and self.procs[i].poll() is not None
+                log.warning("rank %d %s: %r", i, "has exited" if gone else "unreachable", exc)
+                return self._error(503 if gone else 502, f"rank {i} {'is not running' if gone else 'unreachable'}: "
+                                   f"{type(exc).__name__}", "server_error")
             self.send_response(r.status)
             length = r.getheader("Content-Length")
             for k in ("Content-Type", "Cache-Control"):
@@ -80,7 +178,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self.close_connection = True
             self.end_headers()
             while True:
-                chunk = r.read1(65536) if hasattr(r, "read1") else r.read(65536)
+                try:
+                    chunk = r.read1(65536) if hasattr(r, "read1") else r.read(65536)
+                except UPSTREAM_ERRORS as exc:  # headers are out: all that is left is to end the response early
+                    log.warning("rank %d: response cut off: %r", i, exc)
+                    self.close_connection = True
+                    break
                 if not chunk:
                     break
                 self.wfile.write(chunk)
@@ -90,13 +193,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         try:
-            if self.path in ("/health", "/v1/health"):
-                ranks = []
-                for p in self.backends.ports:
-                    try:
-                        ranks.append(json.loads(urllib.request.urlopen(f"http://127.0.0.1:{p}/health", timeout=5).read()))
-                    except Exception as exc:  # noqa: BLE001
-                        ranks.append({"status": "dead", "error": repr(exc)[:200]})
+            route = self._route()
+            if route in ("/health", "/v1/health"):
+                ranks = rank_health(self.backends.ports)
                 ok = all(r.get("status") == "ok" for r in ranks)
 
                 def agg(key):
@@ -121,20 +220,40 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(body)
                 return
+            if route not in PUBLIC_GET:
+                return self._error(404, f"no route {route}")
             self._forward(0, "GET", None)
         except (BrokenPipeError, ConnectionResetError):
             pass
 
     def do_POST(self):
-        n = int(self.headers.get("Content-Length") or 0)
-        body = self.rfile.read(n)
-        i = self.backends.acquire()
         try:
-            self._forward(i, "POST", body)
+            route = self._route()
+            if route not in PUBLIC_POST:  # e.g. the ranks' /internal/* maintenance routes
+                self.close_connection = True  # body left unread
+                return self._error(404, f"no route {route}")
+            if self.headers.get("Transfer-Encoding"):
+                self.close_connection = True
+                return self._error(400, "chunked request bodies are not supported: send Content-Length")
+            raw_n = self.headers.get("Content-Length")
+            try:
+                n = int(raw_n) if raw_n is not None else 0
+            except ValueError:
+                n = -1
+            if n < 0:
+                self.close_connection = True
+                return self._error(400, f"invalid Content-Length {raw_n!r}")
+            if n > self.max_request_bytes:
+                self.close_connection = True
+                return self._error(413, f"request body of {n} bytes exceeds --max-request-bytes {self.max_request_bytes}")
+            body = self.rfile.read(n)
+            i = self.backends.acquire()
+            try:
+                self._forward(i, "POST", body)
+            finally:
+                self.backends.release(i)
         except (BrokenPipeError, ConnectionResetError):
             pass
-        finally:
-            self.backends.release(i)
 
 
 _P2P_TEST = r"""
@@ -177,8 +296,11 @@ def nccl_p2p_env(dp: int) -> dict:
     return {}
 
 
-def run(argv: list[str], dp: int, host: str, port: int) -> int:
-    """argv: server.py arguments without --dp/--host/--port. Spawns the ranks and serves the proxy until interrupted."""
+def run(argv: list[str], dp: int, host: str, port: int, start_timeout: float = 0.0,
+        max_request_bytes: int = 1 << 62) -> int:
+    """argv: server.py arguments without --dp/--host/--port. Spawns the ranks and serves the proxy until interrupted
+    (-> 0); a rank that fails (watchdog) or a start-up past start_timeout raises SystemExit (exit code 1) after the
+    ranks were stopped. start_timeout: seconds for all ranks to answer /health (0 = no limit)."""
     ports = [port + 1 + r for r in range(dp)]
     shm_fds = None
     if os.environ.get("SM120_ENGRAM_MODE") == "pinned":  # one shared, pinned copy of the engram tables for all ranks
@@ -203,6 +325,9 @@ def run(argv: list[str], dp: int, host: str, port: int) -> int:
         t0 = time.time()
         pending = set(range(dp))
         while pending:
+            if start_timeout and time.time() - t0 > start_timeout:
+                start_failed = True
+                raise SystemExit(f"rank(s) {sorted(pending)} not up after {start_timeout:.0f}s (--start-timeout)")
             for r in list(pending):
                 if procs[r].poll() is not None:  # the others may be stuck in a collective with it: stop them all
                     start_failed = True
@@ -226,11 +351,21 @@ def run(argv: list[str], dp: int, host: str, port: int) -> int:
         if fatal:  # SM120_ENGRAM_PIN cannot be honoured: stop all ranks instead of serving without the guarantee
             raise SystemExit(f"engram tables cannot be pinned: {fatal}")
         ProxyHandler.backends = Backends(ports)
+        ProxyHandler.max_request_bytes = max_request_bytes
+        ProxyHandler.procs = procs
         ThreadingHTTPServer.request_queue_size = 1024  # listen backlog (socketserver default 5)
         httpd = ThreadingHTTPServer((host, port), ProxyHandler)
         httpd.daemon_threads = True
         log.info("dp proxy: %d ranks on ports %s, serving on http://%s:%d", dp, ports, host, port)
-        httpd.serve_forever()
+        # a rank that dies while serving: stop serving; the finally block below stops the other ranks
+        watchdog = Watchdog(procs, ports, lambda msg: threading.Thread(target=httpd.shutdown, daemon=True).start()).start()
+        try:
+            httpd.serve_forever()
+        finally:
+            watchdog.stop()
+        if watchdog.failure:  # the finally block stops the other ranks (they may be stuck in a collective with it)
+            start_failed = True
+            raise SystemExit(f"{watchdog.failure}: stopped all ranks")
     except KeyboardInterrupt:
         pass
     finally:

@@ -18,6 +18,7 @@ Every patch is listed and justified in patches/PATCHES.md.
     SM120_REMAP_SMEM_BYTES=<int>     shared-memory budget of the patched sampler.remap_draft_topk kernel (P8)
     SM120_CACHE_ROOT=/cache          persistent cache root: B12X_COMPILE_CACHE_DIR, TRITON_CACHE_DIR defaults
     SM120_RETAIN_GRAPH_PROGRAMS=1|0  keep the b12x programs launched by graph warm-up/capture loaded (P9, default 1)
+    SM120_CAPTURE_FAIL_FATAL=1|0     a failed CUDA-graph capture exits the process with 4 (P9, default 1; 0: re-raise)
 """
 
 from __future__ import annotations
@@ -462,6 +463,13 @@ def _wrap_graph_capture(cls, label: str) -> None:
                   "the forward must be capturable: b12x MoE/linears are (plans are warmed by DeepInfer's "
                   "per-size warm-up run); SM120_MOE_IMPL=torch|deepep are not. "
                   "Set DEEPINFER_ENFORCE_EAGER=1 to bisect.", flush=True)
+            if os.environ.get("SM120_CAPTURE_FAIL_FATAL", "1") != "0":
+                # fatal: re-raised, the error did not end the process (with --dp all 4 ranks hung after it, in
+                # DeepInfer's start-up / NCCL teardown), so the --dp proxy never saw a rank die. Exit at once instead.
+                print(f"[sm120_patches] {label} capture failed: exiting with 4 (SM120_CAPTURE_FAIL_FATAL=0: raise)",
+                      flush=True)
+                sys.stderr.flush()
+                os._exit(4)
             raise
         finally:
             print(f"[sm120_patches] {label} capture done in {time.time() - t0:.1f}s: moe={sm120_moe.stats()} "

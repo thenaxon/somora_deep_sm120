@@ -278,7 +278,7 @@ ranks (MIN all-reduce, `scheduler.hpp:296-340`).
 
   | both intervals | TTFT | mixed short TPOT p50 / p99 | loadgen tok/s, TPOT p99 |
   |---|---|---|---|
-  | 100 / 70 (DeepInfer's defaults) | 2.0 / 2.9 / 24.0 s | 27 / 57 ms | 376, 49 ms |
+  | 1 / 100 (0.2.4; DeepInfer's own defaults are 70 / 100) | 2.0 / 2.9 / 24.0 s | 27 / 57 ms | 376, 49 ms |
   | 1 | 0.24 / 1.1 / 8.8 s | 226 / 401 ms | – |
   | 8 | 0.70 / 1.24 / 9.8 s | 62 / 118 ms | 325, 81 ms |
   | 8, `--max-num-batched-tokens 2048` | 0.78 / 1.42 / 11.2 s | 42 / 71 ms | 363, 56 ms |

@@ -4,6 +4,91 @@ Measured results of the full DeepSeek-V4.1-Flash model on the multi-GPU target, 
 same checkpoint on the same machine. Single-GPU results with truncated test checkpoints are in
 [VALIDATION.md](VALIDATION.md) and the README. Discussion: [issue #2](../../../issues/2).
 
+## v0.3.0 (release candidate)
+
+**In short:** stable on 4× RTX PRO 6000 over PCIe, quality on par with the tuned vLLM deployment (27/27 vs 26/27).
+With many concurrent users and long prompts it now matches vLLM's throughput and reaches the first token sooner.
+A single user still gets about half of vLLM's decode speed, and a single long prompt is read about 5–6× slower,
+because one GPU reads each prompt here while vLLM's tensor parallelism spreads it over four ([#1](../../../issues/1)).
+
+### Setup
+
+- **Hardware, model, baseline:** as for v0.2.0 below (4× RTX PRO 6000 Blackwell Max-Q, 96 GB, PCIe only; full
+  DeepSeek-V4.1-Flash; vLLM fork with b12x kernels, TP=4, adaptive DSpark up to 7 drafts, engram tables in RAM).
+- **This engine:** `--dp 4` with CUDA graphs, `--nextn 7`, `--prefix-cache`, `--gpu-memory-utilization 0.95
+  --max-model-len 40960 --max-num-seqs 16 --max-num-batched-tokens 4096 --max-blocks 4096`,
+  `SM120_ENGRAM_MODE=pinned` (one copy of the 189 GiB engram tables in pinned host RAM for all ranks).
+- The numbers were measured with the 0.2.4 image. The column "0.3.0 defaults" adds the prefill intervals 16 / 16
+  that 0.3.0 sets by default with `--dp > 1` (`-e DEEPINFER_PREFILL_ATTEMPT_INTERVAL=16
+  -e DEEPINFER_PREFILL_ANY_ATTEMPT_INTERVAL=16`); the code is otherwise the same.
+
+### Progress since v0.2.0
+
+| | v0.2.0 | v0.2.1 | v0.2.4 | 0.3.0 defaults | vLLM (TP=4) |
+|---|---|---|---|---|---|
+| TTFT, new 58-token prompt | – | – | 2.0 s | **0.85 s** | ~0.2 s |
+| TTFT, new 4k prompt | 3.9–4.6 s | 3.7–4.0 s | 2.9 s | **1.4 s** | 0.24 s |
+| TTFT, new 32k prompt | 32.6 s | 33.8–35.7 s | 24.0 s | **11.0 s** | ~2.0 s |
+| 4k prompts × 16 users, output tok/s | 224 | 117 | 376 | **388** | 417 |
+| 4k prompts × 64 users, output tok/s (TTFT p50) | 248 (20.4 s) | 116 | **420 (7.9 s)** | – | 425 (33.8 s) |
+| 512-token prompts × 64 users, output tok/s | 944 | 623 | **1,150** | – | 1,324 |
+| quality, 28-item set | 27/27 | – | 27/27 | – | 26/27 |
+
+`loadgen.py` uses random token-id prompts and 256 output tokens (speculative decoding accepts almost nothing on them).
+
+### Real prompts (`eval/scenarios.py realistic`, output tok/s), v0.2.4
+
+| set | users | this engine, `--nextn 7` | vLLM |
+|---|---|---|---|
+| code | 1 | 101 | 209 |
+| code | 16 | 951 | 1,200 |
+| chat (German / English) | 1 | 67 / 74 | 148 / 157 |
+| chat (German / English) | 16 | 496 / 560 | 797 / 787 |
+
+- Draft acceptance with 7 drafts: code 0.52, chat 0.22–0.25. `--nextn 7` was the best fixed setting; `--mtp-varlen`
+  (DeepInfer's adaptive draft length) won only for German chat at 16 users and lost at 1 user.
+- One decode step at batch 1 takes 20.3 ms (v0.2.3: 32.1 ms, before the decode-graph fix).
+
+### Mixed load and the prefill intervals
+
+With several DP ranks DeepInfer decides per step, for all ranks together, whether to read a prompt or to decode. The
+two intervals set how many decode steps run between two prefill chunks. 16 / 16 was the best trade-off measured:
+
+| intervals | TTFT 58 / 4k / 32k | short chats during long prompts: TPOT p50 / p99 | short requests done in 60 s | 4k × 16 tok/s |
+|---|---|---|---|---|
+| 1 / 100 (v0.2.4) | 2.0 / 2.9 / 24.0 s | 27 / 57 ms | 105 | 376 |
+| 1 / 1 | 0.24 / 1.1 / 8.8 s | 226 / 401 ms | 13 | – |
+| 8 / 8 | 0.70 / 1.24 / 9.8 s | 62 / 118 ms | 50 | 325 |
+| **16 / 16** | 0.85 / 1.39 / 11.0 s | 36 / 65 ms | 68 | 388 |
+| vLLM | ~0.2 / 0.24 / ~2.0 s | – / 25 ms | 191 | 417 |
+
+DeepInfer cannot mix decode tokens into a prefill step, so while a long prompt is read the other users' streams pause
+for each chunk. vLLM's mixed batches avoid that.
+
+### What changed since v0.2.1
+
+- **v0.2.1** fixed the prefix-cache chunking and the EP prefill padding (single-GPU gains), but on the 4-GPU host the
+  load numbers dropped (4k × 64: 248 → 116 tok/s). The cause was the engram tables: they did not stay in the page
+  cache, and every miss became an NVMe read through the host's IOMMU (perf: 18 % of the CPU time in
+  `amd_iommu_iotlb_sync`).
+- **Engram tables in pinned RAM (0.2.3):** `SM120_ENGRAM_MODE=pinned` keeps one copy for all ranks in shared, pinned host
+  memory, and the GPUs gather rows from it directly, also inside CUDA graphs. perf no longer shows the IOMMU; the load
+  numbers recovered (4k × 64: 116 → 420 tok/s). It needs about 225 GiB of free RAM before start and about 0.4 GiB of
+  GPU memory per rank, so `--gpu-memory-utilization 0.95` instead of 0.92.
+- **Decode graphs without padding (0.2.3/0.2.4):** the captured decode graphs exchanged the full batch capacity between
+  the GPUs in every step, also for one user. Now each graph exchanges only its own rows: 32.1 → 20.3 ms per step at
+  batch 1, +15–60 % output tok/s.
+- **Prefill vote (0.3.0):** a request that only one rank held waited up to 100 decode steps before its prefill
+  (DeepInfer's `DEEPINFER_PREFILL_ANY_ATTEMPT_INTERVAL`), before every 4096-token chunk. Fixed by the prefill
+  intervals above.
+- Numerics are unchanged: teacher-forced against vLLM's continuations, top-1 agreement 0.949, mean KL 0.063.
+
+### Where a prefill spends its time (v0.2.4, 4k prompt, all 4 ranks busy)
+
+GPU busy 94 %: NCCL collectives 27 % (part of it waiting for the rank with the heaviest experts), MoE 20 %, sparse MLA
+attention 19 %, GEMMs 12 %. Larger MoE buckets (`SM120_MOE_BUCKETS=...,8192`) cut the MoE time by 23 % but did not change
+the TTFT; NCCL already picks the Simple protocol at these message sizes.
+
 ## v0.2.0
 
 **In short:** DeepInfer runs the full DeepSeek-V4.1-Flash on 4 SM120 GPUs over PCIe. It is stable and correct, and its quality matches or exceeds the baseline. It is not yet competitive on speed: decode is about 2–3× and prefill about 15× behind. The main prefill causes are identified, and fixes are on the way for v0.2.1.

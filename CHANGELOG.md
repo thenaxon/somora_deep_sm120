@@ -3,7 +3,21 @@
 All notable changes to this project are documented here. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0 any minor release may change interfaces.
 
-## [Unreleased]
+## [0.3.0-rc1] - 2026-10-22
+
+Release candidate for the first public version. 0.2.5 was not tagged; its changes are listed here.
+
+### Changed
+- Documentation for a public release: the README states the hardware the full model needs (4× RTX PRO 6000, about
+  256 GB RAM; a single RTX 5090 only runs truncated test checkpoints), the recommended configuration
+  (`SM120_ENGRAM_MODE=pinned`, `--gpu-memory-utilization 0.95`, `--nextn 7`) and the current results against vLLM;
+  docs/RESULTS.md has the v0.3.0 measurements and the progress since v0.2.0; the runbook's launch command is the
+  recommended configuration. Start-up banner: "RTX PRO 6000 Blackwell" instead of "RTX 5090 / RTX PRO 6000".
+- `SM120_ENGRAM_MODE=pinned`: the start-up check counts the driver's host memory for the registration (about 14 MiB per
+  GiB of tables per rank), so `--dp 4` needs about 225 GiB available before start (was 215). A KV sizing failure in
+  pinned mode now says how much GPU memory the registration took and suggests raising `--gpu-memory-utilization`.
+  Logs: the registration's GPU and host cost per rank, and a host-memory breakdown after the fill.
+
 
 ### Fixed
 - `--dp > 1`: TTFT of about 2 s even for short prompts. With several DP ranks DeepInfer votes the step type, and a

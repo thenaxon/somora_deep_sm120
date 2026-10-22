@@ -79,7 +79,9 @@ def patch_worker(cls, group) -> None:
             local = 1 if is_placeholder or not seq_metadata_list else sum(int(s.seqlen_q) for s in seq_metadata_list)
             counts = dp_counts(local, group)
             _STATE["prefill_counts"], _STATE["prefill_rows"] = counts, max(counts)
-        elif getattr(mr, "use_cuda_graph", False):
+        elif getattr(mr, "use_cuda_graph", False) and getattr(getattr(mr, "cuda_graph_runner", None), "graphs", None):
+            # DeepInfer's own condition (model_runner._prepare_input_driver): without captured graphs it decodes
+            # eagerly, unpadded, and the EP layer then needs its fixed capacity (synced None), not the synced size
             local = 0
             if not is_placeholder and scheduler_outputs is not None:
                 local = int(scheduler_outputs.num_batched_tokens)

@@ -17,6 +17,7 @@ python3 $SM120_ROOT/tests/test_b12x_tiny_decode_swiglu.py; echo "patched exit=$?
 python3 $SM120_ROOT/tests/test_b12x_tiny_decode_swiglu.py --shape v41 --bench; echo "bench exit=$?"
 python3 $SM120_ROOT/patches/repro_b12x_tiny_decode_swiglu.py; echo "repro exit=$?"
 pytest -q -x $SM120_ROOT/tests/test_gemm_moe_graphs.py 2>&1 | tail -30
+pytest -q -x $SM120_ROOT/tests/test_fail_closed.py 2>&1 | tail -15
 cd /opt/deepinfer/deepinfer/model_executor/layers/tilelang_ops
 python3 -m pytest -q sampler.py -k "not benchmark" 2>&1 | tail -15
 python3 -m pytest -q dflash.py dflash_copy.py store_mtp_info.py schedule_mtp_varlen.py fused_sample.py -k "not benchmark" 2>&1 | tail -15

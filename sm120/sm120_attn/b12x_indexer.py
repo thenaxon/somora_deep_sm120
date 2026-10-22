@@ -196,22 +196,19 @@ def _score(plan_nbytes, qv, sv, w, pool, page_table, lengths, active, cand, cand
     return idx.score(binding)
 
 
-_CONST: dict = {}
-
-
-def _const_full(shape, value: int, dev) -> torch.Tensor:
-    """Cached read-only int32 constant (no fill kernel per call; made eagerly before any graph capture)."""
-    key = (tuple(shape), int(value), str(dev))
-    t = _CONST.get(key)
-    if t is None:
-        t = torch.full(shape, int(value), dtype=torch.int32, device=dev)
-        if not cfg.capturing():
-            _CONST[key] = t
-    return t
+_ACTIVE: dict = {}
 
 
 def _active(value: int, dev) -> torch.Tensor:
-    return _const_full((1,), min(int(value), 2 ** 31 - 1), dev)
+    """The active-width scalar: one persistent int32 per device, set per call (decode W = max_context_len and
+    prefill N change from call to call; a cached tensor per value grew without bound). Under capture the fill is
+    recorded, so a replay sets the capture-time value again."""
+    t = _ACTIVE.get(str(dev))
+    if t is None:
+        t = torch.empty((1,), dtype=torch.int32, device=dev)
+        if not cfg.capturing():
+            _ACTIVE[str(dev)] = t
+    return t.fill_(min(int(value), 2 ** 31 - 1))
 
 
 def _alloc_logits(rows: int, cols: int, device) -> torch.Tensor:
@@ -283,7 +280,7 @@ def _candidate_scores(plan_args, qv, sv, w, pool, table, lens, cand, T, dev):
         if c1 - c0 != cap_c:
             cc = torch.nn.functional.pad(cc, (0, cap_c - (c1 - c0)), value=-1)
         cc = cc.contiguous()
-        cl = _const_full((rows,), c1 - c0, dev)
+        cl = torch.full((rows,), c1 - c0, dtype=torch.int32, device=dev)  # not cached: rows and width vary per call
         for a in range(0, rows, cap):
             b = min(a + cap, rows)
             sc = _score(plan, qv[a:b], sv[a:b], w[a:b], pool, table if shared else table[a:b], lens[a:b], active,

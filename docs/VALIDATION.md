@@ -266,8 +266,8 @@ Logits:
   capture/replay introduces no error. The deterministic tokens
   (`[304, 270, 1840, 5090, 294, 270, 14108, 3554, 33, 455, ...]`) leave the torch-kernel reference at position 2
   (1840 vs 3072), a near-tie decided only by the MoE combine order.
-- For reproducible outputs use the exact torch MoE (`SM120_MOE_IMPL=torch`, which the server's `--deterministic`
-  sets). b12x 1.5.1's `deterministic_output` is wrong for some batch sizes (dynamic tiles below 64) and with expert parallelism (masked routes); 0.3.0 refused `SM120_MOE_DETERMINISTIC=1`, and since 0.3.1 `sm120_moe` works around both bugs (validated on b12x 1.5.1).
+- For reproducible outputs on one GPU use the exact torch MoE (`SM120_MOE_IMPL=torch`, which the server's
+  `--deterministic` sets; single-GPU only, refused with `--dp` / `--ep` > 1), with `--dp` `SM120_MOE_DETERMINISTIC=1`. b12x 1.5.1's `deterministic_output` is wrong for some batch sizes (dynamic tiles below 64) and with expert parallelism (masked routes); 0.3.0 refused `SM120_MOE_DETERMINISTIC=1`, and since 0.3.1 `sm120_moe` works around both bugs (validated on b12x 1.5.1).
 
 Speed (327-token prompt, 16 decode steps, single request; step times from `meta.step_timing`):
 

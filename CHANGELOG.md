@@ -3,7 +3,7 @@
 All notable changes to this project are documented here. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0 any minor release may change interfaces.
 
-## [0.2.4] - unreleased
+## [0.2.4] - 2026-10-22
 
 ### Fixed
 - `--dp` with CUDA graphs failed at start-up in 0.2.3 (`sm120_moe layer 0: b12x plan for max_tokens=64 requested

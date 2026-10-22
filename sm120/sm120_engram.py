@@ -843,14 +843,17 @@ def open_shared_table(ckpt_dir: str | None, layer_id: int, wloc: TensorLoc, sloc
         device = torch.device("cuda", torch.cuda.current_device())
     if not sh["registered"]:
         t0 = time.time()
+        free0 = torch.cuda.mem_get_info(device)[0]
         err = torch.cuda.cudart().cudaHostRegister(sh["base"], sh["size"], 0x01 | 0x02)  # Portable | Mapped
         if int(getattr(err, "value", err)) != 0:
             raise EngramResidencyError(f"pinned mode: cudaHostRegister of the {sh['size'] / 2**30:.1f} GiB shared "
                                        f"segment failed: {err} (needs --ulimit memlock=-1)")
         sh["registered"] = True
         sh["device_base"] = _device_pointer(sh["base"])
+        # the driver's GPU page tables for the mapping (~2 MiB per GiB of 4 KiB host pages) come out of the KV budget
+        cost = free0 - torch.cuda.mem_get_info(device)[0]
         print(f"[sm120_engram] pinned mode: registered the shared segment ({sh['size'] / 2**30:.1f} GiB) for "
-              f"{device} in {time.time() - t0:.1f} s", flush=True)
+              f"{device} in {time.time() - t0:.1f} s, {cost / 2**20:.0f} MiB of GPU memory", flush=True)
 
     def views(off: int, width: int):
         host = torch.frombuffer(sh["mm"], dtype=torch.uint8, count=rows * width, offset=off).view(rows, width)

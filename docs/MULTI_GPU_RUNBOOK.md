@@ -72,6 +72,13 @@ with `cudaErrorNotSupported` (measured on the RTX 5090 test machine), so `mlock`
 - Each registration costs the driver some bookkeeping: about 0.4 GiB for two registrations of 15.7 GiB, i.e. up to
   about 1 GiB per rank for the full tables.
 - The start-up check uses `SM120_ENGRAM_RANK_HOST_GB=5` per rank and `SM120_ENGRAM_PIN_HEADROOM_GB=6`.
+- **GPU memory:** the registration also costs GPU memory for the driver's page tables of the mapping, about 2 MiB per
+  GiB of tables: 0.34 GiB per rank for the full tables (measured on the 4-GPU host: non-torch memory 3.73 GiB vs 3.39
+  with `host` + `mlock`; 30 MiB for 15.7 GiB on the RTX 5090). DeepInfer sizes the KV cache from the free GPU memory, so
+  that comes out of the KV cache. If the KV budget is already tight (`kv_cache_size` in the "Memory profiling results"
+  line close to 0), raise `--gpu-memory-utilization` by about 0.005 or lower `--max-model-len`; otherwise start-up stops
+  with "No available memory for the cache blocks". The start-up log prints the cost per rank ("registered the shared
+  segment ... MiB of GPU memory"; device-wide, so ranks sharing one GPU see each other's registrations).
 
 Per rank, measured on the RTX 5090 test machine after load and a few 4k/32k requests:
 

@@ -25,6 +25,15 @@ Release candidate for the first public version. 0.2.5 was not tagged; its change
   experts. The server now refuses it at start-up (`SM120_ALLOW_B12X_DETERMINISTIC=1` overrides, for tests).
   `--deterministic` (torch MoE) and the default b12x MoE are not affected. The docs no longer recommend the mode.
 - The start log shows the effective prefill intervals (`prefill intervals: ...`).
+- `--dp > 1`: TTFT of about 2 s even for short prompts. With several DP ranks DeepInfer votes the step type, and a
+  prefill happens at the `DEEPINFER_PREFILL_ATTEMPT_INTERVAL` points only if every rank has a waiting prompt. A
+  request that only one rank holds waited for the next `DEEPINFER_PREFILL_ANY_ATTEMPT_INTERVAL` point (default 100
+  decode steps). The server now sets it (`--prefill-any-interval`, docs/SERVER.md).
+- `--dp > 1` with both prefill intervals at 1: while any rank had prompt chunks waiting, the decoders of all ranks got
+  about one token per prefill chunk (mixed load: TPOT p99 401 ms). `--prefill-interval` and `--prefill-any-interval`
+  now default to `auto`: 1 / 1 for `--dp 1`, 16 / 16 for `--dp > 1`, so that at least 16 decode steps run between two
+  chunks. Measured on 4× RTX PRO 6000 (`--nextn 7`), against 0.2.4: TTFT 58 tokens 2.0 → 0.85 s, 4k 2.9 → 1.4 s, 32k
+  24 → 11 s; mixed load short-chat TPOT p99 57 → 65 ms (401 ms with 1 / 1); loadgen 4096×16 376 → 388 tok/s. The image no longer sets the two `DEEPINFER_PREFILL_*` variables (an explicit `-e` still overrides).
 
 ### Changed
 - Documentation for a public release: the README states the hardware the full model needs (4× RTX PRO 6000, about
@@ -36,18 +45,6 @@ Release candidate for the first public version. 0.2.5 was not tagged; its change
   GiB of tables per rank), so `--dp 4` needs about 225 GiB available before start (was 215). A KV sizing failure in
   pinned mode now says how much GPU memory the registration took and suggests raising `--gpu-memory-utilization`.
   Logs: the registration's GPU and host cost per rank, and a host-memory breakdown after the fill.
-
-
-### Fixed
-- `--dp > 1`: TTFT of about 2 s even for short prompts. With several DP ranks DeepInfer votes the step type, and a
-  prefill happens at the `DEEPINFER_PREFILL_ATTEMPT_INTERVAL` points only if every rank has a waiting prompt. A
-  request that only one rank holds waited for the next `DEEPINFER_PREFILL_ANY_ATTEMPT_INTERVAL` point (default 100
-  decode steps). The server now sets it (`--prefill-any-interval`, docs/SERVER.md).
-- `--dp > 1` with both prefill intervals at 1: while any rank had prompt chunks waiting, the decoders of all ranks got
-  about one token per prefill chunk (mixed load: TPOT p99 401 ms). `--prefill-interval` and `--prefill-any-interval`
-  now default to `auto`: 1 / 1 for `--dp 1`, 16 / 16 for `--dp > 1`, so that at least 16 decode steps run between two
-  chunks. Measured on 4× RTX PRO 6000 (`--nextn 7`), against 0.2.4: TTFT 58 tokens 2.0 → 0.85 s, 4k 2.9 → 1.4 s, 32k
-  24 → 11 s; mixed load short-chat TPOT p99 57 → 65 ms (401 ms with 1 / 1); loadgen 4096×16 376 → 388 tok/s. The image no longer sets the two `DEEPINFER_PREFILL_*` variables (an explicit `-e` still overrides).
 
 ## [0.2.4] - 2026-10-22
 

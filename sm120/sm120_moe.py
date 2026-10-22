@@ -358,9 +358,13 @@ class B12xRoutedExperts:
             # shape"). Keep the heuristic config but route "grouped", which supports the top-k-sum combine.
             import dataclasses
 
+            # b12x 1.5.1 also computes wrong results with deterministic_output at dynamic_tile_m < 64 (5090: cos ~0
+            # against the default path, E=16 at 5..64 tokens, E=96 at 65..512; b12x's own choice for
+            # deterministic_output, decode_config=None, has the same tile): use at least 64 rows per tile.
             cfg = caps.decode_config
-            if cfg.backend == "dynamic" and cfg.dynamic_route_mode == "direct":
-                cfg = dataclasses.replace(cfg, dynamic_route_mode="grouped")
+            if cfg.backend == "dynamic":
+                cfg = dataclasses.replace(cfg, dynamic_route_mode="grouped" if cfg.dynamic_route_mode == "direct"
+                                          else cfg.dynamic_route_mode, dynamic_tile_m=max(64, cfg.dynamic_tile_m))
             caps = fm.Caps(**caps_kw, decode_config=cfg, deterministic_output=True)
         plan = fm.plan(caps)
         specs = tuple(plan.scratch_specs())
@@ -394,6 +398,8 @@ class B12xRoutedExperts:
         w = topk_weights.to(torch.float32).contiguous()
         if self.session_mode:
             return self._call_session(x, ids, w, out)
+        if deterministic():
+            ids, w = _unmask_routes(ids, w, self.E)
         buckets = _buckets()
         top = buckets[-1]
         for s0 in range(0, T, top):
@@ -414,6 +420,17 @@ class B12xRoutedExperts:
                 )
                 fm.run(binding=binding)
         return out
+
+
+def _unmask_routes(ids: torch.Tensor, w: torch.Tensor, n_experts: int):
+    """b12x 1.5.1 deterministic_output: a masked route (id -1) leaves its per-route output row unwritten, and the
+    top-k-sum kernel then adds whatever that scratch row holds from an earlier call (5090: cos 0.66-0.87 against the
+    same routes without the masked ones; rows without any route not zero). With --dp every rank masks the routes to
+    the other ranks' experts, so real tokens were wrong. Each masked route gets a local expert with weight 0 instead
+    (spread round-robin, not all on one expert): it adds exactly 0. No host sync (CUDA-graph capturable)."""
+    m = ids < 0
+    spread = torch.arange(ids.numel(), device=ids.device, dtype=torch.int32).view(ids.shape) % n_experts
+    return torch.where(m, spread, ids).contiguous(), torch.where(m, torch.zeros_like(w), w).contiguous()
 
 
 def _check_tiny_decode(swiglu_limit, n: int, layer_idx: int) -> None:

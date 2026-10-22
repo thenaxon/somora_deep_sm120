@@ -10,6 +10,25 @@ before 1.0 any minor release may change interfaces.
   steps once (torch profiler; same per-category GPU and host tables as `SM120_PROFILE_PREFILL`), also per rank with
   `--dp` (docs/SERVER.md).
 
+### Fixed
+- b12x's deterministic MoE: `SM120_MOE_DETERMINISTIC=1` (also on with `DEEPINFER_BATCH_INVARIANT=1` or `B12X_DYNAMIC_DETERMINISTIC_OUTPUT=1`) gave
+  wrong MoE outputs in two cases, both b12x 1.5.1 `deterministic_output` bugs:
+  - plans with `dynamic_tile_m` < 64 (b12x's own choice, e.g. E=16 at 5-64 tokens, E=96 at 65-512): cos ~0 against
+    the default path. The shim now uses at least 64 rows per tile in deterministic mode.
+  - masked routes (id -1) summed stale scratch rows. With `--dp` every rank masks the routes to the other ranks'
+    experts, so real tokens were wrong (single GPU: only discarded padding rows). They now go to a local expert with
+    weight 0.
+  The default b12x MoE and `--deterministic` (torch MoE) were not affected. New tests in `tests/test_gemm_moe_graphs.py`
+  and `tests/sweep_moe_deterministic.py`. Upstream: [flashinfer-ai/flashinfer#7021](https://github.com/flashinfer-ai/flashinfer/issues/7021).
+
+### Changed
+- The server no longer refuses b12x's deterministic MoE (0.3.0 did). It logs one start-up line (bit-exact, slower
+  decode, with `--dp N` the masked routes computed at weight 0) and a warning if the installed b12x is not 1.5.1,
+  the version the workarounds were validated on. `SM120_ALLOW_B12X_DETERMINISTIC`, the 0.3.0 override, is still
+  accepted and has no effect.
+- Deterministic MoE cost (full-depth test model, RTX 5090, CUDA graphs, TPOT B=1/8/32): 16.1/20.8/25.4 ->
+  19.1/23.4/27.0 ms, 1.06-1.19x (0.2.x: 2-2.9x with the small tiles that gave wrong rows).
+
 ## [0.3.0] - 2026-10-22
 
 First public release, experimental. Accepted on 4× RTX PRO 6000 Blackwell as v0.3.0-rc1 (same code). 0.2.5 was not

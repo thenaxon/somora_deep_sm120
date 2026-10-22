@@ -25,7 +25,7 @@ benchmark side in [RUNTIME.md](RUNTIME.md).
 | `SM120_MK_ALIGNMENT` | 128 | `get_theoretical_mk_alignment_for_contiguous_layout` (the value DeepGEMM returns on any arch other than SM100) |
 | `SM120_MOE_TINY_DECODE` | `0` (default), `1`, `auto` | sets `B12X_W4A8_TINY_DECODE` unless set explicitly. `0`: dynamic path (faster, section 7). `1`/`auto`: tiny-decode only if b12x carries `patches/b12x-tiny-decode-swiglu.patch` |
 | `B12X_W4A8_TINY_DECODE` | from the above | `0` = b12x's dynamic path for T <= 4 (correct on unpatched b12x 1.5.1, whose tiny-decode ignores `swiglu_limit`) |
-| `SM120_MOE_DETERMINISTIC` | `auto` | `1`: b12x `deterministic_output` (no atomic top-k combine); `auto` = on with `DEEPINFER_BATCH_INVARIANT=1` (section 5). **Not safe with b12x 1.5.1** (wrong rows below tile 64 and for masked routes); the server refuses it |
+| `SM120_MOE_DETERMINISTIC` | `auto` | `1`: b12x `deterministic_output` (no atomic top-k combine); `auto` = on with `DEEPINFER_BATCH_INVARIANT=1` (section 5). b12x 1.5.1 bugs (wrong rows below tile 64 and for masked routes) are worked around since 0.3.1 (section 5) |
 | `SM120_MOE_PLAN` | `caps` | `session`: one b12x `plan_execution` per layer with exact variants for every CUDA-graph size, prepared by a `PreparationSession` (autotuned with `SM120_B12X_AUTOTUNE=1`). Optional, within about 5 % of `caps`; forced off in deterministic mode |
 | `SM120_MOE_GRAPH_BUCKETS` | 0 | `1`: every captured CUDA-graph token count gets its own exact MoE plan (section 6) |
 | `SM120_B12X_AUTOTUNE` | 0 | `1`: block_fp8_linear plans are prepared by a b12x `PreparationSession` (candidate race, section 7) |
@@ -140,15 +140,28 @@ around this by forcing `"grouped"`
 (`patches/repro_b12x_deterministic_direct.py` reproduces it standalone). The tiny-decode path always uses bf16 atomic
 adds and has no deterministic variant.
 
+Two more b12x 1.5.1 `deterministic_output` bugs, worked around in `sm120_moe` (tests `test_moe_deterministic_tile`,
+`test_moe_deterministic_vs_default` in `tests/test_gemm_moe_graphs.py`; each fails with its workaround removed):
+- With `dynamic_tile_m` < 64 the result is wrong (5090: cos ~0 against the default path, top-6, E=16 at 5-64 tokens,
+  E=96 at 65-512; also with b12x's own choice, `decode_config=None`). Deterministic plans use `dynamic_tile_m >= 64`.
+- A masked route (`topk_ids == -1`) leaves its per-route output row unwritten, and the top-k sum adds stale scratch
+  from an earlier call (cos 0.5-0.85; rows without any route not zero). An EP rank masks the routes to the other ranks'
+  experts, so under `--dp` real tokens were wrong. Masked routes go to a local expert (spread round-robin) with
+  weight 0 instead; that adds exactly 0 but costs expert work for them (deterministic mode only).
+On the RTX 5090 test model (single GPU) deterministic decode teacher-forced on torch-MoE tokens has the same per-step
+KL as the default path (5.6e-3 vs 6.3e-3); free-running greedy tokens part at a near-tie.
+
 Cost (RTX 5090, CUDA graphs, prompt 256, 128 generated tokens, TPOT ms default -> deterministic):
 
 | model | B=1 | B=8 | B=32 |
 |---|---|---|---|
-| 3-layer test model | 2.3 -> 4.6 | 2.6 -> 5.2 | 3.6 -> 6.7 |
-| YOCO test model (8 layers) | 4.3 -> 11.0 | 6.0 -> 11.9 | 8.3 -> 16.1 |
-| full-depth test model (40 layers, 16/384 experts) | 16.1 -> 46.1 | 20.4 -> 42.2 | 25.6 -> 47.8 |
+| full-depth test model (40 layers, 16/384 experts), 0.3.1 | 16.1 -> 19.1 | 20.8 -> 23.4 | 25.4 -> 27.0 |
+| same, 0.2.x (b12x's own tile choice, which gave wrong rows) | 16.1 -> 46.1 | 20.4 -> 42.2 | 25.6 -> 47.8 |
 
-The decode step is 2-2.9x slower, so the deterministic mode stays opt-in, for tests and reproducibility only
+With the tile >= 64 plans of 0.3.1 the decode step is 1.06-1.19x slower on one GPU (the 0.2.x plans were 2-2.9x
+slower, and wrong for some shapes). With `--dp N` each rank also computes the (N-1)/N routes to the other ranks'
+experts at weight 0 (masked-route workaround), which is not measured yet. The mode stays opt-in, for tests and
+reproducibility
 (`server.py --deterministic` is a different switch: it uses the torch MoE reference, `SM120_MOE_IMPL=torch`).
 `SM120_MOE_PLAN=session` is forced off in deterministic mode: session plans did not give bit-identical repeats. Whether b12x `block_fp8_linear` is bit-reproducible
 (split-K configs) is not checked. Test: `tests/test_gemm_moe_graphs.py::test_moe_determinism`.

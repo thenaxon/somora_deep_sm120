@@ -32,7 +32,7 @@ python3 /opt/sm120/server/server.py --ckpt /work/ckpt3 --port 8000 --max-num-seq
 python3 /opt/sm120/server/server.py --ckpt /work/ckpt3 --port 8000 --deterministic      # reproducible outputs
 # options: --max-model-len 16384 --max-num-batched-tokens 4096 --gpu-memory-utilization 0.9 --max-blocks 256
 #          --nextn N (MTP, needs mtp.* layers) --graphs (CUDA graphs) --mtp-varlen (adaptive draft length, needs
-#          --graphs and --nextn > 0; docs/MTP_YOCO.md §9) --zos 0|1 --prefill-interval 1 --model-name ID
+#          --graphs and --nextn > 0; docs/MTP_YOCO.md §9) --zos 0|1 --prefill-interval 1 --prefill-any-interval 1 --model-name ID
 #          --prefix-cache [--prefix-cache-grain 512 --prefix-cache-checkpoint-stride 0 (= --max-num-batched-tokens)
 #                          --prefix-cache-entries 64 --prefix-cache-max-block-frac 0.5]
 #          (tool-calling workloads with short shared system prompts: --prefix-cache-checkpoint-stride 1024 or 2048, see PREFIX_CACHE.md)
@@ -260,6 +260,17 @@ Every DeepInfer and CUDA call happens on that thread. HTTP handler threads only 
 placeholder steps count (`scheduler.hpp:296-330`, built for DP-wide prefill voting). At about 32 ms per eager step that alone is
 about 2.3 s of TTFT. The server sets it to `--prefill-interval 1`. The cost is that one decode step of the running requests waits
 for each prefill chunk (bounded by chunked prefill, `max_num_batched_tokens`).
+
+**`DEEPINFER_PREFILL_ANY_ATTEMPT_INTERVAL` (`--dp > 1`):** with several DP ranks, the step type is voted across the
+ranks (MIN all-reduce, `scheduler.hpp:296-340`).
+- At the `PREFILL_ATTEMPT_INTERVAL` ("ALL") points, a prefill step happens only if every rank has a waiting prompt.
+- A rank that alone has one waits for an "ANY" point, every `DEEPINFER_PREFILL_ANY_ATTEMPT_INTERVAL` decode steps
+  (default 100).
+- Up to v0.2.4 the server left this at 100. With `--dp 4` a single request then waited up to 100 decode steps (about
+  2 s of TTFT at 20 ms per step, even for a 58-token prompt).
+- The server now sets `--prefill-any-interval 1`: an ANY point at every step except the one right after a prefill.
+- Cost: while any rank has a waiting prompt, the decode of all ranks pauses for that prefill chunk (the other ranks run
+  an empty prompt step in lockstep). A larger value batches prefills across ranks at the price of TTFT.
 
 ## Profiling a prefill (`SM120_PROFILE_PREFILL`)
 

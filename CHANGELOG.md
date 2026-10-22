@@ -3,6 +3,16 @@
 All notable changes to this project are documented here. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0 any minor release may change interfaces.
 
+## [Unreleased]
+
+### Documentation
+- README and `docs/RESULTS.md`: the numbers of the v0.3.0-rc1 acceptance run on 4× RTX PRO 6000 (single user 136 / 84–87
+  tok/s for code / chat, 4k × 64 users 460 tok/s, 32 users within the latency targets like vLLM, 15-minute soak
+  without errors).
+- `docker run` examples use `--stop-timeout 120`: with `--dp 4` and pinned engram tables the orderly shutdown takes
+  longer than Docker's default 10 s, after which Docker kills the server (harmless, nothing is left behind).
+- README: about 12 GiB of host RAM stay free while serving on a 246 GiB host.
+
 ## [0.3.0-rc1] - 2026-10-22
 
 Release candidate for the first public version. 0.2.5 was not tagged; its changes are listed here.

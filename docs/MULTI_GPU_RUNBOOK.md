@@ -162,8 +162,10 @@ All 4 rank processes map the same files, so the page cache holds one copy.
     quality set.
   - No `/dev/shm/psm_*` leftovers. Patch P11 unlinks the segment's name right after DeepInfer forks its multimodal
     workers, so the memory exists only while a process maps it, also after SIGKILL, OOM or `docker kill`. The server
-    handles SIGTERM (`docker stop`; the server is PID 1 through `exec` in the entrypoint) with a clean shutdown, and
-    the `--dp` proxy forwards it to its ranks. Before v0.1.1 every stopped engine left a 2 GB `psm_*` file in the
+    handles SIGTERM (`docker stop`; the server is PID 1 through `exec` in the entrypoint) with an orderly shutdown, and
+    the `--dp` proxy forwards it to its ranks. With `--dp 4` and pinned engram tables that takes longer than Docker's
+    default 10 s, so start the container with `--stop-timeout 120` (§5). A `docker stop` without it ends with SIGKILL
+    (exit 137) after 10 s; in the v0.3.0 acceptance that left no processes, GPU memory or shared memory behind. Before v0.1.1 every stopped engine left a 2 GB `psm_*` file in the
     host's `/dev/shm` (with `--ipc=host`); delete leftovers from older runs by hand.
 - **NUMA:** the image has libnuma1. On a multi-socket host add `--cap-add SYS_NICE`, otherwise the memory policy part of
   DeepInfer's binding is refused (CPU affinity still applies). Single-socket hosts skip the binding (patch P10).
@@ -182,7 +184,7 @@ Then follow the remaining steps of [MULTI_GPU.md](MULTI_GPU.md) §6 (W=4 NCCL te
 ## 5. Launch
 
 ```bash
-docker run -d --name sm120-serve --gpus all --ipc=host --shm-size=32g --ulimit memlock=-1 -p 8100:8000 \
+docker run -d --name sm120-serve --gpus all --ipc=host --shm-size=32g --ulimit memlock=-1 --stop-timeout 120 -p 8100:8000 \
   -v /models/DeepSeek-V4.1-Flash:/models/ds41:ro -v /srv/sm120/cache:/cache -v /srv/work:/work \
   -e SM120_EP_IMPL=allgather -e SM120_EP_TRANSPORT=nccl -e SM120_ENGRAM_MODE=pinned \
   -e DEEPINFER_MULTIMODAL_POOL_SIZE_GB=1 \
@@ -245,7 +247,7 @@ For each step:
 
 **Hang symptom.** The log stops after `CudaGraphRunner capture done` on some or all ranks, `/health` never answers, and
 the GPUs sit at 100 % utilization with no progress (ranks waiting in a collective). Stop the container
-(`docker stop`; the server shuts down on SIGTERM). Keep the `docker logs` of all ranks (each line is prefixed with the
+(`docker stop`; a hung rank is killed after the stop timeout). Keep the `docker logs` of all ranks (each line is prefixed with the
 rank's port) and report which rank stopped where. A hang during serving shows as `/health` timing out or TPOT
 growing without bound; the same applies.
 

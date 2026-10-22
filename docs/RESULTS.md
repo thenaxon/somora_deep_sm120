@@ -4,11 +4,12 @@ Measured results of the full DeepSeek-V4.1-Flash model on the multi-GPU target, 
 same checkpoint on the same machine. Single-GPU results with truncated test checkpoints are in
 [VALIDATION.md](VALIDATION.md) and the README. Discussion: [issue #2](../../../issues/2).
 
-## v0.3.0 (release candidate)
+## v0.3.0
 
 **In short:** stable on 4× RTX PRO 6000 over PCIe, quality on par with the tuned vLLM deployment (27/27 vs 26/27).
-With many concurrent users and long prompts it now matches vLLM's throughput and reaches the first token sooner.
-A single user still gets about half of vLLM's decode speed, and a single long prompt is read about 5–6× slower,
+With many concurrent users and long prompts it now matches vLLM's throughput and reaches the first token sooner, and
+it serves as many users within the latency targets (32). A single user gets about 55–65 % of vLLM's speed, and a
+single long prompt is read about 5–6× slower,
 because one GPU reads each prompt here while vLLM's tensor parallelism spreads it over four ([#1](../../../issues/1)).
 
 ### Setup
@@ -18,32 +19,36 @@ because one GPU reads each prompt here while vLLM's tensor parallelism spreads i
 - **This engine:** `--dp 4` with CUDA graphs, `--nextn 7`, `--prefix-cache`, `--gpu-memory-utilization 0.95
   --max-model-len 40960 --max-num-seqs 16 --max-num-batched-tokens 4096 --max-blocks 4096`,
   `SM120_ENGRAM_MODE=pinned` (one copy of the 189 GiB engram tables in pinned host RAM for all ranks).
-- The numbers were measured with the 0.2.4 image. The column "0.3.0 defaults" adds the prefill intervals 16 / 16
-  that 0.3.0 sets by default with `--dp > 1` (`-e DEEPINFER_PREFILL_ATTEMPT_INTERVAL=16
-  -e DEEPINFER_PREFILL_ANY_ATTEMPT_INTERVAL=16`); the code is otherwise the same.
+- The column 0.3.0 is the acceptance run of the release candidate (`v0.3.0-rc1`, 2026-10-22), started exactly as in
+  [MULTI_GPU_RUNBOOK.md](MULTI_GPU_RUNBOOK.md) §5: 5 starts in 181–186 s, a 15-minute soak (1,400 requests, 0 errors,
+  same memory before and after), the README quickstart from an empty kernel cache (up after 351 s).
+- Single measurements vary by about 10 %: 4k × 16 gave 321 tok/s in one run of 32 requests and 361 tok/s over the
+  15-minute soak at the same load (v0.2.4 with the 0.3.0 intervals: 388).
 
 ### Progress since v0.2.0
 
-| | v0.2.0 | v0.2.1 | v0.2.4 | 0.3.0 defaults | vLLM (TP=4) |
+| | v0.2.0 | v0.2.1 | v0.2.4 | **0.3.0** | vLLM (TP=4) |
 |---|---|---|---|---|---|
-| TTFT, new 58-token prompt | – | – | 2.0 s | **0.85 s** | ~0.2 s |
-| TTFT, new 4k prompt | 3.9–4.6 s | 3.7–4.0 s | 2.9 s | **1.4 s** | 0.24 s |
-| TTFT, new 32k prompt | 32.6 s | 33.8–35.7 s | 24.0 s | **11.0 s** | ~2.0 s |
-| 4k prompts × 16 users, output tok/s | 224 | 117 | 376 | **388** | 417 |
-| 4k prompts × 64 users, output tok/s (TTFT p50) | 248 (20.4 s) | 116 | **420 (7.9 s)** | – | 425 (33.8 s) |
-| 512-token prompts × 64 users, output tok/s | 944 | 623 | **1,150** | – | 1,324 |
-| quality, 28-item set | 27/27 | – | 27/27 | – | 26/27 |
+| TTFT, new 58-token prompt | – | – | 2.0 s | **0.45 s** | ~0.2 s |
+| TTFT, new 4k prompt | 3.9–4.6 s | 3.7–4.0 s | 2.9 s | **1.35 s** | 0.24 s |
+| TTFT, new 32k prompt | 32.6 s | 33.8–35.7 s | 24.0 s | **11.2 s** | ~2.0 s |
+| 4k prompts × 16 users, output tok/s | 224 | 117 | 376 | **321 / 361 (soak)** | 417 |
+| 4k prompts × 64 users, output tok/s (TTFT p50) | 248 (20.4 s) | 116 | 420 (7.9 s) | **460 (9.2 s)** | 425 (33.8 s) |
+| 512-token prompts × 64 users, output tok/s | 944 | 623 | 1,150 | **1,256** | 1,324 |
+| users within TTFT p99 ≤ 2 s, TPOT p99 ≤ 50 ms | – | – | 0 | **32** | 32 |
+| quality, 28-item set | 27/27 | – | 27/27 | **27/27** | 26/27 |
+| teacher-forced vs vLLM: top-1 agreement / mean KL | – | 0.949 / 0.059 | 0.949 / 0.063 | **0.952 / 0.055** | – |
 
 `loadgen.py` uses random token-id prompts and 256 output tokens (speculative decoding accepts almost nothing on them).
 
-### Real prompts (`eval/scenarios.py realistic`, output tok/s), v0.2.4
+### Real prompts (`eval/scenarios.py realistic`, output tok/s, `--nextn 7`)
 
-| set | users | this engine, `--nextn 7` | vLLM |
-|---|---|---|---|
-| code | 1 | 101 | 209 |
-| code | 16 | 951 | 1,200 |
-| chat (German / English) | 1 | 67 / 74 | 148 / 157 |
-| chat (German / English) | 16 | 496 / 560 | 797 / 787 |
+| set | users | v0.2.4 | **0.3.0** | vLLM |
+|---|---|---|---|---|
+| code | 1 | 101 | **136** | 209 |
+| code | 16 | 951 | **917** | 1,200 |
+| chat (German / English) | 1 | 67 / 74 | **84 / 87** | 148 / 157 |
+| chat (German / English) | 16 | 496 / 560 | **548 / 533** | 797 / 787 |
 
 - Draft acceptance with 7 drafts: code 0.52, chat 0.22–0.25. `--nextn 7` was the best fixed setting; `--mtp-varlen`
   (DeepInfer's adaptive draft length) won only for German chat at 16 users and lost at 1 user.
@@ -60,6 +65,7 @@ two intervals set how many decode steps run between two prefill chunks. 16 / 16 
 | 1 / 1 | 0.24 / 1.1 / 8.8 s | 226 / 401 ms | 13 | – |
 | 8 / 8 | 0.70 / 1.24 / 9.8 s | 62 / 118 ms | 50 | 325 |
 | **16 / 16** | 0.85 / 1.39 / 11.0 s | 36 / 65 ms | 68 | 388 |
+| 16 / 16, 0.3.0 acceptance | 0.45 / 1.35 / 11.2 s | 36 / 63 ms | 66 | 321 / 361 |
 | vLLM | ~0.2 / 0.24 / ~2.0 s | – / 25 ms | 191 | 417 |
 
 DeepInfer cannot mix decode tokens into a prefill step, so while a long prompt is read the other users' streams pause

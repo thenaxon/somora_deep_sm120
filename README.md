@@ -21,12 +21,13 @@ As far as we know this is the first port of DeepInfer to SM120 workstation GPUs.
 >   GPU, so fewer or smaller GPUs do not work; **a single RTX 5090 cannot run the full model**.
 > - **About 256 GB of host RAM**: the engram tables (189 GiB) are kept in RAM, and the recommended mode needs about
 >   225 GiB free before start ([docs/MULTI_GPU_RUNBOOK.md](docs/MULTI_GPU_RUNBOOK.md) §3 lists modes for less RAM).
+>   While it serves, a 246 GiB host has about 12 GiB left, so do not run other large processes next to it.
 > - Linux, Docker with the NVIDIA container toolkit, NVIDIA driver >= 595 (CUDA 13.2), the DeepSeek-V4.1-Flash
 >   checkpoint (~300 GB, not included).
 
 > **Status: experimental (v0.3.0).** Stable on 4× RTX PRO 6000, quality on par with a tuned vLLM deployment of the
 > same model. With many concurrent users and long prompts it matches vLLM's throughput and reaches the first token
-> sooner; a single user gets about half of vLLM's decode speed, and a single long prompt is read about 5–6× slower
+> sooner; a single user gets about 55–65 % of vLLM's speed, and a single long prompt is read about 5–6× slower
 > ([docs/RESULTS.md](docs/RESULTS.md)). If you want the fastest single-user serving on this hardware, use vLLM. This
 > project is for running DeepSeek's own engine on it. Not affiliated with DeepSeek or NVIDIA.
 
@@ -46,8 +47,8 @@ Pinned versions are listed in [COMPATIBILITY.md](COMPATIBILITY.md).
 git clone <this repository> somora_deep_sm120 && cd somora_deep_sm120
 docker build -t somora_deep_sm120:0.3.0 -f docker/Dockerfile .      # ~6 min; clones DeepInfer at the pinned commit
 
-docker run -d --name sm120-serve --gpus all --ipc=host --shm-size=32g --ulimit memlock=-1 -p 8000:8000 \
-  -v /models/DeepSeek-V4.1-Flash:/models/ds41:ro -v sm120-cache:/cache \
+docker run -d --name sm120-serve --gpus all --ipc=host --shm-size=32g --ulimit memlock=-1 --stop-timeout 120 \
+  -p 8000:8000 -v /models/DeepSeek-V4.1-Flash:/models/ds41:ro -v sm120-cache:/cache \
   -e SM120_EP_IMPL=allgather -e SM120_ENGRAM_MODE=pinned -e DEEPINFER_MULTIMODAL_POOL_SIZE_GB=1 \
   somora_deep_sm120:0.3.0 --model /models/ds41 --served-model-name deepseek-v4.1-flash \
     --dp 4 --nextn 7 --prefix-cache --gpu-memory-utilization 0.95 --max-model-len 40960 \
@@ -59,6 +60,9 @@ curl -s localhost:8000/v1/chat/completions -H 'content-type: application/json' \
 ```
 
 - Mount a volume on `/cache`: the first start compiles many kernels (b12x, TileLang, Triton), and later starts reuse them.
+- `--stop-timeout 120` gives the four ranks time to shut down on `docker stop`. With Docker's default of 10 s they are
+  killed instead; that leaves nothing behind (GPU memory, pinned RAM and `/dev/shm` are freed), but skips the orderly
+  shutdown.
 - Read [docs/MULTI_GPU_RUNBOOK.md](docs/MULTI_GPU_RUNBOOK.md) before the first start: preflight checks, engram modes by
   free RAM, NCCL P2P, what the start log should show, and how to evaluate against another endpoint.
 - `--help` lists all options. CUDA graphs are on by default (`--no-graphs` turns them off).
@@ -104,15 +108,16 @@ More in [docker/README.md](docker/README.md) and [docs/SERVER.md](docs/SERVER.md
 | | this engine | vLLM, TP=4 |
 |---|---|---|
 | quality, 28-item set (core / tool / json / image) | 27/27 | 26/27 |
-| 4k prompts × 64 users: output tok/s, median time to first token | 420 tok/s, 7.9 s | 425 tok/s, 33.8 s |
-| 4k prompts × 16 users, output tok/s | 388 | 417 |
-| real prompts, 1 user: code / chat, output tok/s | 101 / 67–74 | 209 / 148–157 |
-| real prompts, 16 users: code, output tok/s | 951 | 1,200 |
-| time to first token, new 4k / 32k prompt | 1.4 s / 11 s | 0.24 s / ~2 s |
+| 4k prompts × 64 users: output tok/s, median time to first token | 460 tok/s, 9.2 s | 425 tok/s, 33.8 s |
+| 4k prompts × 16 users, output tok/s (32 requests / 15 min soak) | 321 / 361 | 417 |
+| real prompts, 1 user: code / chat, output tok/s | 136 / 84–87 | 209 / 148–157 |
+| real prompts, 16 users: code, output tok/s | 917 | 1,200 |
+| users within TTFT p99 ≤ 2 s and TPOT p99 ≤ 50 ms | 32 | 32 |
+| time to first token, new 58-token / 4k / 32k prompt | 0.45 s / 1.35 s / 11.2 s | ~0.2 s / 0.24 s / ~2 s |
 
-Measured with `--nextn 7` and `SM120_ENGRAM_MODE=pinned`; the time to first token with the 0.3.0 prefill defaults.
-Stable in all runs (CUDA graphs, DSpark, clean shutdown). Setup, progress since v0.2.0, mixed load and where the time
-goes: [docs/RESULTS.md](docs/RESULTS.md).
+Measured on the 0.3.0 release candidate with the recommended configuration (quickstart above: `--nextn 7`,
+`SM120_ENGRAM_MODE=pinned`). Stable in all runs: 5 starts, a 15-minute soak with 1,400 requests and no errors.
+Setup, progress since v0.2.0, mixed load and where the time goes: [docs/RESULTS.md](docs/RESULTS.md).
 
 ### Development GPU: one RTX 5090, truncated test checkpoints (not the full model)
 
@@ -139,11 +144,11 @@ Details and more tables: [docs/VALIDATION.md](docs/VALIDATION.md), [docs/ATTENTI
 
 ## Known limitations
 
-- **Single-user speed is behind a tuned vLLM TP=4 deployment**: about half the decode speed, and a single long
+- **Single-user speed is behind a tuned vLLM TP=4 deployment**: about 55–65 % of its speed, and a single long
   prompt is read about 5–6× slower. DP attention reads each request's prompt on one GPU; tensor parallelism for the
   attention and dense layers is tracked in [#1](../../issues/1).
 - **Mixed load:** DeepInfer cannot mix decode tokens into a prefill step, so while a long prompt is read the other
-  users' streams pause for each 4096-token chunk (TPOT p99 65 ms vs vLLM's 25 ms; [docs/RESULTS.md](docs/RESULTS.md)).
+  users' streams pause for each 4096-token chunk (TPOT p99 63 ms vs vLLM's 25 ms; [docs/RESULTS.md](docs/RESULTS.md)).
 - **Memory is tight on 4× 96 GB:** the recommended `SM120_ENGRAM_MODE=pinned` needs `--gpu-memory-utilization 0.95`
   (at 0.92 no KV cache is left) and about 225 GiB of free host RAM before start.
 - `--yoco-compact` (opt-in, about 1.15–1.2× faster prefill at 32k) cannot be combined with `--prefix-cache`.

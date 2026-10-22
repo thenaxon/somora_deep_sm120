@@ -15,8 +15,9 @@ before 1.0 any minor release may change interfaces.
   on the 0.2.3 behaviour. The extra plans (buckets 4 and 64 next to 512) add about 17 MiB of shared b12x scratch
   per GPU, once, not per layer.
 - A failed engine start (e.g. a CUDA-graph capture that raised) left the server process hanging in the interpreter
-  teardown, and with `--dp` the proxy waited for it forever. The server now exits at once with code 3; the `--dp`
-  proxy stops the other ranks (SIGTERM, `kill` after 10 s) and exits non-zero.
+  teardown, and with `--dp` the proxy waited for it forever. A failed CUDA-graph capture now exits the process at
+  once with code 4 (runtime patch P9; `SM120_CAPTURE_FAIL_FATAL=0` re-raises instead), any other start-up failure
+  with code 3; the `--dp` proxy stops the other ranks (SIGTERM, `kill` after 10 s) and exits non-zero.
 
 ### Changed
 - `SM120_ENGRAM_MODE=pinned`: each rank logs the GPU memory its registration of the shared segment costs (page tables,

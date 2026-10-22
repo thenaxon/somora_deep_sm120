@@ -9,7 +9,11 @@ before 1.0 any minor release may change interfaces.
 - `--dp > 1`: TTFT of about 2 s even for short prompts. With several DP ranks DeepInfer votes the step type, and a
   prefill happens at the `DEEPINFER_PREFILL_ATTEMPT_INTERVAL` points only if every rank has a waiting prompt. A
   request that only one rank holds waited for the next `DEEPINFER_PREFILL_ANY_ATTEMPT_INTERVAL` point (default 100
-  decode steps). The server and the image now set it to 1 (`--prefill-any-interval`, docs/SERVER.md).
+  decode steps). The server now sets it (`--prefill-any-interval`, docs/SERVER.md).
+- `--dp > 1` with both prefill intervals at 1: while any rank had prompt chunks waiting, the decoders of all ranks got
+  about one token per prefill chunk (mixed load: TPOT p99 401 ms). `--prefill-interval` and `--prefill-any-interval`
+  now default to `auto`: 1 / 1 for `--dp 1`, 8 / 8 for `--dp > 1`, so that at least 8 decode steps run between two
+  chunks. The image no longer sets the two `DEEPINFER_PREFILL_*` variables (an explicit `-e` still overrides).
 
 ## [0.2.4] - 2026-10-22
 

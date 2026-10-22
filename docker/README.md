@@ -45,8 +45,7 @@ Environment defaults (override with `-e`):
 | `B12X_AUTOTUNE` | 0 | deterministic start-up; `SM120_B12X_AUTOTUNE=1` opts in |
 | `SM120_MOE_TINY_DECODE` | 0 | dynamic MoE path (faster on SM120, [../docs/RUNTIME.md](../docs/RUNTIME.md)) |
 | `SM120_ENGRAM_MODE` | `host` | engram tables mmapped from the checkpoint ([../docs/ENGRAM.md](../docs/ENGRAM.md)) |
-| `DEEPINFER_PREFILL_ATTEMPT_INTERVAL` | 1 | DeepInfer's default 70 costs about 2 s TTFT ([../docs/SERVER.md](../docs/SERVER.md)) |
-| `DEEPINFER_PREFILL_ANY_ATTEMPT_INTERVAL` | 1 | `--dp > 1`: DeepInfer's default 100 delays a request that only one rank has by up to 100 decode steps (about 2 s TTFT) |
+| `DEEPINFER_PREFILL_ATTEMPT_INTERVAL`, `DEEPINFER_PREFILL_ANY_ATTEMPT_INTERVAL` | not set: the server picks them (`--prefill-interval` / `--prefill-any-interval`, default `auto`: 1 for `--dp 1`, 8 for `--dp > 1`) | `-e` overrides; DeepInfer's own defaults (70 / 100) cost about 2 s TTFT ([../docs/SERVER.md](../docs/SERVER.md)) |
 | `DEEPINFER_MULTIMODAL_POOL_SIZE_GB` | 2 | pinned host buffer per engine (rank) for preprocessed images, DeepInfer's default is 8; sizing in [../docs/MULTI_GPU_RUNBOOK.md](../docs/MULTI_GPU_RUNBOOK.md) §3 |
 | `DEEPINFER_DISABLE_SYNC_GUARD` | 1 | the shims do CPU syncs |
 | `HF_HUB_OFFLINE`, `TOKENIZERS_PARALLELISM` | 1, false | |

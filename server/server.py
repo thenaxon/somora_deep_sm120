@@ -586,12 +586,14 @@ def main() -> int:
                     help="adaptive MTP: per step, verify only as many drafts (<= --nextn per request) as the profiled "
                          "cost curve and the draft confidences pay for (DEEPINFER_ENABLE_MTP_VARLEN); needs --graphs")
     ap.add_argument("--zos", choices=("default", "0", "1"), default="default")
-    ap.add_argument("--prefill-interval", type=int, default=1,
-                    help="DEEPINFER_PREFILL_ATTEMPT_INTERVAL (DeepInfer default 70 decode steps; 1 = lowest TTFT)")
-    ap.add_argument("--prefill-any-interval", type=int, default=1,
-                    help="DEEPINFER_PREFILL_ANY_ATTEMPT_INTERVAL: with --dp > 1, how many decode steps a rank that alone "
-                         "has a waiting prompt waits before all ranks do a prefill step (DeepInfer default 100; "
-                         "1 = lowest TTFT)")
+    ap.add_argument("--prefill-interval", default="auto",
+                    help="DEEPINFER_PREFILL_ATTEMPT_INTERVAL: decode steps between prefill attempts (with --dp > 1: "
+                         "attempts that need every rank to have a waiting prompt). auto = 1 for --dp 1, 8 otherwise; "
+                         "DeepInfer default 70")
+    ap.add_argument("--prefill-any-interval", default="auto",
+                    help="DEEPINFER_PREFILL_ANY_ATTEMPT_INTERVAL: with --dp > 1, decode steps a rank that alone has a "
+                         "waiting prompt waits before all ranks do a prefill step. auto = 1 for --dp 1, 8 otherwise; "
+                         "DeepInfer default 100. Smaller = lower TTFT, larger = fewer decode stalls for the others")
     ap.add_argument("--deterministic", action="store_true",
                     help="SM120_MOE_IMPL=torch: run-to-run reproducible outputs (b12x fused_moe is not), slower")
     ap.add_argument("--request-timeout", type=float, default=600.0, help="max seconds between two tokens")

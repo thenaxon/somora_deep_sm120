@@ -15,6 +15,7 @@ while [ $# -gt 0 ]; do
         --model) model="$2"; shift 2 ;;
         --model=*) model="${1#*=}"; shift ;;
         --served-model-name) args+=(--model-name "$2"); shift 2 ;;
+        --served-model-name=*) args+=(--model-name "${1#*=}"); shift ;;
         --no-graphs) graphs=0; shift ;;
         --graphs) graphs=1; shift ;;
         --host) host="$2"; shift 2 ;;

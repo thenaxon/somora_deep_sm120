@@ -116,6 +116,11 @@ tables the gather is CPU work, so it cannot itself be part of a graph. Two modes
   layer's rows into pinned staging (for `uring`, b12x's native reader writes its mapped-host staging) and writes a
   per-layer done flag. The hook of engram layer l, also captured, runs a Triton `wait` kernel that spins on that flag
   (with a timeout and an error flag), then copies the rows H2D.
+  - Failures fail the step, they never feed it stale rows: the wait gives up after `SM120_ENGRAM_GRAPH_WAIT_S` of
+    wall time (default 30 s, the GPU's global timer) and raises the error flag; a gather or reader exception in the
+    service thread is stored, raises the flag and releases the waits of that and every later replay. Patch E9 checks
+    after every `LLMEngine.step` / `flush_inflight_reqs` (outputs synchronized, not yet returned) and raises
+    `EngramFetchError`: the server fails the requests of that step instead of returning its tokens.
   - No host code runs per replay; the fetch starts right after the previous step's sampling (the earliest point the
     tokens exist) and overlaps the embedding and layer 0 (and layers 1-13 for layer 14). ZOS keeps its overlap.
   - The pinned buffers, thread and Triton JIT are set up at the first eager fetch, never inside a capture (compiling
@@ -390,6 +395,7 @@ original shard directory must be visible at the same absolute path wherever the 
 |---|---|---|
 | `SM120_ENGRAM_MODE` | `auto` (= `host`) | `host`, `pinned`, `uva`, `uring` (see §3); the serving image sets `host` |
 | `SM120_ENGRAM_GRAPH` | `async` | CUDA-graph fetch mode: `async` or `prestage` |
+| `SM120_ENGRAM_GRAPH_WAIT_S` | 30 | `async`: how long a captured wait kernel waits for the host's rows before the step fails |
 | `SM120_ENGRAM_PRESTAGE` | 1 | 0 skips prestaging (negative control only) |
 | `SM120_ENGRAM_PREFAULT` | 0 | 1 reads the whole tables into the page cache. The server does it once after every rank has loaded its weights, before it accepts requests (`--dp`: the proxy asks rank 0), and skips it when the tables do not fit into MemAvailable minus `SM120_ENGRAM_PREFAULT_HEADROOM_GB` (use `uring` there). `force` prefaults regardless |
 | `SM120_ENGRAM_PREFAULT_HEADROOM_GB` | 4 | MemAvailable that the prefault leaves free. A partial prefault is not offered: on the RTX 5090 test machine it made cold prefills 20 % slower (page-cache pressure), and the second table's pages evicted the first's |

@@ -61,6 +61,7 @@ import sys
 import threading
 import time
 import warnings
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Callable, Sequence
@@ -336,7 +337,31 @@ def _prefault_policy(tables: list, force: bool) -> dict:
 
 
 def post_load_cache_policy(ckpt_dir: str | None) -> dict:
-    """Page-cache policy after the weights of every rank are loaded (server: once, on one process per host).
+    """After the weights of every rank are loaded (server: once, on one process per host).
+
+    Mandatory first: in SM120_ENGRAM_MODE=pinned, fill the shared tables. Any failure there raises
+    EngramResidencyError (the server must not serve: unfilled rows are not the model's weights). Then the optional
+    page-cache hints (_cache_hints); a failure there only warns, except EngramResidencyError from SM120_ENGRAM_PIN."""
+    res = {}
+    if _SHARED_TABLES:
+        try:
+            res.update(fill_shared_tables())
+        except EngramResidencyError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - partly filled tables: fatal
+            raise EngramResidencyError(f"pinned mode: filling the shared engram tables failed: {exc!r}") from exc
+    try:
+        res.update(_cache_hints(ckpt_dir))
+    except EngramResidencyError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - advisory only
+        print(f"[sm120_engram] WARNING: page-cache policy failed: {exc!r}", flush=True)
+        res["hints_error"] = repr(exc)
+    return res
+
+
+def _cache_hints(ckpt_dir: str | None) -> dict:
+    """Page-cache policy after the weights of every rank are loaded (optional hints).
 
     1. posix_fadvise(DONTNEED) on the checkpoint's other *.safetensors shards: their pages served the weight load
        and now only compete with the Engram tables for the page cache (clean, read-only pages; pages a process
@@ -365,8 +390,6 @@ def post_load_cache_policy(ckpt_dir: str | None) -> dict:
         print(f"[sm120_engram] page cache: dropped clean pages of {dropped} weight shards ({nbytes / 2**30:.0f} GiB of "
               f"files) after load (SM120_ENGRAM_DROP_WEIGHT_PAGES=0 keeps them)", flush=True)
     pf = _env("SM120_ENGRAM_PREFAULT", "0")
-    if _SHARED_TABLES:
-        res.update(fill_shared_tables())  # pinned mode: one process fills the shared segment for all ranks
     if _env("SM120_ENGRAM_PIN", "0") in ("mlock", "1", "true", "yes") and tables:
         res.update(_pin_policy(tables))  # raises EngramResidencyError: the server aborts its start-up
         if _PREFETCH is not None:  # every lookup hits locked pages: nothing to read ahead
@@ -1093,8 +1116,12 @@ def fill_shared_tables(threads: int = 8, chunk: int = 64 << 20) -> dict:
                 jobs.append((os.path.realpath(loc.path), loc.offset + a, mv[a : min(a + chunk, nbytes)]))
     fds: dict = {}
 
+    fail_at, started = int(_env("SM120_ENGRAM_TEST_FAIL_FILL", "0")), iter(range(1, len(jobs) + 1))  # tests only
+
     def run(job):
         path, off, dst = job
+        if fail_at and next(started) == fail_at:  # the fail_at-th chunk read raises (after some chunks are filled)
+            raise OSError(5, f"SM120_ENGRAM_TEST_FAIL_FILL={fail_at}")
         fd = fds.get(path) or fds.setdefault(path, os.open(path, os.O_RDONLY))
         done = 0
         while done < len(dst):
@@ -1237,7 +1264,8 @@ class EngramFetcher:
                     self._futures[i] = None
 
     # ---- fetch
-    def fetch(self, indices: torch.Tensor, use_tma_aligned_col_major_sf: bool = True) -> list[Callable]:
+    def fetch(self, indices: torch.Tensor, use_tma_aligned_col_major_sf: bool = True, *,
+              prefill: bool | None = None) -> list[Callable]:
         L, T, E = indices.shape
         assert L == self.num_layers and E == self.num_entries_per_token, (indices.shape, self.num_layers)
         assert T <= self.num_max_tokens, f"fetch of {T} tokens exceeds num_max_tokens={self.num_max_tokens}"
@@ -1259,7 +1287,9 @@ class EngramFetcher:
             via_host = {l for l, t in enumerate(self.tables)
                         if t.kind == "host" or (t.kind == "uring" and t.weight is not None and T >= self.uring_mmap_tokens)}
             self._via_host = via_host
-            if _PREFETCH is not None and T > 1:
+            if prefill is None:  # the model's step kind (E6 forward); unknown (no patch): count every batch > 1
+                prefill = _STEP_IS_PROMPT if _STEP_IS_PROMPT is not None else T > 1
+            if _PREFETCH is not None and prefill:  # only prefill tokens consume the prefetcher's read-ahead
                 _PREFETCH.consumed(T)
             if (self.is_cuda and self._async is None and kinds <= {"host", "uring"}
                     and _env("SM120_ENGRAM_GRAPH", "async") == "async"):
@@ -1322,7 +1352,7 @@ class EngramFetcher:
         current stream, eager. indices: int32 CUDA [num_layers, T, E] (T = the graph's padded batch)."""
         t_start = time.perf_counter()
         sync0 = self.stats["sync_s"]
-        hooks = self.fetch(indices, use_tma_aligned_col_major_sf=False)
+        hooks = self.fetch(indices, use_tma_aligned_col_major_sf=False, prefill=False)  # decode graphs only
         self.stats["pre_sync_s"] = self.stats.get("pre_sync_s", 0.0) + self.stats["sync_s"] - sync0
         t_gather = time.perf_counter()
         for l, t in enumerate(self.tables):
@@ -1455,13 +1485,23 @@ def _triton_kernels():
             tl.store(ready_ptr, c * 1048576 + T)  # one 64-bit store: generation and batch size
 
         @triton.jit
-        def wait_kernel(cnt_ptr, done_ptr, err_ptr, max_iters, stat_ptr):
+        def _now_ns():
+            return tl.inline_asm_elementwise("mov.u64 $0, %globaltimer;", "=l", [], dtype=tl.int64, is_pure=False,
+                                             pack=1)
+
+        @triton.jit
+        def wait_kernel(cnt_ptr, done_ptr, err_ptr, max_ns, stat_ptr):
+            # spin until the host service thread marks this layer done, at most max_ns of wall time (the GPU's
+            # global timer); a timeout raises the error flag, which the engine checks before it uses the step
             c = tl.load(cnt_ptr)
             v = tl.load(done_ptr, volatile=True)
-            i = 0
-            while (v < c) & (i < max_iters):
+            t0 = _now_ns()
+            dt = tl.zeros_like(t0)
+            i = tl.zeros_like(t0)
+            while (v < c) & (dt < max_ns):
                 v = tl.load(done_ptr, volatile=True)
                 i += 1
+                dt = _now_ns() - t0
             if v < c:
                 tl.store(err_ptr, c)
             tl.atomic_add(stat_ptr, i)  # spin iterations (each one host-memory read over PCIe, ~1 us)
@@ -1473,7 +1513,8 @@ def _triton_kernels():
 class _AsyncGraphFetch:
     """Host side of EngramFetcher's in-graph fetch: one service thread per fetcher."""
 
-    MAX_SPIN = 1 << 31  # GPU wait-loop iterations before giving up (seconds); the error flag is then raised
+    # GPU wait budget per layer and replay (SM120_ENGRAM_GRAPH_WAIT_S, default 30 s): then the error flag is raised and
+    # check_graph_fetch() makes the engine step fail instead of using the step's rows
 
     def __init__(self, fetcher: "EngramFetcher") -> None:
         f = self.f = fetcher
@@ -1488,6 +1529,8 @@ class _AsyncGraphFetch:
         self.idx_dev = _host_view_on_device(self.idx, dev)
         self.np = self.flags.numpy()
         self.served = 0
+        self.max_ns = int(float(_env("SM120_ENGRAM_GRAPH_WAIT_S", "30")) * 1e9)
+        self.error: BaseException | None = None  # the service thread's failure; the flag np[1] carries it to the GPU
         signal_kernel, wait_kernel = _triton_kernels()  # compile now, never inside a capture
         scratch = torch.zeros((3,), dtype=torch.int64, device=dev)
         signal_kernel[(1,)](scratch[0:1], scratch[1:2], 1)
@@ -1519,7 +1562,7 @@ class _AsyncGraphFetch:
                 src_w, src_s = b["stage_w"][l], b["stage_s"][l]
 
             def hook(l=l, src_w=src_w, src_s=src_s):
-                wait_kernel[(1,)](self.cnt, self.flags_dev[2 + l : 3 + l], self.flags_dev[1:2], self.MAX_SPIN,
+                wait_kernel[(1,)](self.cnt, self.flags_dev[2 + l : 3 + l], self.flags_dev[1:2], self.max_ns,
                                   self.spins[l : l + 1])
                 b["dev_w"][l][:n].copy_(src_w[:n], non_blocking=True)
                 if f.use_fp8:
@@ -1531,7 +1574,6 @@ class _AsyncGraphFetch:
 
     @torch.inference_mode()
     def _serve(self) -> None:
-        f = self.f
         idle = 0
         while not self._stop:
             v = int(self.np[0])
@@ -1541,38 +1583,74 @@ class _AsyncGraphFetch:
                 time.sleep(0 if idle < 2000 else 5e-5)
                 continue
             idle = 0
-            t0 = time.perf_counter()
-            E, L = f.num_entries_per_token, f.num_layers
-            n = T * E
-            b = f._bufs
-            for l in range(L):  # layer order: the first engram layer is released first
-                idx = self.idx[l * n : (l + 1) * n].to(torch.int64)
-                if f.row_offsets[l]:
-                    idx -= f.row_offsets[l]
-                t = f.tables[l]
-                if t.kind == "uring":
-                    c = t._uring  # b12x DiskRowCache: drive its native reader directly from host ids
-                    if f.use_fp8 and not t.uring_scales:
-                        t.gather_host(idx, None, b["stage_s"][l][:n], pool=f._pool, chunk=f.chunk)
-                    c.ids_host[:n].copy_(idx)
-                    c._native.ple_reader_run(c._reader, c._ids_buffer, c._weight_buffer, c._scale_buffer, n)
-                else:
-                    t.gather_host(idx, b["stage_w"][l][:n], b["stage_s"][l][:n] if t.groups else None,
-                                  pool=f._pool, chunk=f.chunk)
-                self.np[2 + l] = gen
-                key = f"graph_ready_l{l}_s"  # flag seen -> this layer's rows staged
-                f.stats[key] = f.stats.get(key, 0.0) + time.perf_counter() - t0
+            if self.error is None:
+                try:
+                    self._serve_one(gen, T)
+                except BaseException as exc:  # noqa: BLE001 - a gather / reader failure: fail the step, not hang
+                    self.error = exc
+                    print(f"[sm120_engram] ERROR: graph fetch service failed at generation {gen}: {exc!r}", flush=True)
+            if self.error is not None:  # this and every later replay: flag the error first, then release the waits
+                self.np[1] = gen
+                self.np[2:] = gen
             self.served = gen
-            f.stats["graph_fetches"] = f.stats.get("graph_fetches", 0) + 1
-            f.stats["graph_gather_s"] = f.stats.get("graph_gather_s", 0.0) + time.perf_counter() - t0
-            if int(self.np[1]):
-                print(f"[sm120_engram] ERROR: GPU engram wait timed out at generation {int(self.np[1])}", flush=True)
+            if int(self.np[1]) and not getattr(self, "_reported", False):
+                self._reported = True
+                print(f"[sm120_engram] ERROR: GPU engram wait failed at generation {int(self.np[1])}", flush=True)
+
+    def _serve_one(self, gen: int, T: int) -> None:
+        f = self.f
+        t0 = time.perf_counter()
+        E, L = f.num_entries_per_token, f.num_layers
+        n = T * E
+        b = f._bufs
+        for l in range(L):  # layer order: the first engram layer is released first
+            idx = self.idx[l * n : (l + 1) * n].to(torch.int64)
+            if f.row_offsets[l]:
+                idx -= f.row_offsets[l]
+            t = f.tables[l]
+            if t.kind == "uring":
+                c = t._uring  # b12x DiskRowCache: drive its native reader directly from host ids
+                if f.use_fp8 and not t.uring_scales:
+                    t.gather_host(idx, None, b["stage_s"][l][:n], pool=f._pool, chunk=f.chunk)
+                c.ids_host[:n].copy_(idx)
+                c._native.ple_reader_run(c._reader, c._ids_buffer, c._weight_buffer, c._scale_buffer, n)
+            else:
+                t.gather_host(idx, b["stage_w"][l][:n], b["stage_s"][l][:n] if t.groups else None,
+                              pool=f._pool, chunk=f.chunk)
+            self.np[2 + l] = gen
+            key = f"graph_ready_l{l}_s"  # flag seen -> this layer's rows staged
+            f.stats[key] = f.stats.get(key, 0.0) + time.perf_counter() - t0
+        f.stats["graph_fetches"] = f.stats.get("graph_fetches", 0) + 1
+        f.stats["graph_gather_s"] = f.stats.get("graph_gather_s", 0.0) + time.perf_counter() - t0
+
+    def failure(self) -> str | None:
+        """Why the in-graph fetch of a replay so far did not deliver its rows (None: all good)."""
+        if self.error is not None:
+            return f"engram graph fetch service failed: {self.error!r}"
+        if int(self.np[1]):
+            return (f"GPU wait for the engram rows timed out (SM120_ENGRAM_GRAPH_WAIT_S={self.max_ns / 1e9:g}) at "
+                    f"replay {int(self.np[1])}")
+        return None
 
     def stop(self) -> None:
         self._stop = True
         self.thread.join(timeout=5)
 
 
+
+
+class EngramFetchError(RuntimeError):
+    """A CUDA-graph replay used engram rows that were not delivered (service failure or wait timeout)."""
+
+
+def check_graph_fetch() -> None:
+    """Raise EngramFetchError if any in-graph fetch failed so far. The engine calls it after every step (E9), after
+    the step's outputs were synchronized and before they are returned, so no output of a failed step is used."""
+    for f in _FETCHERS:
+        a = f._async
+        why = a.failure() if a is not None else None
+        if why is not None:
+            raise EngramFetchError(why)
 
 
 def _dump_stats(only_changed: bool = False) -> None:
@@ -1638,6 +1716,12 @@ def _done(value) -> Future:
 
 # ------------------------------------------------------------------------------------------------ prefetch
 _PREFETCH = None  # EngramPrefetcher of this process (start_prefetcher), None when off
+_STEP_IS_PROMPT: bool | None = None  # kind of the model forward running now (E6), None = unknown
+
+
+def set_step_is_prompt(prompt: bool) -> None:
+    global _STEP_IS_PROMPT
+    _STEP_IS_PROMPT = prompt
 _TRACE = os.environ.get("SM120_ENGRAM_TRACE", "0") not in ("0", "")  # per prefill-gather timing lines
 
 _FADVISE_SRC = r"""
@@ -1764,7 +1848,7 @@ class EngramPrefetcher:
         self._fds = {}
         self._q: list = []  # [request id, compressed ids, next position, pad, sentinel, admission seq or None]
         self._ids: set = set()  # queued or done recently (server submit and LLMEngine.add_request both report a prompt)
-        self._recent: list = []
+        self._recent: deque = deque()
         self._admit_seq = 0
         self._cv = threading.Condition()
         self._issued = 0  # prompt tokens prefetched
@@ -1820,6 +1904,7 @@ class EngramPrefetcher:
         with self._cv:
             n = len(self._q)
             self._q = [e for e in self._q if e[0] != request_id]
+            self._ids.discard(request_id)  # also when already read: a reused id is prefetched again
             if len(self._q) != n:
                 self.stats["cancelled"] += 1
 
@@ -1855,7 +1940,7 @@ class EngramPrefetcher:
                         self._q.remove(e)
                         self._recent.append(rid)
                         if len(self._recent) > 4096:
-                            self._ids.discard(self._recent.pop(0))
+                            self._ids.discard(self._recent.popleft())
                     self._issued += n
                     return comp, pos, n, pad, sentinel
                 t0 = time.perf_counter()

@@ -397,6 +397,14 @@ def run_tests(args, cfg: Cfg, ckpt: str, M, E, tokenizer, device: torch.device) 
             ok6, dt6 = graph_check(cfg, table, cols, device, args.seed + 6, prestage=(mode == "prestage"))
             check(f"T6 graph {mode}", ok6, f"5 replays x 16 tokens, graph output == eager fetch; "
                                            f"{dt6 * 1e3:.3f} ms per replay (incl. host gather)")
+        # T9: in-graph fetch failures (host tables): a gather that raises in the service thread, and one that stalls
+        # past SM120_ENGRAM_GRAPH_WAIT_S. The replay must return within the budget and check_graph_fetch() (E9: the
+        # engine step) must raise, so no output of that step is used.
+        if table.kind == "host":
+            os.environ["SM120_ENGRAM_GRAPH"] = "async"
+            for fault in ("raise", "stall"):
+                ok9, detail = graph_fault_check(cfg, table, cols, device, args.seed + 9, fault)
+                check(f"T9 graph fetch {fault}", ok9, detail)
         os.environ.pop("SM120_ENGRAM_GRAPH", None)
 
     # T5: the reference re-quantizes the bf16 rows (act_quant, ue8m0) before its fp8 GEMM; DeepInfer feeds
@@ -510,6 +518,65 @@ def graph_check(cfg, table, cols, device, seed, prestage: bool, Tg: int = 16, re
     buf.fetcher.owns_tables = False  # the table is shared with the other checks
     buf.destroy()
     return ok, dt / reps
+
+
+def graph_fault_check(cfg, table, cols, device, seed, fault: str, Tg: int = 16, wait_s: float = 1.0):
+    from deep_ep._engram import EngramBuffer
+
+    os.environ["SM120_ENGRAM_GRAPH_WAIT_S"] = str(wait_s)
+    buf = EngramBuffer(None)
+    buf.set_config([table.rows], cfg.head_dim, 64, cols, torch.float8_e4m3fn, cfg.head_dim // 128)
+    buf.attach_tables([table])
+    g = torch.Generator().manual_seed(seed)
+    static_idx = torch.randint(0, table.rows, (1, Tg, cols), generator=g, dtype=torch.int64).to(torch.int32).to(device)
+    out = torch.empty((Tg, cols * cfg.head_dim), dtype=torch.bfloat16, device=device)
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        (h,) = buf.fetch(static_idx)
+        h()
+    torch.cuda.current_stream().wait_stream(s)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=s):
+        (h,) = buf.fetch(static_idx)
+        d, f = h()
+        out.copy_(se.dequant_rows(d, f, cfg.head_dim))
+    graph.replay()
+    torch.cuda.synchronize()
+    clean = None
+    try:
+        se.check_graph_fetch()
+    except se.EngramFetchError as exc:
+        clean = exc
+    orig = table.gather_host
+
+    def faulty(*a, **k):
+        if fault == "raise":
+            raise OSError(5, "injected gather failure (test)")
+        time.sleep(3 * wait_s)
+        return orig(*a, **k)
+
+    table.gather_host = faulty
+    try:
+        t0 = time.perf_counter()
+        graph.replay()
+        torch.cuda.synchronize()
+        dt = time.perf_counter() - t0
+        raised = None
+        try:
+            se.check_graph_fetch()
+        except se.EngramFetchError as exc:
+            raised = exc
+    finally:
+        table.gather_host = orig
+    if fault == "stall":
+        time.sleep(3 * wait_s)  # let the stalled gather finish before the buffers go away
+    buf.fetcher.owns_tables = False
+    buf.destroy()
+    os.environ.pop("SM120_ENGRAM_GRAPH_WAIT_S", None)
+    ok = clean is None and raised is not None and dt < wait_s * 2 + 1
+    return ok, (f"clean replay passes the check: {clean is None}; faulty replay returned after {dt:.2f} s "
+                f"(budget {wait_s} s), check raised: {raised!r}")
 
 
 # ------------------------------------------------------------------------------------------------ benchmark

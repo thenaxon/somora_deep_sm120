@@ -136,7 +136,7 @@ more expert weights per token, so the speed numbers are **not** a prediction for
 | MTP/DSpark decode, B=8 | 388 tok/s (nextn 0) -> 642 / 927 / 909 tok/s (nextn 1 / 3 / 5): 2.4x with nextn 3 |
 | deterministic MoE cost (`SM120_MOE_DETERMINISTIC=1`), TPOT B=1 / 8 / 32 | 16.1 / 20.8 / 25.4 -> 19.1 / 23.4 / 27.0 ms (1.06-1.19x on one GPU, 0.3.1; opt-in) |
 | determinism | with `SM120_MOE_DETERMINISTIC=1`, eager and CUDA graphs are bit-identical (17/17 tokens, 0.0 error on every layer); nextn 0 / 1 / 5 decode identical tokens with a deterministic MoE |
-| server test suite, 3-layer test model | 22/22 with `--deterministic --prefix-cache` |
+| server test suite, 3-layer test model | 22/22 with `--deterministic --prefix-cache` (eager, `--no-graphs`) |
 | prefix cache hit, 1503-token prompt | TTFT 1.82 s → 0.56 s, identical tokens |
 
 Details and more tables: [docs/VALIDATION.md](docs/VALIDATION.md), [docs/ATTENTION.md](docs/ATTENTION.md),
@@ -155,9 +155,10 @@ Details and more tables: [docs/VALIDATION.md](docs/VALIDATION.md), [docs/ATTENTI
 - **Layer 0 deviates from the reference** beyond the noise floor (about 12-20× noise, not at other layers). This is a
   known rounding property of DeepInfer's `fused_transform` path, not a port bug ([docs/VALIDATION.md](docs/VALIDATION.md)).
 - **b12x `fused_moe` (the default MoE) is not run-to-run deterministic.** The same prompt can decode different tokens
-  after a few steps. For reproducible outputs on one GPU use `--deterministic` (`SM120_MOE_IMPL=torch`, exact but
-  slower); it is not expert-parallel, so with `--dp` use `SM120_MOE_DETERMINISTIC=1` (below). In 0.3.0
-  `--deterministic` with `--dp > 1` computed wrong MoE outputs; since 0.3.1 the server refuses that combination.
+  after a few steps. For reproducible outputs on one GPU use `--deterministic --no-graphs` (`SM120_MOE_IMPL=torch`,
+  exact but slower; not CUDA-graph capturable, not expert-parallel). With CUDA graphs or `--dp` use
+  `SM120_MOE_DETERMINISTIC=1` (below). In 0.3.0 `--deterministic` with `--dp > 1` computed wrong MoE outputs; since
+  0.3.1 the server refuses that combination, and `--deterministic` with graphs at start-up.
 - b12x's deterministic MoE mode (`SM120_MOE_DETERMINISTIC=1`, also turned on by `DEEPINFER_BATCH_INVARIANT=1`) is
   bit-exact run to run, 1.06-1.19x slower in decode on one GPU (with `--dp` more, see docs/RUNTIME.md). b12x 1.5.1's `deterministic_output` has two bugs (wrong rows
   below dynamic tile 64, stale rows for masked routes under expert parallelism), worked around since 0.3.1 (refused by

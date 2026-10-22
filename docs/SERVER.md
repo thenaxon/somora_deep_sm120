@@ -29,7 +29,7 @@ Inside the image (`PYTHONPATH=/opt/sm120/sm120:/opt/deepinfer` is preset):
 
 ```bash
 python3 /opt/sm120/server/server.py --ckpt /work/ckpt3 --port 8000 --max-num-seqs 8     # b12x backends (fast)
-python3 /opt/sm120/server/server.py --ckpt /work/ckpt3 --port 8000 --deterministic      # reproducible outputs (torch MoE; one GPU only)
+python3 /opt/sm120/server/server.py --ckpt /work/ckpt3 --port 8000 --deterministic      # reproducible outputs (torch MoE; one GPU, eager: no --graphs)
 # options: --max-model-len 16384 --max-num-batched-tokens 4096 --gpu-memory-utilization 0.9 --max-blocks 256
 #          --nextn N (MTP, needs mtp.* layers) --graphs (CUDA graphs) --mtp-varlen (adaptive draft length, needs
 #          --graphs and --nextn > 0; docs/MTP_YOCO.md §9) --zos 0|1 --prefill-interval auto --prefill-any-interval auto --model-name ID

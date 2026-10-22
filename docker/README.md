@@ -59,7 +59,8 @@ docker run --rm --gpus all --ipc=host --shm-size=16g -p 8000:8000 \
 # entrypoint options: --model PATH (required) --served-model-name NAME --no-graphs (CUDA graphs are on by default)
 #   --host 0.0.0.0 --port 8000; everything else goes to server.py:
 #   --gpu-memory-utilization 0.9 --max-model-len 16384 --max-num-seqs 8 --max-num-batched-tokens 4096 --prefix-cache
-#   [--prefix-cache-grain 512 --prefix-cache-entries 64 --prefix-cache-max-block-frac 0.5] --nextn N --deterministic
+#   [--prefix-cache-grain 512 --prefix-cache-entries 64 --prefix-cache-max-block-frac 0.5] --nextn N
+#   --deterministic (torch MoE: needs --no-graphs, one GPU; with graphs or --dp: -e SM120_MOE_DETERMINISTIC=1)
 docker run --rm somora_deep_sm120:0.3.0 --help
 ```
 

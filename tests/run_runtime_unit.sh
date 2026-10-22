@@ -22,6 +22,7 @@ step bench python3 $SM120_ROOT/tests/test_b12x_tiny_decode_swiglu.py --shape v41
 step repro python3 $SM120_ROOT/patches/repro_b12x_tiny_decode_swiglu.py   # prints its findings; only a crash fails
 step gemm_moe_graphs bash -o pipefail -c "pytest -q -x $SM120_ROOT/tests/test_gemm_moe_graphs.py 2>&1 | tail -30"
 step fail_closed bash -o pipefail -c "pytest -q -x $SM120_ROOT/tests/test_fail_closed.py 2>&1 | tail -15"
+step server_args bash -o pipefail -c "pytest -q -x $SM120_ROOT/tests/test_server_args.py 2>&1 | tail -5"
 cd /opt/deepinfer/deepinfer/model_executor/layers/tilelang_ops || exit 1
 step tilelang_sampler bash -o pipefail -c "python3 -m pytest -q sampler.py -k 'not benchmark' 2>&1 | tail -15"
 step tilelang_mtp bash -o pipefail -c "python3 -m pytest -q dflash.py dflash_copy.py store_mtp_info.py schedule_mtp_varlen.py fused_sample.py -k 'not benchmark' 2>&1 | tail -15"

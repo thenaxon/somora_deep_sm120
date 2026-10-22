@@ -149,6 +149,8 @@ Details and more tables: [docs/VALIDATION.md](docs/VALIDATION.md), [docs/ATTENTI
 - `--yoco-compact` (opt-in, about 1.15–1.2× faster prefill at 32k) cannot be combined with `--prefix-cache`.
 - **Layer 0 deviates from the reference** beyond the noise floor (about 12-20× noise, not at other layers). This is a
   known rounding property of DeepInfer's `fused_transform` path, not a port bug ([docs/VALIDATION.md](docs/VALIDATION.md)).
+- **b12x's deterministic MoE mode (`SM120_MOE_DETERMINISTIC=1`) is wrong with `--dp > 1`** (a b12x bug with masked
+  routes); the server refuses that combination. Use `--deterministic` (torch MoE) for reproducible multi-GPU runs.
 - **b12x `fused_moe` (the default MoE) is not run-to-run deterministic.** The same prompt can decode different tokens
   after a few steps. `--deterministic` / `SM120_MOE_IMPL=torch` is exact but slower, and `SM120_MOE_DETERMINISTIC=1`
   gives a deterministic b12x mode, recommended when reproducibility matters but 2-2.9x slower in decode

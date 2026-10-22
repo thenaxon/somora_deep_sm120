@@ -569,6 +569,26 @@ def _exit_start_failed(exc: BaseException, dp_rank) -> None:
     os._exit(3)
 
 
+def _deterministic_moe_on_ep(args) -> str | None:
+    """b12x 1.5.1 deterministic_output (SM120_MOE_DETERMINISTIC, also turned on by DEEPINFER_BATCH_INVARIANT=1 or
+    B12X_DYNAMIC_DETERMINISTIC_OUTPUT=1) does not zero the per-route rows of masked routes (topk_ids -1) and sums stale
+    scratch into them. With expert parallelism every rank masks the routes to the other ranks' experts, so the output
+    is wrong. Returns the reason to refuse, or None. --deterministic (torch MoE) is not affected."""
+    on = lambda name: os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")  # noqa: E731
+    if max(args.dp, args.ep or args.dp) <= 1 or args.deterministic:
+        return None
+    if os.environ.get("SM120_MOE_IMPL", "b12x").strip().lower() == "torch":
+        return None
+    det = os.environ.get("SM120_MOE_DETERMINISTIC", "auto").strip().lower()
+    if det in ("0", "false", "no", "off"):
+        return None
+    names = [n for n in ("SM120_MOE_DETERMINISTIC", "DEEPINFER_BATCH_INVARIANT", "B12X_DYNAMIC_DETERMINISTIC_OUTPUT") if on(n)]
+    if not names:
+        return None
+    return (f"{'/'.join(names)} with --dp/--ep > 1: b12x's deterministic MoE output is wrong with expert parallelism "
+            "(masked routes are not zeroed). Use --deterministic (torch MoE), or SM120_MOE_DETERMINISTIC=0")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--ckpt", required=True)
@@ -633,6 +653,9 @@ def main() -> int:
     # docker stop / kill -TERM: run the finally blocks (engine shutdown here, rank shutdown in the dp proxy) instead
     # of dying in place; the default SIGTERM action skips them.
     signal.signal(signal.SIGTERM, _sigterm)
+    reason = _deterministic_moe_on_ep(args)
+    if reason:
+        ap.error(reason)
     if args.mtp_varlen and (args.nextn <= 0 or not args.graphs):
         ap.error("--mtp-varlen needs --nextn > 0 and --graphs (DeepInfer profiles the decode graphs for its cost model)")
     logging.basicConfig(level=args.log_level, format="%(asctime)s %(name)s %(levelname)s %(message)s")

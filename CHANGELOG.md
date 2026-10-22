@@ -7,6 +7,13 @@ before 1.0 any minor release may change interfaces.
 
 Release candidate for the first public version. 0.2.5 was not tagged; its changes are listed here.
 
+### Fixed
+- `--dp > 1` with b12x's deterministic MoE (`SM120_MOE_DETERMINISTIC=1`, or `DEEPINFER_BATCH_INVARIANT=1` /
+  `B12X_DYNAMIC_DETERMINISTIC_OUTPUT=1`, which turn it on) gave wrong outputs: b12x 1.5.1's `deterministic_output`
+  does not zero the rows of masked routes (`topk_ids` -1) and sums stale scratch into them, and with expert
+  parallelism every rank masks the routes to the other ranks' experts. The server now refuses this combination at
+  start-up. `--deterministic` (torch MoE), the default b12x MoE and a single GPU are not affected.
+
 ### Changed
 - Documentation for a public release: the README states the hardware the full model needs (4× RTX PRO 6000, about
   256 GB RAM; a single RTX 5090 only runs truncated test checkpoints), the recommended configuration

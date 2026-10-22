@@ -3,6 +3,17 @@
 All notable changes to this project are documented here. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0 any minor release may change interfaces.
 
+## [0.2.3] - unreleased
+
+### Added
+- `SM120_ENGRAM_MODE=pinned`: the engram tables are kept once in shared, pinned host memory for all ranks, the way the
+  baseline keeps them in RAM.
+  - A memfd created by the server or the `--dp` proxy is registered with `cudaHostRegister` in every rank and filled
+    from the shards after load.
+  - Lookups are GPU gathers from it, also inside CUDA graphs, and never touch the NVMe.
+  - The start-up fails with the numbers when tables + ranks' memory + headroom do not fit.
+  - `tests/test_engram_pinned.py` checks one copy for two ranks, bit-exact rows and graph replay.
+
 ## [0.2.2] - unreleased
 
 ### Fixed

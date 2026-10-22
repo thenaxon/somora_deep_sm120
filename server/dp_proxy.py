@@ -179,13 +179,23 @@ def nccl_p2p_env(dp: int) -> dict:
 def run(argv: list[str], dp: int, host: str, port: int) -> int:
     """argv: server.py arguments without --dp/--host/--port. Spawns the ranks and serves the proxy until interrupted."""
     ports = [port + 1 + r for r in range(dp)]
+    shm_fd = None
+    if os.environ.get("SM120_ENGRAM_MODE") == "pinned":  # one shared, pinned copy of the engram tables for all ranks
+        ckpt = argv[argv.index("--ckpt") + 1] if "--ckpt" in argv else next(
+            (a.split("=", 1)[1] for a in argv if a.startswith("--ckpt=")), None)
+        import sm120_engram
+
+        try:
+            shm_fd = sm120_engram.create_shared_tables(ckpt, ranks=dp)
+        except sm120_engram.EngramResidencyError as exc:
+            raise SystemExit(f"engram tables cannot be pinned: {exc}") from None
     env = dict(os.environ, **nccl_p2p_env(dp))
     procs = []
     for r, p in enumerate(ports):
         cmd = [sys.executable, __file__.replace("dp_proxy.py", "server.py"), *argv, "--dp", str(dp), "--dp-rank", str(r),
                "--host", "127.0.0.1", "--port", str(p)]
         log.info("rank %d: %s", r, " ".join(cmd))
-        procs.append(subprocess.Popen(cmd, env=env))
+        procs.append(subprocess.Popen(cmd, env=env, pass_fds=(shm_fd,) if shm_fd is not None else ()))
     try:
         t0 = time.time()
         pending = set(range(dp))

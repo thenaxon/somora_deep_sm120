@@ -88,6 +88,7 @@ above is met exactly, so the FP8 GEMM sees the same operand as on SM100.
 | `SM120_ENGRAM_MODE` | table | gather | CUDA graphs | RAM needed |
 |---|---|---|---|---|
 | `host` (default) | mmap of the HF shard (`MADV_RANDOM`); page cache = RAM tier | D2H of the ids + one stream sync, CPU `index_select` in worker threads (each page-faults its rows from NVMe), pinned staging, async H2D. The layer-14 gather runs while the GPU computes layers 1-13 | yes (§3.1) | none beyond page cache |
+| `pinned` | anonymous shared memory (memfd) holding the whole tables once for all ranks, created by the server / `--dp` proxy before the ranks start, filled by rank 0 after load (reads from the shards), registered with `cudaHostRegister(Portable\|Mapped)` in every rank | GPU `index_select` over PCIe from the pinned host memory (8-byte elements): 2.5-6.5 ms per 98k rows (both planes) on the RTX 5090 test machine; no host sync | yes (inside the graph) | tables (188.8 GiB) + the ranks' own memory; start-up refuses if it does not fit (MULTI_GPU_RUNBOOK.md §3) |
 | `uva` | the same mmap, `cudaHostRegister(Mapped\|ReadOnly)`, CUDA view | GPU `index_select` over PCIe, no host sync | yes | >= table size (pinned). **Does not work:** registering the read-only file pages fails with `cudaErrorNotSupported` (RTX 5090 test machine); pin with `SM120_ENGRAM_PIN=mlock` instead |
 | `uring` | b12x `DiskRowCache` (O_DIRECT io_uring, `b12x.sequence._shared.disk_table`) for the weight rows; scale rows and prefill-sized batches (>= `SM120_ENGRAM_URING_MMAP_TOKENS` tokens, default 256) through the mmap like `host` | decode: per-batch reads into mapped-host staging, then a GPU copy; prefill: as `host` | yes (§3.1) | staging only; container needs io_uring allowed by seccomp and a memlock limit (§7) |
 | (tensors) | `EngramBuffer.write` (stock path, enp=1 only), CPU or CUDA | as above | GPU: yes | as stock |
@@ -360,6 +361,10 @@ original shard directory must be visible at the same absolute path wherever the 
   each rank maps the same files and the page cache holds **one shared copy** (203 GB for both tables). Nothing is
   replicated per rank and nothing is exchanged between GPUs. Row sharding plus all-to-all only pays off when shards sit
   in GPU memory, and ~51 GB per GPU next to the weights does not fit on 96 GB cards.
+- **MemAvailable before start-up >= tables + 5 GiB per rank + 6 GiB (215 GiB for 4 ranks):** `pinned`. There is
+  one shared copy in pinned host memory and every rank gathers on the GPU. On the RTX 5090 test machine (tables
+  truncated with `SM120_ENGRAM_SHM_MAX_ROWS`), the cost of the lookups disappeared: TTFT 4k 0.81 s, 32k 6.32 s,
+  4 x 4k 3.15 s, the same as without engram (0.81 / 6.29 / 3.13 s).
 - **MemAvailable after start-up >= tables + 8 GiB (about 212 GB):** `host` with `SM120_ENGRAM_PIN=mlock`. Rank 0
   prefaults the tables and locks them once. All ranks share that locked page-cache copy, so lookups never do NVMe I/O,
   which matters most where the NVMe sits behind a translating IOMMU (MULTI_GPU_RUNBOOK.md §3). The start-up refuses
@@ -383,11 +388,13 @@ original shard directory must be visible at the same absolute path wherever the 
 
 | env | default | meaning |
 |---|---|---|
-| `SM120_ENGRAM_MODE` | `auto` (= `host`) | `host`, `uva`, `uring` (see §3); the serving image sets `host` |
+| `SM120_ENGRAM_MODE` | `auto` (= `host`) | `host`, `pinned`, `uva`, `uring` (see §3); the serving image sets `host` |
 | `SM120_ENGRAM_GRAPH` | `async` | CUDA-graph fetch mode: `async` or `prestage` |
 | `SM120_ENGRAM_PRESTAGE` | 1 | 0 skips prestaging (negative control only) |
 | `SM120_ENGRAM_PREFAULT` | 0 | 1 reads the whole tables into the page cache. The server does it once after every rank has loaded its weights, before it accepts requests (`--dp`: the proxy asks rank 0), and skips it when the tables do not fit into MemAvailable minus `SM120_ENGRAM_PREFAULT_HEADROOM_GB` (use `uring` there). `force` prefaults regardless |
 | `SM120_ENGRAM_PREFAULT_HEADROOM_GB` | 4 | MemAvailable that the prefault leaves free. A partial prefault is not offered: on the RTX 5090 test machine it made cold prefills 20 % slower (page-cache pressure), and the second table's pages evicted the first's |
+| `SM120_ENGRAM_RANK_HOST_GB` | 5 | `pinned`: host memory budgeted per rank in the start-up check (tables + ranks x this + `SM120_ENGRAM_PIN_HEADROOM_GB`, default 6 in this mode, must fit into MemAvailable before the ranks start) |
+| `SM120_ENGRAM_SHM_MAX_ROWS` | 0 | tests only: truncate the shared tables to this many rows so that `pinned` fits a small machine (lookups beyond read zeros) |
 | `SM120_ENGRAM_PIN` | 0 | `mlock`: after load, prefault the tables and `mlock` them once in rank 0's process. The pages are the shared page cache of the shard files, so all ranks get guaranteed residency from one locked copy. Start-up fails if the tables plus `SM120_ENGRAM_PIN_HEADROOM_GB` do not fit into MemAvailable, or if `RLIMIT_MEMLOCK` is too low (`--ulimit memlock=-1`). The prefetcher is turned off (nothing to read ahead) |
 | `SM120_ENGRAM_PIN_HEADROOM_GB` | 8 | MemAvailable that must remain after pinning (locked memory is not reclaimable and there is no swap) |
 | `SM120_ENGRAM_RESIDENCY_INTERVAL` | 0 | seconds between residency log lines while serving (process that ran the post-load policy; mincore, about 1 s per 200 GiB) |

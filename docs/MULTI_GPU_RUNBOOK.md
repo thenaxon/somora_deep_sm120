@@ -56,17 +56,24 @@ each rank holds its own CUDA context, pinned staging, the 2 GB multimodal pool a
 10 GB per rank, about 40 GB for 4). The server logs `MemAvailable` together with the tables' page-cache residency
 at start-up and again after the post-load step (`[sm120_engram] engram tables resident in the page cache ...`).
 
-| MemAvailable after start-up | mode | flags |
+| MemAvailable | mode | flags |
 |---|---|---|
-| >= tables + 8 GiB (about 212 GB, tables 188.8 GiB) | **`host` + pinned tables** (recommended): once all ranks have loaded their weights, rank 0 drops the weight shards' page-cache pages, reads both tables into the page cache (sequential reads, about 1 min at 3.5 GB/s) and `mlock`s them. The locked pages are the shared page cache of the shard files, so the 4 ranks share one locked copy (measured: two processes locking the same 16 GiB raise `Mlocked` by 16 GiB, not 32). The kernel cannot evict them; lookups never do I/O. Start-up fails with a clear message if the tables plus `SM120_ENGRAM_PIN_HEADROOM_GB` (8) do not fit | `-e SM120_ENGRAM_MODE=host -e SM120_ENGRAM_PIN=mlock --ulimit memlock=-1 -e DEEPINFER_MULTIMODAL_POOL_SIZE_GB=1` |
+| **before** start-up >= tables + 5 GiB per rank + 6 GiB (215 GiB for `--dp 4`) | **`pinned`** (recommended, the way the baseline keeps its tables):<br>- The server (the `--dp` proxy) creates one anonymous shared segment (memfd) of 188.8 GiB before the ranks start. Every rank registers it with `cudaHostRegister` (portable, mapped).<br>- Once all ranks have loaded, rank 0 reads the shards into it (buffered reads, the shard pages dropped behind them, about 1 min at 3.5 GB/s). Every rank's lookups then gather on the GPU straight from that pinned host memory.<br>- One copy for all ranks: two processes registering a 15.7 GiB segment raised Shmem by 15.8 GiB, not 31.<br>- Shared memory without swap is never reclaimed, and the registration pins it: residency is guaranteed, and there is no I/O while serving.<br>- Start-up fails with a message naming the numbers if it does not fit | `-e SM120_ENGRAM_MODE=pinned --ulimit memlock=-1 -e DEEPINFER_MULTIMODAL_POOL_SIZE_GB=1` |
+| after start-up >= tables + 8 GiB (about 212 GB, tables 188.8 GiB) | `host` + locked page cache: once all ranks have loaded their weights, rank 0 drops the weight shards' page-cache pages, reads both tables into the page cache (sequential reads, about 1 min at 3.5 GB/s) and `mlock`s them. The locked pages are the shared page cache of the shard files, so the 4 ranks share one locked copy (measured: two processes locking the same 16 GiB raise `Mlocked` by 16 GiB, not 32). The kernel cannot evict them; lookups never do I/O. Start-up fails with a clear message if the tables plus `SM120_ENGRAM_PIN_HEADROOM_GB` (8) do not fit | `-e SM120_ENGRAM_MODE=host -e SM120_ENGRAM_PIN=mlock --ulimit memlock=-1 -e DEEPINFER_MULTIMODAL_POOL_SIZE_GB=1` |
 | >= tables + 4 GiB | `host` + prefault (best effort: page cache, no lock; process growth evicts table pages) | `-e SM120_ENGRAM_MODE=host -e SM120_ENGRAM_PREFAULT=1` (0.2.1: `=force`) |
 | below that | `uring` (O_DIRECT reads per lookup batch, flat latency) | `-e SM120_ENGRAM_MODE=uring -e SM120_ENGRAM_THREADS=16 --security-opt seccomp=unconfined --ulimit memlock=-1` |
 
 `uva` (pinning through `cudaHostRegister`) does not work with the shard mmaps: registering read-only file pages fails
 with `cudaErrorNotSupported` (measured on the RTX 5090 test machine), so `mlock` is the way to pin.
 
-**Memory budget for `--dp 4` on a 246 GiB host without swap.** Per rank, measured on the RTX 5090 test machine after
-load and a few 4k/32k requests:
+**Memory budget for `--dp 4` on a 246 GiB host without swap.**
+- In `pinned` mode the tables are 188.8 GiB of shared memory (`Shmem` in `/proc/meminfo`), counted once.
+- The ranks no longer map the shard files, so their page tables stay small: VmPTE 0.03 GiB instead of 0.4.
+- Each registration costs the driver some bookkeeping: about 0.4 GiB for two registrations of 15.7 GiB, i.e. up to
+  about 1 GiB per rank for the full tables.
+- The start-up check uses `SM120_ENGRAM_RANK_HOST_GB=5` per rank and `SM120_ENGRAM_PIN_HEADROOM_GB=6`.
+
+Per rank, measured on the RTX 5090 test machine after load and a few 4k/32k requests:
 
 | | per rank | 4 ranks |
 |---|---|---|

@@ -500,7 +500,7 @@ def _engram_cache_policy(ckpt: str) -> dict | None:
     residency), before the server accepts requests: a prefault running while serving starves the prefill's own
     engram reads. None if it already ran or Engram is not loaded."""
     eng = sys.modules.get("sm120_engram")
-    if eng is None or not getattr(eng, "_TABLES", None) or _CACHE_POLICY:
+    if eng is None or not (getattr(eng, "_TABLES", None) or getattr(eng, "_SHARED_TABLES", None)) or _CACHE_POLICY:
         return None
     _CACHE_POLICY["started"] = time.time()
     try:
@@ -598,6 +598,14 @@ def main() -> int:
                 continue
             rest.append(a)
         return dp_proxy.run(rest, args.dp, args.host, args.port)
+    if args.dp_rank is None:  # SM120_ENGRAM_MODE=pinned: the shared table segment exists before the engine starts
+        try:
+            import sm120_engram
+
+            sm120_engram.create_shared_tables(args.ckpt, ranks=1)
+        except Exception as exc:  # noqa: BLE001 - EngramResidencyError: does not fit; refuse to start
+            log.error("%s", exc)
+            return 2
     app = App(args)
     app.engine.start()
     if args.dp_rank is None:  # single process: weights are loaded now; with --dp the proxy calls it on rank 0

@@ -30,6 +30,9 @@ Environment (all optional):
     SM120_ENGRAM_PREFAULT_HEADROOM_GB=<g>   prefault only if the tables fit into MemAvailable minus g GiB (default
                                             4); SM120_ENGRAM_PREFAULT=force prefaults regardless
     SM120_ENGRAM_RESIDENCY_INTERVAL=<s>     log the tables' page-cache residency every s seconds (default 0 = off)
+    SM120_ENGRAM_MODE=pinned                the tables once in shared pinned host memory (memfd), registered in every
+                                            rank, GPU gathers; SM120_ENGRAM_RANK_HOST_GB (5) per rank +
+                                            SM120_ENGRAM_PIN_HEADROOM_GB (6) must fit, else start-up fails
     SM120_ENGRAM_PIN=0|mlock                after load: prefault and mlock the tables once (shared by all ranks);
                                             start-up fails unless they fit with SM120_ENGRAM_PIN_HEADROOM_GB (8)
     SM120_ENGRAM_DROP_WEIGHT_PAGES=1|0      server: drop the other shards' page-cache pages after load
@@ -362,6 +365,8 @@ def post_load_cache_policy(ckpt_dir: str | None) -> dict:
         print(f"[sm120_engram] page cache: dropped clean pages of {dropped} weight shards ({nbytes / 2**30:.0f} GiB of "
               f"files) after load (SM120_ENGRAM_DROP_WEIGHT_PAGES=0 keeps them)", flush=True)
     pf = _env("SM120_ENGRAM_PREFAULT", "0")
+    if _SHARED_TABLES:
+        res.update(fill_shared_tables())  # pinned mode: one process fills the shared segment for all ranks
     if _env("SM120_ENGRAM_PIN", "0") in ("mlock", "1", "true", "yes") and tables:
         res.update(_pin_policy(tables))  # raises EngramResidencyError: the server aborts its start-up
         if _PREFETCH is not None:  # every lookup hits locked pages: nothing to read ahead
@@ -681,10 +686,14 @@ class EngramHostTable:
         """GPU gather for device / UVA tables: idx int64 CUDA [n]; out_w [n, row_bytes], out_s [n, groups]."""
         valid = (idx >= 0) & (idx < self.rows)
         safe = torch.where(valid, idx, torch.zeros_like(idx))
-        torch.index_select(self.weight, 0, safe, out=out_w)
+
+        def wide(t: torch.Tensor) -> torch.Tensor:  # 8-byte elements: far fewer, wider reads (over PCIe for uva)
+            return t.view(torch.int64) if t.shape[-1] % 8 == 0 and t.is_contiguous() else t
+
+        torch.index_select(wide(self.weight), 0, safe, out=wide(out_w))
         out_w.masked_fill_(~valid.unsqueeze(-1), 0)
         if out_s is not None and self.scale is not None:
-            torch.index_select(self.scale, 0, safe, out=out_s)
+            torch.index_select(wide(self.scale), 0, safe, out=wide(out_s))
             out_s.masked_fill_(~valid.unsqueeze(-1), E8M0_ONE)
 
 
@@ -718,6 +727,8 @@ def open_table(ckpt_dir: str | None, layer_id: int, *, wloc: TensorLoc | None = 
     mode = mode or _env("SM120_ENGRAM_MODE", "auto")
     if wloc is None:
         wloc, sloc = find_engram_tensors(ckpt_dir, layer_id)
+    if mode == "pinned":
+        return open_shared_table(ckpt_dir, layer_id, wloc, sloc, device)
     table = EngramHostTable.from_locations(wloc, sloc, name=f"layers.{layer_id}.engram",
                                            prefault=None if mode in ("auto", "host") else False)
     if mode in ("auto", "host", "uring"):
@@ -731,7 +742,172 @@ def open_table(ckpt_dir: str | None, layer_id: int, *, wloc: TensorLoc | None = 
         return table.to_uva(device)
     if mode == "uring":
         return table.to_uring(device, max_lookups)
-    raise ValueError(f"SM120_ENGRAM_MODE={mode!r}: expected auto, host, uva or uring")
+    raise ValueError(f"SM120_ENGRAM_MODE={mode!r}: expected auto, host, pinned, uva or uring")
+
+
+# ------------------------------------------------------------------------------------------------ pinned shared tables
+# SM120_ENGRAM_MODE=pinned: the tables live once in anonymous shared memory (a memfd created by the --dp proxy or the
+# single server process, inherited by the ranks), registered with cudaHostRegister(Portable|Mapped) in every rank and
+# gathered on the GPU over PCIe (kind "uva"). Shared memory without swap is never reclaimed and the registration pins it
+# for DMA: guaranteed residency with one copy for all ranks, like an engine that pins its tables. Unlike file-backed
+# mmaps, anonymous shared pages can be registered. Filled after load by one process with buffered reads from the shards.
+_SHM_ALIGN = 1 << 21
+
+
+def _engram_layer_ids(ckpt_dir: str) -> list[int]:
+    with open(os.path.join(ckpt_dir, "config.json")) as f:
+        cfg = json.load(f)
+    return list(cfg.get("text_config", cfg).get("engram_layer_ids") or [])
+
+
+def shared_layout(ckpt_dir: str) -> tuple[list, int]:
+    """[(layer_id, wloc, sloc, weight offset, scale offset)] in the shared segment, and its total size. Every process
+    computes the same layout from the checkpoint headers. SM120_ENGRAM_SHM_MAX_ROWS (tests only) truncates the
+    tables to fit a small machine: lookups of rows beyond it read zeros."""
+    out, off = [], 0
+    cap = int(_env("SM120_ENGRAM_SHM_MAX_ROWS", "0"))
+    for lid in _engram_layer_ids(ckpt_dir):
+        wloc, sloc = find_engram_tensors(ckpt_dir, lid)
+        rows = wloc.shape[0] if not cap else min(cap, wloc.shape[0])
+        wo = off
+        off = _align(wo + rows * (wloc.nbytes // wloc.shape[0]), _SHM_ALIGN)
+        so = off
+        off = _align(so + rows * (sloc.nbytes // sloc.shape[0]), _SHM_ALIGN)
+        out.append((lid, wloc, sloc, wo, so, rows))
+    return out, off
+
+
+def create_shared_tables(ckpt_dir: str, ranks: int = 1) -> int | None:
+    """Proxy / single server, before any rank starts: create the shared segment for SM120_ENGRAM_MODE=pinned and export
+    SM120_ENGRAM_SHM_FD. Fails (EngramResidencyError) unless the tables plus the ranks' own host memory
+    (SM120_ENGRAM_RANK_HOST_GB per rank, default 5: measured 3.3-4.5 GiB per rank on the RTX 5090 test machine plus
+    the driver's bookkeeping for the registration) plus SM120_ENGRAM_PIN_HEADROOM_GB (default 6) fit into
+    MemAvailable now, before the ranks start."""
+    if _env("SM120_ENGRAM_MODE", "auto") != "pinned" or not _engram_layer_ids(ckpt_dir):
+        return None
+    layout, size = shared_layout(ckpt_dir)
+    per_rank = float(_env("SM120_ENGRAM_RANK_HOST_GB", "5")) * 2**30
+    headroom = float(_env("SM120_ENGRAM_PIN_HEADROOM_GB", "6")) * 2**30
+    avail = _mem_available()
+    if avail is not None and size + ranks * per_rank + headroom > avail:
+        raise EngramResidencyError(
+            f"SM120_ENGRAM_MODE=pinned: engram tables {size / 2**30:.1f} GiB + {ranks} ranks x {per_rank / 2**30:.0f} GiB "
+            f"(SM120_ENGRAM_RANK_HOST_GB) + headroom {headroom / 2**30:.0f} GiB (SM120_ENGRAM_PIN_HEADROOM_GB) > "
+            f"MemAvailable {avail / 2**30:.1f} GiB; pinned tables could OOM the host without swap. Free host memory or "
+            f"use SM120_ENGRAM_MODE=host / uring (docs/MULTI_GPU_RUNBOOK.md section 3)")
+    fd = os.memfd_create("sm120-engram-tables", 0)  # inheritable (pass_fds) and not tied to /dev/shm's size
+    os.ftruncate(fd, size)
+    os.environ["SM120_ENGRAM_SHM_FD"] = str(fd)
+    os.environ["SM120_ENGRAM_SHM_SIZE"] = str(size)
+    os.environ["SM120_ENGRAM_SHM_CKPT"] = os.path.abspath(ckpt_dir)  # the ranks compute the same layout from it
+    os.environ["SM120_ENGRAM_SHM_PID"] = str(os.getpid())
+    print(f"[sm120_engram] pinned mode: shared segment for {len(layout)} engram tables, {size / 2**30:.1f} GiB "
+          f"(memfd {fd}); MemAvailable {(avail or 0) / 2**30:.1f} GiB", flush=True)
+    return fd
+
+
+_SHM = {}  # this process' mapping of the shared segment: {"mm", "base", "size", "registered"}
+
+
+def _shared_mapping() -> dict:
+    if not _SHM:
+        fd, size = int(os.environ["SM120_ENGRAM_SHM_FD"]), int(os.environ["SM120_ENGRAM_SHM_SIZE"])
+        try:
+            ours = os.readlink(f"/proc/self/fd/{fd}").startswith("/memfd:sm120-engram-tables")
+        except OSError:
+            ours = False
+        if not ours:  # not inherited (e.g. a multiprocessing spawn child): reopen it through the creator's fd table
+            fd = os.open(f"/proc/{os.environ['SM120_ENGRAM_SHM_PID']}/fd/{fd}", os.O_RDWR)
+        mm = mmap.mmap(fd, size, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ | mmap.PROT_WRITE)
+        base = np.frombuffer(mm, dtype=np.uint8, count=1).ctypes.data
+        _SHM.update(mm=mm, base=base, size=size, registered=False)
+    return _SHM
+
+
+def open_shared_table(ckpt_dir: str | None, layer_id: int, wloc: TensorLoc, sloc: TensorLoc,
+                      device: torch.device | str | None) -> EngramHostTable:
+    """A rank's view of one table in the shared segment: CUDA views through the registration (kind "uva"), host views
+    for the fill. The registration of the whole segment happens once per process, on the first table."""
+    if "SM120_ENGRAM_SHM_FD" not in os.environ:
+        raise EngramResidencyError("SM120_ENGRAM_MODE=pinned needs the shared segment the server creates before the "
+                                   "ranks start (server/server.py, server/dp_proxy.py); SM120_ENGRAM_SHM_FD is not set")
+    sh = _shared_mapping()
+    hf_dir = os.environ.get("SM120_ENGRAM_SHM_CKPT") or ckpt_dir or os.path.dirname(wloc.path)
+    entry = next((e for e in shared_layout(hf_dir)[0] if e[0] == layer_id), None)
+    if entry is None:
+        raise EngramResidencyError(f"pinned mode: layer {layer_id} is not in the shared layout of {hf_dir}")
+    _, wl, sl, wo, so, rows = entry
+    row_bytes, groups = wloc.nbytes // wloc.shape[0], sloc.nbytes // sloc.shape[0]
+    device = torch.device(device or "cuda")
+    if device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    if not sh["registered"]:
+        t0 = time.time()
+        err = torch.cuda.cudart().cudaHostRegister(sh["base"], sh["size"], 0x01 | 0x02)  # Portable | Mapped
+        if int(getattr(err, "value", err)) != 0:
+            raise EngramResidencyError(f"pinned mode: cudaHostRegister of the {sh['size'] / 2**30:.1f} GiB shared "
+                                       f"segment failed: {err} (needs --ulimit memlock=-1)")
+        sh["registered"] = True
+        sh["device_base"] = _device_pointer(sh["base"])
+        print(f"[sm120_engram] pinned mode: registered the shared segment ({sh['size'] / 2**30:.1f} GiB) for "
+              f"{device} in {time.time() - t0:.1f} s", flush=True)
+
+    def views(off: int, width: int):
+        host = torch.frombuffer(sh["mm"], dtype=torch.uint8, count=rows * width, offset=off).view(rows, width)
+        st = torch._C._construct_storage_from_data_pointer(sh["device_base"] + off, device, rows * width)
+        dev = torch.empty(0, dtype=torch.uint8, device=device).set_(st, 0, (rows, width), (width, 1))
+        return host, dev
+
+    hw, dw = views(wo, row_bytes)
+    hs, ds = views(so, groups)
+    t = EngramHostTable(dw, ds, rows=rows, row_bytes=row_bytes, groups=groups, name=f"layers.{layer_id}.engram",
+                        source=(wloc, sloc))
+    t.kind = "uva"
+    t.host_weight, t.host_scale = hw, hs
+    _SHARED_TABLES.append(t)
+    return t
+
+
+_SHARED_TABLES: list = []
+
+
+def fill_shared_tables(threads: int = 8, chunk: int = 64 << 20) -> dict:
+    """Read every shared table from its shard into the segment (one process, after load): buffered preads in parallel,
+    straight into the shared pages; the shard pages are dropped from the page cache behind the reads."""
+    tables = {t.name: t for t in _SHARED_TABLES}.values()
+    jobs = []
+    for t in tables:
+        for loc, host in ((t.source[0], t.host_weight), (t.source[1], t.host_scale)):
+            nbytes = host.numel()
+            mv = memoryview(host.view(-1).numpy())
+            for a in range(0, nbytes, chunk):
+                jobs.append((os.path.realpath(loc.path), loc.offset + a, mv[a : min(a + chunk, nbytes)]))
+    fds: dict = {}
+
+    def run(job):
+        path, off, dst = job
+        fd = fds.get(path) or fds.setdefault(path, os.open(path, os.O_RDONLY))
+        done = 0
+        while done < len(dst):
+            n = os.preadv(fd, [dst[done:]], off + done)
+            if n <= 0:
+                raise EngramResidencyError(f"pinned mode: short read of {path} at {off + done}")
+            done += n
+        os.posix_fadvise(fd, off, len(dst), os.POSIX_FADV_DONTNEED)
+
+    t0 = time.time()
+    for path in {j[0] for j in jobs}:
+        fds[path] = os.open(path, os.O_RDONLY)
+    with ThreadPoolExecutor(max_workers=threads) as pool:
+        list(pool.map(run, jobs))
+    for fd in fds.values():
+        os.close(fd)
+    total = sum(len(j[2]) for j in jobs)
+    dt = time.time() - t0
+    print(f"[sm120_engram] pinned mode: read {total / 2**30:.1f} GiB of engram tables into the shared segment in "
+          f"{dt:.0f} s ({total / max(dt, 1e-9) / 1e9:.1f} GB/s); MemAvailable {(_mem_available() or 0) / 2**30:.1f} GiB",
+          flush=True)
+    return {"pinned_fill_s": round(dt, 1), "pinned_gib": round(total / 2**30, 1)}
 
 
 # ------------------------------------------------------------------------------------------------ fetcher

@@ -63,7 +63,7 @@ def compare_logits(tag, ref, x):
 
     if not torch.equal(ref["input_ids"], x["input_ids"]):
         print("  input_ids DIFFER -- comparison is meaningless")
-        return
+        return None
     L = ref["input_ids"].numel()
     pa, pb = ref.get("prefill_argmax"), x.get("prefill_argmax")
     if pa is not None and pb is not None and pa.numel() == pb.numel():
@@ -80,6 +80,7 @@ def compare_logits(tag, ref, x):
           + ("  (x was teacher-forced)" if x.get("meta", {}).get("teacher_forced") else ""))
     if prefix < n:
         print("  NOTE: decode steps after the first divergence see different prefixes unless teacher-forced")
+    result = dict(prefix=prefix, n=n, top1=None, kl=None)
     d4r, d4x = ref.get("decode_logits_first4"), x.get("decode_logits_first4")
     if d4r is not None and d4x is not None and d4r.numel() and d4x.numel():
         k = min(d4r.shape[0], d4x.shape[0])
@@ -94,6 +95,8 @@ def compare_logits(tag, ref, x):
         print(f"  {'decode all steps (top-50)':28s} n={k:4d}  KL_top50 mean={kl.mean().item():.4e} "
               f"max={kl.max().item():.4e}  cos_top50 mean={cos.mean().item():.6f}  top1={t1:.3f}")
         print("  per-step KL_top50: " + " ".join(f"{v:.3f}" for v in kl.tolist()))
+        result.update(top1=t1, kl=kl.mean().item())
+    return result
 
 
 def rel_l2(a, b):
@@ -140,13 +143,13 @@ def layer_roles(meta: dict | None) -> dict[int, str]:
     return out
 
 
-def compare_hidden(ref, ref2, di, factor: float, floor: float) -> int:
+def compare_hidden(ref, ref2, di, factor: float, floor: float, known=()) -> int:
     hr = (ref.get("hidden") or {}).get("prefill") or {}
     hd = (di.get("hidden") or {}).get("prefill") or {}
     h2 = ((ref2 or {}).get("hidden") or {}).get("prefill") or {}
     if not hr or not hd:
         print("\n== hidden: missing in ref or di")
-        return 0
+        return -1
     order = ["embed_hc"] + sorted([k for k in hr if k.startswith("layer")], key=lambda k: int(k[5:])) + ["final_norm"]
     # "L<i>/<name>" keys are the fine per-layer taps (CAPTURE_LAYER): compared by compare_l0.py, not here
     order = [k for k in order if k in hr] + [k for k in hr if k not in order and "/" not in k]
@@ -172,7 +175,9 @@ def compare_hidden(ref, ref2, di, factor: float, floor: float) -> int:
         thr = factor * max(noise, floor)
         ratio = r_di / max(noise, floor)
         flag = "SUSPICIOUS" if (r_di != r_di or r_di > thr) else "ok"
-        bad += flag != "ok"
+        if flag != "ok" and k in known:
+            flag = "known"  # documented deviation: reported, not counted in the exit status
+        bad += flag not in ("ok", "known")
         role = roles.get(int(k[5:]), "") if k.startswith("layer") and k[5:].isdigit() else ""
         print(f"  {k:12s} {str(tuple(hd[k].shape)):>20s} | {r_di:12.4e} {m_di:10.3e} | {r_d2:13.4e} {m_d2:10.3e} | "
               f"{r_nz:11.4e} {m_nz:10.3e} | {ratio:6.2f} {flag:11s} {role}")
@@ -186,22 +191,69 @@ def main() -> int:
     ap.add_argument("--ref2", default="/work/ref_out_torch.pt", help="second reference (pure torch) for the noise floor")
     ap.add_argument("--factor", type=float, default=3.0)
     ap.add_argument("--floor", type=float, default=1e-4, help="minimum noise floor (rel-L2) for exact layers")
+    ap.add_argument("--allow-missing-hidden", action="store_true",
+                    help="dumps made with --no-hidden: compare logits / tokens only")
+    ap.add_argument("--decode-check", choices=("none", "identical", "diverge"), default="none",
+                    help="expect the DI decode to be identical to the reference, or to diverge (negative controls). "
+                         "Teacher-forced runs decode the forced tokens, so there the check uses the decode logits: "
+                         "identical = top-1 agreement 1.0, diverge = mean KL_top50 above --diverge-kl")
+    ap.add_argument("--diverge-kl", type=float, default=0.5,
+                    help="teacher-forced --decode-check: mean decode KL_top50 that counts as diverged")
+    ap.add_argument("--known-deviation", default="",
+                    help="comma-separated hidden keys (e.g. layer0) whose flag is a documented deviation: "
+                         "printed as 'known', not counted in the exit status")
     args = ap.parse_args()
     ref, di = load(args.ref), load(args.di)
     ref2 = load(args.ref2) if args.ref2 and os.path.isfile(args.ref2) else None
     meta = di.get("meta", {})
     print(f"DI: gpu={meta.get('gpu')} teacher_forced={meta.get('teacher_forced')} "
           f"env={ {k: v for k, v in (meta.get('env') or {}).items() if k.startswith(('SM120_', 'B12X_'))} }")
+    # exit status: 0 ok, 1 suspicious hidden layers, 2 the comparison is invalid (different input_ids, capture
+    # errors, hidden states missing without --allow-missing-hidden), 3 the --decode-check expectation failed
+    invalid = []
     for e in meta.get("errors") or []:
-        print(f"DI capture WARNING: {e}")
-    compare_logits("DI vs ref", ref, di)
+        print(f"DI capture ERROR: {e}")
+        invalid.append(f"capture: {e}")
+    res = compare_logits("DI vs ref", ref, di)
+    if res is None:
+        invalid.append("input_ids differ")
     if ref2 is not None:
         compare_logits("DI vs ref2", ref2, di)
         compare_logits("ref2 vs ref (noise floor)", ref, ref2)
-    bad = compare_hidden(ref, ref2, di, args.factor, args.floor)
+    known = {k for k in args.known_deviation.split(",") if k}
+    bad = compare_hidden(ref, ref2, di, args.factor, args.floor, known)
+    if bad < 0:
+        bad = 0
+        if not args.allow_missing_hidden:
+            invalid.append("hidden states missing (use --allow-missing-hidden for --no-hidden dumps)")
     print(f"\nsuspicious hidden layers: {bad}")
     if any("/" in k for k in ((ref.get("hidden") or {}).get("prefill") or {})):
         print("fine per-layer taps present: run compare_l0.py for the intra-layer breakdown")
+    check_failed = False
+    if res is not None and args.decode_check != "none":
+        if meta.get("teacher_forced"):
+            # the decoded ids are the forced tokens: only the decode logits show a divergence
+            if res["kl"] is None:
+                invalid.append("teacher-forced --decode-check needs decode logits in both dumps")
+            else:
+                diverged = res["kl"] > args.diverge_kl
+                if args.decode_check == "identical":
+                    check_failed = diverged or res["top1"] < 1.0
+                else:
+                    check_failed = not diverged
+                print(f"decode check '{args.decode_check}' (teacher-forced): top1 {res['top1']:.3f}, "
+                      f"KL_top50 mean {res['kl']:.4e} (diverge > {args.diverge_kl:g}) -> "
+                      f"{'FAILED' if check_failed else 'ok'}")
+        else:
+            identical = res["prefix"] == res["n"] and res["n"] > 0
+            check_failed = identical != (args.decode_check == "identical")
+            print(f"decode check '{args.decode_check}': identical prefix {res['prefix']}/{res['n']} -> "
+                  f"{'FAILED' if check_failed else 'ok'}")
+    if invalid:
+        print("INVALID comparison: " + "; ".join(invalid))
+        return 2
+    if check_failed:
+        return 3
     return 1 if bad else 0
 
 

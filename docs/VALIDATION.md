@@ -168,6 +168,13 @@ first difference is `kv` after norm, RoPE and FP8 cast (2.2e-3), inside DeepInfe
 FP8 codes flip. The output projection amplifies this, and 10-12 % of tokens then pick different experts. The kernel
 matches its own torch reference on SM120. This is a rounding property of DeepInfer relative to the reference, not a
 port error; it is expected to appear on SM100 too (not verified). Later layers return to the noise floor.
+`compare.py --known-deviation layer0` prints the row as `known` and leaves it out of the exit status
+(`tests/e2e_matrix.sh` passes it by default; `TEST_KNOWN_DEVIATION=` turns it off).
+
+Exit status of `compare.py`: 0 ok, 1 suspicious layers, 2 invalid comparison (different input ids, capture errors,
+missing hidden states without `--allow-missing-hidden`), 3 a failed `--decode-check identical|diverge`. Teacher-forced
+dumps decode the forced tokens, so there the check uses the decode logits: identical = top-1 agreement 1.0 and mean
+top-50 KL at most `--diverge-kl` (0.5), diverge = above it.
 
 ## 6. Results (RTX 5090 test machine)
 

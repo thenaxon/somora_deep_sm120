@@ -9,21 +9,31 @@ Scenarios (all streaming /v1/chat/completions with stream_options.include_usage)
                  decoding (MTP / DSpark, EAGLE, ...) depends on the text, so random token ids are not a fair test of it.
                  Reports output tok/s, TPOT, TTFT, and the engine's draft acceptance where it exposes it.
   prefill        Many users with long distinct prompts (8k/16k/32k tokens) all at once (16/32/64 users):
-                 TTFT p50/p99/max, time until the last request is done, prompt + output tok/s.
+                 TTFT p50 and tail, time until the last request is done, prompt + output tok/s.
   shared-prefix  Tool-using assistant workload: N users share one long system prompt (tool definitions + instructions, ~6k tokens)
                  with short distinct user turns, and continue their conversations for several turns. Run once with a
                  shared and once with a per-user system prompt: the difference is what prefix caching buys.
                  Reports TTFT per turn, and cache statistics if the endpoint exposes them.
   mixed          Short chats stream continuously while long-prompt requests arrive. Baseline phase without the long
-                 requests, then with them: TTFT, TPOT p99 and the longest stall of the short streams (head-of-line
+                 requests, then with them: TTFT, TPOT tail and the longest stall of the short streams (head-of-line
                  blocking by prefills).
-  capacity       Ramp concurrency until TTFT p99 > --slo-ttft (s) or TPOT p99 > --slo-tpot (ms): the largest number of
+  capacity       Ramp concurrency until the TTFT tail > --slo-ttft (s) or the TPOT tail > --slo-tpot (ms): the largest number of
                  concurrent users that meets both, and the throughput there.
 
-Fairness: every scenario builds its prompts from --seed only (no endpoint input), so two endpoints get identical
-requests. Greedy (temperature 0) unless --temperature. The same max_tokens everywhere; ignore_eos only where stated
-(--ignore-eos). Synthetic long texts are sized by characters (--chars-per-token, default 3.6 for V4.1); the tables
-report the real prompt token counts from `usage`.
+Fairness and method (eval/measure.py, eval/sse.py):
+- Prompts come from --seed only, plus a per-run nonce at the very start of every prompt (--nonce; random per run,
+  recorded in the JSON), so two endpoints get the same requests and no prefix cache helps, also across runs.
+- Greedy (temperature 0) unless --temperature; the same max_tokens everywhere; ignore_eos by default (--allow-eos to
+  stop at the model's EOS), so every engine generates the same number of tokens. output_tokens_mean and the per-user
+  decode speed (tok_s_per_user = 1 / TPOT p50) are always reported.
+- Every level: an unmeasured warm-up with the same lengths (different nonce), then --repeats measured runs (default 3).
+  Throughput: median and range over the repeats, also in the steady-state window (all slots busy). Latencies over the
+  samples of all repeats: p50 and a tail that is a p99 only with >= 100 samples, else the maximum (`*_tail_kind`).
+- A request counts only if its stream completes ([DONE] or a finish_reason, no error event); failed ones are errors,
+  their tokens partial_out_tokens. A missing TPOT is None, never 0 ms (capacity counts it as an SLO miss).
+- mixed counts short requests only if they finish within the phase (--duration).
+Synthetic long texts are sized by characters (--chars-per-token, default 3.6 for V4.1); the tables report the real
+prompt token counts from `usage`.
 
 Engine statistics: before/after each level the script reads GET /health (this repo's server: engine steps, prefix cache
 hits) and GET /metrics (Prometheus, e.g. vLLM: prefix cache and speculative decoding counters) and reports the deltas
@@ -48,6 +58,10 @@ import urllib.parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROMPTS = os.path.join(HERE, "prompts.json")
+sys.path.insert(0, HERE)
+
+from measure import combine, ms, steady_tok_s, tail  # noqa: E402
+from sse import read_stream  # noqa: E402
 
 
 # ------------------------------------------------------------------------------------------------ helpers
@@ -135,7 +149,8 @@ class Endpoint:
         return out
 
     def chat(self, messages, max_tokens, temperature=0.0, ignore_eos=False, seed=None, extra=None) -> dict:
-        """One streaming chat request. -> timings, token counts, inter-chunk gaps, text."""
+        """One streaming chat request. -> timings, token counts, inter-chunk gaps, text. Raises StreamFailed (with the
+        partial output) unless the stream completes (eval/sse.py)."""
         body = dict(model=self.model, messages=messages, max_tokens=max_tokens, temperature=temperature, stream=True,
                     stream_options={"include_usage": True})
         if ignore_eos:
@@ -145,37 +160,38 @@ class Endpoint:
         body.update(extra or {})
         c = http.client.HTTPConnection(self.host, self.port, timeout=self.timeout)
         t0 = time.perf_counter()
-        c.request("POST", self.prefix + "/v1/chat/completions", json.dumps(body), {"Content-Type": "application/json"})
-        r = c.getresponse()
-        if r.status != 200:
-            raise RuntimeError(f"HTTP {r.status}: {r.read()[:200]!r}")
-        stamps, usage, parts = [], None, []
-        while True:
-            line = r.fp.readline()
-            if not line:
-                break
-            line = line.strip()
-            if not line.startswith(b"data: "):
-                continue
-            if line[6:] == b"[DONE]":
-                break
-            ev = json.loads(line[6:])
-            if ev.get("usage"):
-                usage = ev["usage"]
-            for ch in ev.get("choices") or []:
-                d = ch.get("delta") or {}
-                txt = (d.get("content") or "") + (d.get("reasoning_content") or "")
-                if txt:
-                    stamps.append(time.perf_counter())
-                    parts.append(d.get("content") or "")
-        c.close()
+        try:
+            c.request("POST", self.prefix + "/v1/chat/completions", json.dumps(body),
+                      {"Content-Type": "application/json"})
+            r = c.getresponse()
+            if r.status != 200:
+                raise StreamFailed(f"HTTP {r.status}: {r.read()[:200]!r}", 0)
+            st = read_stream(r)
+        except StreamFailed:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise StreamFailed(f"{type(exc).__name__}: {exc}"[:200], 0) from None
+        finally:
+            c.close()
+        if not st.ok:
+            raise StreamFailed(st.error, len(st.stamps))
         t_end = time.perf_counter()
-        n_out = (usage or {}).get("completion_tokens") or len(stamps)
-        n_in = (usage or {}).get("prompt_tokens")
+        stamps = st.stamps
+        n_out = (st.usage or {}).get("completion_tokens") or len(stamps)
+        n_in = (st.usage or {}).get("prompt_tokens")
         gaps = [b - a for a, b in zip(stamps, stamps[1:])]
-        return dict(t0=t0, ttft=(stamps[0] - t0) if stamps else None, e2e=t_end - t0, t_end=t_end, out=n_out, inp=n_in,
+        return dict(t0=t0, t_send=t0, t_first=stamps[0] if stamps else None, t_last=stamps[-1] if stamps else None,
+                    ttft=(stamps[0] - t0) if stamps else None, e2e=t_end - t0, t_end=t_end, out=n_out, inp=n_in,
                     tpot=((stamps[-1] - stamps[0]) / (n_out - 1)) if len(stamps) > 1 and n_out > 1 else None,
-                    max_gap=max(gaps) if gaps else None, text="".join(parts))
+                    max_gap=max(gaps) if gaps else None, text=st.text)
+
+
+class StreamFailed(Exception):
+    """A request whose stream did not complete; .partial = output chunks received before the failure."""
+
+    def __init__(self, msg, partial):
+        super().__init__(msg)
+        self.partial = partial
 
 
 def stats_delta(before: dict, after: dict) -> dict:
@@ -221,8 +237,8 @@ def stats_delta(before: dict, after: dict) -> dict:
 
 
 def run_pool(jobs, conc):
-    """Run callables with at most `conc` in flight (closed loop). -> (results, errors, wall seconds)."""
-    results, errors = [], []
+    """Run callables with at most `conc` in flight (closed loop). -> (results, errors, partial tokens, wall s)."""
+    results, errors, partial = [], [], [0]
     lock = threading.Lock()
     it = iter(jobs)
 
@@ -239,6 +255,7 @@ def run_pool(jobs, conc):
             except Exception as exc:  # noqa: BLE001
                 with lock:
                     errors.append(repr(exc)[:200])
+                    partial[0] += getattr(exc, "partial", 0)
 
     t0 = time.perf_counter()
     ths = [threading.Thread(target=worker, daemon=True) for _ in range(max(1, conc))]
@@ -246,21 +263,65 @@ def run_pool(jobs, conc):
         t.start()
     for t in ths:
         t.join()
-    return results, errors, time.perf_counter() - t0
+    return results, errors, partial[0], time.perf_counter() - t0
 
 
-def summarize(results, wall) -> dict:
-    out = sum(r["out"] or 0 for r in results)
-    inp = sum(r["inp"] or 0 for r in results)
-    return dict(ok=len(results), wall_s=wall, output_tok_s=out / wall if wall else None,
-                total_tok_s=(out + inp) / wall if wall else None, prompt_tokens_mean=mean([r["inp"] for r in results]),
-                output_tokens_mean=mean([r["out"] for r in results]),
-                ttft_p50=pct([r["ttft"] for r in results], 50), ttft_p99=pct([r["ttft"] for r in results], 99),
-                ttft_max=max([r["ttft"] for r in results if r["ttft"] is not None], default=None),
-                tpot_p50_ms=(pct([r["tpot"] for r in results], 50) or 0) * 1e3,
-                tpot_p99_ms=(pct([r["tpot"] for r in results], 99) or 0) * 1e3,
-                max_gap_p99_ms=(pct([r["max_gap"] for r in results], 99) or 0) * 1e3,
-                e2e_p50=pct([r["e2e"] for r in results], 50), e2e_p99=pct([r["e2e"] for r in results], 99))
+def latency(results, prefix="") -> dict:
+    """p50 and tail (p99 from >= 100 samples, else the max; measure.py) of TTFT, TPOT, E2E and the longest stall.
+    A missing TPOT stays None."""
+    out = {}
+    for key, vals, conv in (("ttft", [r["ttft"] for r in results], None), ("tpot", [r["tpot"] for r in results], ms),
+                            ("e2e", [r["e2e"] for r in results], None), ("max_gap", [r.get("max_gap") for r in results], ms)):
+        v, kind, n = tail(vals)
+        p50 = pct(vals, 50)
+        unit = "_ms" if conv else ""
+        out[f"{prefix}{key}_p50{unit}"] = conv(p50) if conv else p50
+        out[f"{prefix}{key}_tail{unit}"] = conv(v) if conv else v
+        out[f"{prefix}{key}_tail_kind"] = kind
+    out[f"{prefix}samples"] = len(results)
+    tp = pct([r["tpot"] for r in results], 50)
+    out[f"{prefix}tok_s_per_user"] = (1.0 / tp) if tp else None
+    return out
+
+
+def measure_level(ep, a, make_msgs, conc, max_tokens, ignore_eos, nwarm=None) -> dict:
+    """One level: an unmeasured warm-up (same lengths, different nonce), then --repeats runs, each with a fresh nonce
+    at the start of every prompt (no prefix cache helps, also across runs). Throughput per repeat (wall and steady
+    state), combined as median / range; latencies over the samples of all repeats; engine counters over all repeats.
+    make_msgs(nonce) -> list of message lists."""
+    warm = make_msgs(f"{a.nonce}-warm-{conc}")[: (nwarm if nwarm is not None else min(conc, a.warmup))]
+    if warm:
+        run_pool([lambda m=m: ep.chat(m, max_tokens, a.temperature, ignore_eos, seed=a.seed) for m in warm], len(warm))
+    reps, pooled, errs, partial = [], [], [], 0
+    s0 = ep.stats()
+    for rep in range(a.repeats):
+        msgs = make_msgs(f"{a.nonce}-{conc}-r{rep}")
+        res, err, part, wall = run_pool(
+            [lambda m=m: ep.chat(m, max_tokens, a.temperature, ignore_eos, seed=a.seed) for m in msgs], conc)
+        out = sum(r["out"] or 0 for r in res)
+        inp = sum(r["inp"] or 0 for r in res)
+        st, win = steady_tok_s(res, conc)
+        reps.append(dict(wall_s=wall, output_tok_s=out / wall if wall else None,
+                         total_tok_s=(out + inp) / wall if wall else None,
+                         prefill_tok_s=inp / wall if wall else None, steady_output_tok_s=st, steady_window_s=win,
+                         ok=len(res), errors=len(err)))
+        pooled += res
+        errs += err
+        partial += part
+    row = dict(requests=len(msgs), repeats=a.repeats, ok=len(pooled), errors=len(errs), error_samples=errs[:2],
+               partial_out_tokens=partial,
+               **combine(reps, ["output_tok_s", "steady_output_tok_s", "total_tok_s", "prefill_tok_s", "wall_s",
+                                "steady_window_s"]),
+               prompt_tokens_mean=mean([r["inp"] for r in pooled]), output_tokens_mean=mean([r["out"] for r in pooled]),
+               **latency(pooled), **stats_delta(s0, ep.stats()), per_repeat=reps)
+    return row
+
+
+def with_nonce(messages, nonce):
+    """Copy of the messages with a nonce at the very start of the first message (defeats prefix caches)."""
+    msgs = [dict(m) for m in messages]
+    msgs[0]["content"] = f"[{nonce}] " + (msgs[0].get("content") or "")
+    return msgs
 
 
 # ------------------------------------------------------------------------------------------------ prompt material
@@ -340,31 +401,28 @@ USER_TURNS = [
 # ------------------------------------------------------------------------------------------------ scenarios
 def sc_realistic(ep, a):
     rows = []
-    sets = a.sets.split(",")
-    for name in sets:
+    for name in a.sets.split(","):
         items = load_set(name)
         for conc in [int(x) for x in a.concurrency.split(",")]:
-            n = max(len(items), a.min_requests, 2 * conc)
-            msgs = [items[i % len(items)]["messages"] for i in range(n)]
-            jobs = [lambda m=m: ep.chat(m, a.max_tokens, a.temperature, a.ignore_eos, seed=a.seed) for m in msgs]
-            s0 = ep.stats()
-            res, err, wall = run_pool(jobs, conc)
-            row = dict(set=name, concurrency=conc, requests=n, errors=len(err), error_samples=err[:2],
-                       **summarize(res, wall), **stats_delta(s0, ep.stats()))
+            n = max(len(items), a.min_requests, 3 * conc)
+
+            def make(nonce, items=items, n=n):
+                return [with_nonce(items[i % len(items)]["messages"], f"{nonce}-{i}") for i in range(n)]
+
+            row = dict(set=name, concurrency=conc,
+                       **measure_level(ep, a, make, conc, a.max_tokens, not a.allow_eos))
             if row.get("engine_emit_steps"):
                 # generated tokens per DECODE step of a sequence (1 without speculative decoding, up to 1 + nextn
                 # with MTP): each request's first token comes from its prefill step, the rest from decode steps.
                 # emit_steps counts, per request, only the steps in which it got tokens, so idle / placeholder / DP
                 # lockstep steps and the batch size do not distort it (needs the emit_steps counter in /health).
-                toks, nreq = row.get("engine_tokens", 0), row.get("engine_requests") or len(res)
+                toks, nreq = row.get("engine_tokens", 0), row.get("engine_requests") or row["ok"]
                 if row["engine_emit_steps"] > nreq:
                     row["tokens_per_step"] = (toks - nreq) / (row["engine_emit_steps"] - nreq)
                     if row.get("nextn") and not row.get("mtp_varlen"):
                         row["draft_acceptance_est"] = (row["tokens_per_step"] - 1) / row["nextn"]
             rows.append(row)
-            show(row, ["set", "concurrency", "requests", "errors", "output_tok_s", "output_tokens_mean", "tpot_p50_ms",
-                       "tpot_p99_ms", "ttft_p50", "ttft_p99", "tokens_per_step", "draft_acceptance_est",
-                       "draft_acceptance", "drafts_verified_per_step", "spec_acceptance"])
+            show(row, MD_COLUMNS["realistic"])
     return rows
 
 
@@ -377,18 +435,17 @@ def sc_prefill(ep, a):
         for conc in [int(x) for x in a.concurrency.split(",")]:
             docs = [synthetic_document(a.seed * 100003 + plen * 101 + conc * 7 + i, plen, a.chars_per_token)
                     for i in range(conc * a.rounds)]
-            msgs = [[{"role": "user", "content": d + "\n\nSummarise the report above in three bullet points."}]
-                    for d in docs]
-            jobs = [lambda m=m: ep.chat(m, a.max_tokens, a.temperature, True, seed=a.seed) for m in msgs]
-            s0 = ep.stats()
-            res, err, wall = run_pool(jobs, conc)
-            prompt_tok = sum(r["inp"] or 0 for r in res)
-            row = dict(prompt_len=plen, concurrency=conc, requests=len(msgs), errors=len(err), error_samples=err[:2],
-                       time_to_last_s=wall, prefill_tok_s=prompt_tok / wall if wall else None,
-                       **summarize(res, wall), **stats_delta(s0, ep.stats()))
+
+            def make(nonce, docs=docs):
+                return [[{"role": "user", "content": f"[{nonce}-{i}] " + d +
+                          "\n\nSummarise the report above in three bullet points."}] for i, d in enumerate(docs)]
+
+            # warm-up: a few prompts of the same length (a full burst of long prompts would cost as much as a repeat)
+            row = dict(prompt_len=plen, concurrency=conc,
+                       **measure_level(ep, a, make, conc, a.max_tokens, True, nwarm=min(conc, a.warmup, 4)))
+            row["time_to_last_s"] = row.get("wall_s")
             rows.append(row)
-            show(row, ["prompt_len", "concurrency", "errors", "prompt_tokens_mean", "ttft_p50", "ttft_p99", "ttft_max",
-                       "time_to_last_s", "prefill_tok_s", "total_tok_s"])
+            show(row, MD_COLUMNS["prefill"])
     return rows
 
 
@@ -396,123 +453,125 @@ def sc_shared_prefix(ep, a):
     rows = []
     for variant in a.variants.split(","):
         per_turn: dict[int, list] = {}
-        all_res, errs = [], []
+        all_res, errs, walls = [], [], []
         lock = threading.Lock()
-        shared = tools_system_prompt(a.system_tokens, a.chars_per_token, a.seed + (0 if variant == "shared" else 1))
-
-        def user(u):
-            system = shared if variant == "shared" else tools_system_prompt(
-                a.system_tokens, a.chars_per_token, a.seed + 1, unique_tag=f"[session {variant}-{a.seed}-{u:03d}] ")
-            msgs = [{"role": "system", "content": system}]
-            for t in range(a.turns):
-                msgs.append({"role": "user", "content": f"(user {u}) " + USER_TURNS[(u + t) % len(USER_TURNS)]})
-                try:
-                    r = ep.chat(msgs, a.max_tokens, a.temperature, a.ignore_eos, seed=a.seed)
-                except Exception as exc:  # noqa: BLE001
-                    with lock:
-                        errs.append(repr(exc)[:200])
-                    return
-                r["turn"] = t
-                with lock:
-                    per_turn.setdefault(t, []).append(r)
-                    all_res.append(r)
-                msgs.append({"role": "assistant", "content": r["text"] or "OK."})
-
         s0 = ep.stats()
-        t0 = time.perf_counter()
-        ths = [threading.Thread(target=user, args=(u,), daemon=True) for u in range(a.users)]
-        for i, t in enumerate(ths):
-            t.start()
-            time.sleep(a.stagger)
-        for t in ths:
-            t.join()
-        wall = time.perf_counter() - t0
+        for rep in range(a.repeats):
+            nonce = f"{a.nonce}-{variant}-r{rep}"
+            shared = tools_system_prompt(a.system_tokens, a.chars_per_token,
+                                         a.seed + (0 if variant == "shared" else 1), unique_tag=f"[{nonce}] ")
+
+            def user(u, shared=shared, nonce=nonce):
+                system = shared if variant == "shared" else tools_system_prompt(
+                    a.system_tokens, a.chars_per_token, a.seed + 1, unique_tag=f"[{nonce}-{u:03d}] ")
+                msgs = [{"role": "system", "content": system}]
+                for t in range(a.turns):
+                    msgs.append({"role": "user", "content": f"(user {u}) " + USER_TURNS[(u + t) % len(USER_TURNS)]})
+                    try:
+                        r = ep.chat(msgs, a.max_tokens, a.temperature, not a.allow_eos, seed=a.seed)
+                    except Exception as exc:  # noqa: BLE001
+                        with lock:
+                            errs.append(repr(exc)[:200])
+                        return
+                    r["turn"] = t
+                    with lock:
+                        per_turn.setdefault(t, []).append(r)
+                        all_res.append(r)
+                    msgs.append({"role": "assistant", "content": r["text"] or "OK."})
+
+            t0 = time.perf_counter()
+            ths = [threading.Thread(target=user, args=(u,), daemon=True) for u in range(a.users)]
+            for t in ths:
+                t.start()
+                time.sleep(a.stagger)
+            for t in ths:
+                t.join()
+            walls.append(time.perf_counter() - t0)
         delta = stats_delta(s0, ep.stats())
         for t in sorted(per_turn):
             rs = per_turn[t]
-            row = dict(variant=variant, turn=t + 1, users=a.users, requests=len(rs), errors=len(errs) if t == 0 else 0,
-                       prompt_tokens_mean=mean([r["inp"] for r in rs]), ttft_p50=pct([r["ttft"] for r in rs], 50),
-                       ttft_p99=pct([r["ttft"] for r in rs], 99), tpot_p50_ms=(pct([r["tpot"] for r in rs], 50) or 0) * 1e3)
+            row = dict(variant=variant, turn=t + 1, users=a.users, repeats=a.repeats, requests=len(rs),
+                       errors=len(errs) if t == 0 else 0, prompt_tokens_mean=mean([r["inp"] for r in rs]), **latency(rs))
             rows.append(row)
-            show(row, ["variant", "turn", "requests", "errors", "prompt_tokens_mean", "ttft_p50", "ttft_p99",
-                       "tpot_p50_ms"])
-        tot = dict(variant=variant, turn="all", users=a.users, requests=len(all_res), errors=len(errs), wall_s=wall,
-                   ttft_p50=pct([r["ttft"] for r in all_res], 50), ttft_p99=pct([r["ttft"] for r in all_res], 99),
-                   prompt_tokens_total=sum(r["inp"] or 0 for r in all_res), **delta)
+            show(row, MD_COLUMNS["shared-prefix"])
+        tot = dict(variant=variant, turn="all", users=a.users, repeats=a.repeats, requests=len(all_res),
+                   errors=len(errs), wall_s=statistics.median(walls), wall_s_min=min(walls), wall_s_max=max(walls),
+                   prompt_tokens_total=sum(r["inp"] or 0 for r in all_res), **latency(all_res), **delta)
         rows.append(tot)
-        show(tot, ["variant", "turn", "requests", "errors", "wall_s", "ttft_p50", "ttft_p99",
-                   "prefix_cache_token_hit_rate", "prefix_cache_hits"])
+        show(tot, MD_COLUMNS["shared-prefix"])
     return rows
 
 
 def sc_mixed(ep, a):
+    """Shorts are counted only if they finish inside the phase (t0 .. t0 + duration), so both engines get the same
+    measuring window; long requests that are still running then are waited for but their shorts are not counted."""
     rows = []
     short_items = load_set("chat_en") + load_set("chat_de")
     for phase in ("short only", "short + long"):
-        stop = threading.Event()
-        shorts, longs, errs = [], [], []
-        lock = threading.Lock()
-        rng = random.Random(a.seed)
+        shorts, longs, errs, walls = [], [], [], []
+        s0 = ep.stats()
+        for rep in range(a.repeats):
+            stop = threading.Event()
+            lock = threading.Lock()
+            rng = random.Random(a.seed + rep)
+            nonce = f"{a.nonce}-{phase[:5]}-r{rep}"
+            t0 = time.perf_counter()
+            t_stop = t0 + a.duration
 
-        def short_user(u):
-            k = 0
-            while not stop.is_set():
-                m = short_items[(u * 7 + k) % len(short_items)]["messages"]
-                k += 1
-                try:
-                    r = ep.chat(m, a.short_tokens, a.temperature, True, seed=a.seed)
-                    if not stop.is_set():
+            def short_user(u, nonce=nonce, lock=lock, stop=stop, t_stop=t_stop):
+                k = 0
+                while not stop.is_set():
+                    m = with_nonce(short_items[(u * 7 + k) % len(short_items)]["messages"], f"{nonce}-{u}-{k}")
+                    k += 1
+                    try:
+                        r = ep.chat(m, a.short_tokens, a.temperature, True, seed=a.seed)
+                        if r["t_end"] <= t_stop:
+                            with lock:
+                                shorts.append(r)
+                    except Exception as exc:  # noqa: BLE001
                         with lock:
-                            shorts.append(r)
+                            errs.append(repr(exc)[:200])
+
+            def long_req(i, nonce=nonce, lock=lock):
+                doc = synthetic_document(a.seed * 31 + i + 1000 * (phase == "short + long"), a.long_tokens,
+                                         a.chars_per_token)
+                try:
+                    r = ep.chat([{"role": "user", "content": f"[{nonce}-L{i}] " + doc +
+                                  "\n\nWhat is this report about? One sentence."}],
+                                a.long_out, a.temperature, True, seed=a.seed)
+                    with lock:
+                        longs.append(r)
                 except Exception as exc:  # noqa: BLE001
                     with lock:
                         errs.append(repr(exc)[:200])
 
-        def long_req(i):
-            doc = synthetic_document(a.seed * 31 + i + 1000 * (phase == "short + long"), a.long_tokens, a.chars_per_token)
-            try:
-                r = ep.chat([{"role": "user", "content": doc + "\n\nWhat is this report about? One sentence."}],
-                            a.long_out, a.temperature, True, seed=a.seed)
-                with lock:
-                    longs.append(r)
-            except Exception as exc:  # noqa: BLE001
-                with lock:
-                    errs.append(repr(exc)[:200])
-
-        s0 = ep.stats()
-        ths = [threading.Thread(target=short_user, args=(u,), daemon=True) for u in range(a.short_users)]
-        for t in ths:
-            t.start()
-        t0 = time.perf_counter()
-        lths = []
-        if phase == "short + long":
-            i = 0
-            while time.perf_counter() - t0 < a.duration:
-                th = threading.Thread(target=long_req, args=(i,), daemon=True)
-                th.start()
-                lths.append(th)
-                i += 1
-                time.sleep(a.long_interval * (0.5 + rng.random()))
-        else:
-            time.sleep(a.duration)
-        for th in lths:
-            th.join()
-        stop.set()
-        for t in ths:
-            t.join()
-        row = dict(phase=phase, short_users=a.short_users, short_requests=len(shorts), long_requests=len(longs),
-                   errors=len(errs), error_samples=errs[:2],
-                   short_ttft_p50=pct([r["ttft"] for r in shorts], 50), short_ttft_p99=pct([r["ttft"] for r in shorts], 99),
-                   short_tpot_p50_ms=(pct([r["tpot"] for r in shorts], 50) or 0) * 1e3,
-                   short_tpot_p99_ms=(pct([r["tpot"] for r in shorts], 99) or 0) * 1e3,
-                   short_max_gap_p99_ms=(pct([r["max_gap"] for r in shorts], 99) or 0) * 1e3,
-                   short_max_gap_max_ms=(max([r["max_gap"] for r in shorts if r["max_gap"]], default=0)) * 1e3,
-                   long_prompt_tokens=mean([r["inp"] for r in longs]), long_ttft_p50=pct([r["ttft"] for r in longs], 50),
-                   long_ttft_p99=pct([r["ttft"] for r in longs], 99), **stats_delta(s0, ep.stats()))
+            ths = [threading.Thread(target=short_user, args=(u,), daemon=True) for u in range(a.short_users)]
+            for t in ths:
+                t.start()
+            lths = []
+            if phase == "short + long":
+                i = 0
+                while time.perf_counter() < t_stop:
+                    th = threading.Thread(target=long_req, args=(i,), daemon=True)
+                    th.start()
+                    lths.append(th)
+                    i += 1
+                    time.sleep(a.long_interval * (0.5 + rng.random()))
+            else:
+                time.sleep(max(0.0, t_stop - time.perf_counter()))
+            stop.set()
+            for th in lths:
+                th.join()
+            for t in ths:
+                t.join()
+            walls.append(a.duration)
+        row = dict(phase=phase, short_users=a.short_users, repeats=a.repeats, phase_wall_s=a.duration,
+                   short_requests=len(shorts), long_requests=len(longs), errors=len(errs), error_samples=errs[:2],
+                   **latency(shorts, "short_"), long_prompt_tokens=mean([r["inp"] for r in longs]),
+                   **{k: v for k, v in latency(longs, "long_").items() if k.startswith("long_ttft")},
+                   **stats_delta(s0, ep.stats()))
         rows.append(row)
-        show(row, ["phase", "short_requests", "long_requests", "errors", "short_ttft_p50", "short_ttft_p99",
-                   "short_tpot_p50_ms", "short_tpot_p99_ms", "short_max_gap_p99_ms", "short_max_gap_max_ms",
-                   "long_ttft_p50"])
+        show(row, MD_COLUMNS["mixed"])
     return rows
 
 
@@ -523,46 +582,54 @@ def sc_capacity(ep, a):
     for conc in [int(x) for x in a.concurrency.split(",")]:
         n = max(a.min_requests, a.requests_per_user * conc)
         if a.prompt_tokens:
-            msgs = [[{"role": "user", "content": synthetic_document(a.seed * 977 + conc * 1000 + i, a.prompt_tokens,
-                                                                    a.chars_per_token) + "\n\nSummarise this."}]
+            docs = [synthetic_document(a.seed * 977 + conc * 1000 + i, a.prompt_tokens, a.chars_per_token)
                     for i in range(n)]
+
+            def make(nonce, docs=docs):
+                return [[{"role": "user", "content": f"[{nonce}-{i}] " + d + "\n\nSummarise this."}]
+                        for i, d in enumerate(docs)]
         else:
-            msgs = [items[(i * 5 + conc) % len(items)]["messages"] for i in range(n)]
-        jobs = [lambda m=m: ep.chat(m, a.max_tokens, a.temperature, True, seed=a.seed) for m in msgs]
-        res, err, wall = run_pool(jobs, conc)
-        s = summarize(res, wall)
-        miss = [x for x, bad in (("errors", bool(err)), ("ttft", s["ttft_p99"] is None or s["ttft_p99"] > a.slo_ttft),
-                                 ("tpot", s["tpot_p99_ms"] > a.slo_tpot)) if bad]
+            def make(nonce, n=n, conc=conc):
+                return [with_nonce(items[(i * 5 + conc) % len(items)]["messages"], f"{nonce}-{i}") for i in range(n)]
+        s = measure_level(ep, a, make, conc, a.max_tokens, True)
+        # SLO on the tails over all repeats (p99 from >= 100 samples, else the max: stricter, labelled). A level
+        # without any TPOT value (no request with two output chunks) is a miss, not 0 ms.
+        miss = [x for x, bad in (("errors", s["errors"] > 0),
+                                 ("ttft", s["ttft_tail"] is None or s["ttft_tail"] > a.slo_ttft),
+                                 ("tpot", s["tpot_tail_ms"] is None or s["tpot_tail_ms"] > a.slo_tpot)) if bad]
         ok = not miss
-        row = dict(concurrency=conc, requests=n, errors=len(err), meets_slo=ok, missed="+".join(miss) or "-", **s)
+        row = dict(concurrency=conc, meets_slo=ok, missed="+".join(miss) or "-", **s)
         rows.append(row)
-        show(row, ["concurrency", "requests", "errors", "meets_slo", "missed", "output_tok_s", "ttft_p50", "ttft_p99",
-                   "tpot_p50_ms", "tpot_p99_ms"])
+        show(row, MD_COLUMNS["capacity"])
         if ok:
             best = row
         elif not a.full:
             break
     summary = dict(concurrency="max within SLO", slo_ttft_s=a.slo_ttft, slo_tpot_ms=a.slo_tpot,
                    max_users=best["concurrency"] if best else 0, output_tok_s=best["output_tok_s"] if best else None,
-                   ttft_p99=best["ttft_p99"] if best else None, tpot_p99_ms=best["tpot_p99_ms"] if best else None)
-    print(f"max concurrency within SLO (TTFT p99 <= {a.slo_ttft} s, TPOT p99 <= {a.slo_tpot} ms): "
+                   ttft_tail=best["ttft_tail"] if best else None, ttft_tail_kind=best["ttft_tail_kind"] if best else None,
+                   tpot_tail_ms=best["tpot_tail_ms"] if best else None)
+    print(f"max concurrency within SLO (TTFT tail <= {a.slo_ttft} s, TPOT tail <= {a.slo_tpot} ms): "
           f"{summary['max_users']} users, {fmt(summary['output_tok_s'], 1)} output tok/s")
     rows.append(summary)
     return rows
 
 
 MD_COLUMNS = {
-    "realistic": ["set", "concurrency", "requests", "errors", "output_tok_s", "output_tokens_mean", "tpot_p50_ms",
-                  "tpot_p99_ms", "ttft_p50", "ttft_p99", "tokens_per_step", "draft_acceptance_est", "draft_acceptance",
-                  "drafts_verified_per_step", "spec_acceptance"],
-    "prefill": ["prompt_len", "concurrency", "errors", "prompt_tokens_mean", "ttft_p50", "ttft_p99", "ttft_max",
-                "time_to_last_s", "prefill_tok_s", "total_tok_s"],
-    "shared-prefix": ["variant", "turn", "requests", "errors", "prompt_tokens_mean", "ttft_p50", "ttft_p99", "tpot_p50_ms",
-                      "wall_s", "prefix_cache_token_hit_rate", "prefix_cache_hits"],
-    "mixed": ["phase", "short_requests", "long_requests", "errors", "short_ttft_p50", "short_ttft_p99", "short_tpot_p50_ms",
-              "short_tpot_p99_ms", "short_max_gap_p99_ms", "short_max_gap_max_ms", "long_prompt_tokens", "long_ttft_p50"],
-    "capacity": ["concurrency", "requests", "errors", "meets_slo", "missed", "output_tok_s", "ttft_p50", "ttft_p99", "tpot_p50_ms",
-                 "tpot_p99_ms", "max_users"],
+    "realistic": ["set", "concurrency", "ok", "errors", "output_tok_s", "output_tok_s_min", "output_tok_s_max",
+                  "steady_output_tok_s", "output_tokens_mean", "tok_s_per_user", "tpot_p50_ms", "tpot_tail_ms",
+                  "tpot_tail_kind", "ttft_p50", "ttft_tail", "ttft_tail_kind", "tokens_per_step",
+                  "draft_acceptance_est", "draft_acceptance", "drafts_verified_per_step", "spec_acceptance"],
+    "prefill": ["prompt_len", "concurrency", "ok", "errors", "prompt_tokens_mean", "ttft_p50", "ttft_tail",
+                "ttft_tail_kind", "time_to_last_s", "wall_s_min", "wall_s_max", "prefill_tok_s", "total_tok_s"],
+    "shared-prefix": ["variant", "turn", "requests", "errors", "prompt_tokens_mean", "ttft_p50", "ttft_tail",
+                      "ttft_tail_kind", "tpot_p50_ms", "wall_s", "prefix_cache_token_hit_rate", "prefix_cache_hits"],
+    "mixed": ["phase", "phase_wall_s", "short_requests", "long_requests", "errors", "short_ttft_p50", "short_ttft_tail",
+              "short_tpot_p50_ms", "short_tpot_tail_ms", "short_max_gap_p50_ms", "short_max_gap_tail_ms",
+              "short_max_gap_tail_kind", "long_prompt_tokens", "long_ttft_p50"],
+    "capacity": ["concurrency", "ok", "errors", "meets_slo", "missed", "output_tok_s", "output_tok_s_min",
+                 "output_tok_s_max", "steady_output_tok_s", "tok_s_per_user", "ttft_p50", "ttft_tail", "ttft_tail_kind",
+                 "tpot_p50_ms", "tpot_tail_ms", "tpot_tail_kind", "max_users"],
 }
 
 SCENARIOS = {"realistic": sc_realistic, "prefill": sc_prefill, "shared-prefix": sc_shared_prefix, "mixed": sc_mixed,
@@ -595,7 +662,12 @@ def main() -> int:
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--timeout", type=float, default=3600)
     ap.add_argument("--chars-per-token", type=float, default=3.6, help="sizing of the synthetic texts")
-    ap.add_argument("--ignore-eos", action="store_true", help="realistic / shared-prefix: generate exactly max_tokens")
+    ap.add_argument("--allow-eos", action="store_true",
+                    help="realistic / shared-prefix: stop at the model's EOS (default: ignore_eos, so every engine "
+                         "generates exactly max_tokens and A/B throughput compares equal work)")
+    ap.add_argument("--repeats", type=int, default=3, help="measured runs per level (median and range)")
+    ap.add_argument("--warmup", type=int, default=8, help="unmeasured warm-up requests per level (same lengths)")
+    ap.add_argument("--nonce", default=None, help="prompt nonce (default: random per run; recorded in the JSON)")
     g = ap.add_argument_group("realistic")
     g.add_argument("--sets", default="code,chat_de,chat_en")
     g.add_argument("--min-requests", type=int, default=16)
@@ -623,12 +695,14 @@ def main() -> int:
     g.add_argument("--long-interval", type=float, default=4.0, help="mean seconds between long requests")
     g.add_argument("--duration", type=float, default=30.0, help="seconds per phase")
     a = ap.parse_args()
+    a.nonce = a.nonce or os.urandom(6).hex()
     a.concurrency = a.concurrency or {"realistic": "1,4,16", "prefill": "16,32,64",
                                       "capacity": "1,2,4,8,16,32,64,128"}.get(a.scenario, "1")
     a.max_tokens = a.max_tokens or {"prefill": 64, "shared-prefix": 64}.get(a.scenario, 256)
     ep = Endpoint(a.url, a.model, a.timeout)
-    print(f"{a.scenario}: endpoint {a.url} model {ep.model} max_model_len {ep.max_model_len}")
-    ep.chat([{"role": "user", "content": "Hello"}], 4)  # warm-up
+    print(f"{a.scenario}: endpoint {a.url} model {ep.model} max_model_len {ep.max_model_len} nonce {a.nonce} "
+          f"repeats {a.repeats}")
+    ep.chat([{"role": "user", "content": f"[{a.nonce}] Hello"}], 4)  # connection / first-request warm-up
     t0 = time.time()
     rows = SCENARIOS[a.scenario](ep, a)
     md = f"### {a.scenario} — {ep.model} @ {a.url} {a.label}\n\n" + markdown(rows, MD_COLUMNS.get(a.scenario)) + "\n"

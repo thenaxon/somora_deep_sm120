@@ -3,6 +3,17 @@
 All notable changes to this project are documented here. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0 any minor release may change interfaces.
 
+## [0.2.3] - unreleased
+
+### Added
+- Adaptive speculative decoding: `server.py --mtp-varlen` (with `--graphs --nextn K`) enables DeepInfer's
+  cost-model draft trimming (`DEEPINFER_ENABLE_MTP_VARLEN`). The decode graphs are profiled at start-up (cached in
+  `/cache/decode_perf`); each step verifies only as many drafts per sequence (≤ K) as the profiled step cost and the
+  DSpark confidence head justify. Measured on the RTX 5090 test model: K=5/7 is +35-45 % output tok/s over K=3 at one
+  user; the trimming itself is neutral at ≤ 8 users (docs/MTP_YOCO.md §9).
+- `/health` reports verified / accepted draft tokens (`stats.mtp_verified`, `stats.mtp_accepted`, runtime patch P12);
+  `eval/scenarios.py realistic` reports `draft_acceptance` (accepted / verified) and `drafts_verified_per_step`.
+
 ## [0.2.2] - unreleased
 
 ### Fixed

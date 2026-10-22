@@ -107,7 +107,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         xs = [v.get(k) for v in vals if isinstance(v.get(k), (int, float))]
                         if xs:
                             # all ranks step in lockstep: steps / flushes are a per-rank count, not a sum
-                            out[k] = max(xs) if k.startswith("max") or k in ("steps", "flushes") else sum(xs)
+                            out[k] = max(xs) if k.startswith("max") or k in ("steps", "flushes", "mtp_decode_steps") else sum(xs)
                     return out
 
                 body = json.dumps({"status": "ok" if ok else "degraded", "inflight": self.backends.inflight,

@@ -226,7 +226,54 @@ bash /opt/sm120/tests/mtp_check.sh       # nextn 0 / 5, eager / graphs, and next
 - Both MTP backbones differ from `ckpt3` / `ckpt_yoco` in expert count, so a backbone logit comparison needs its own
   reference run (which ignores the MTP layers).
 
-## 9. Caveats
+## 9. Draft length and adaptive MTP (`--nextn K`, `--mtp-varlen`)
+
+**Fixed K** (`--nextn K`, the default mode):
+- Every decode step verifies all K drafts of every sequence: 1 + K rows per sequence.
+- The DSpark draft step proposes K tokens per sequence in one forward of the 3 DFlash layers.
+
+**Adaptive** (`--mtp-varlen`, needs `--graphs` and `--nextn K > 0`): DeepInfer's own scheduler
+(`DEEPINFER_ENABLE_MTP_VARLEN`, `csrc/engine/mtp_varlen.hpp`), the same idea as vLLM's DSpark adaptive verification.
+- **Cost curve at start-up:** after graph capture, the worker replays every decode graph to get (graph size → ms)
+  (`model_runner.profile_decode_perf`). The curve is cached in `$DEEPINFER_DECODE_PERF_CACHE_DIR` (the server sets
+  `/cache/decode_perf`) for `DEEPINFER_DECODE_PERF_CACHE_TTL_SEC` (1 h). At runtime it is corrected by a fitted per-row
+  slope and the median sampler time.
+- **Per step:** the scheduler sorts all sequences' draft positions by the DFlash confidence head's cumulative accept
+  estimate.
+  - It picks the total verify size that maximizes expected tokens per ms.
+  - It gives the extra rows to the most confident positions, so each sequence verifies its own K' ≤ K.
+  - Under ZOS the per-sequence split is redone on the GPU (`compute_seqlens_q_by_confidence_rates`).
+- **No shim changes needed:** the graphs are sized in tokens, and the DP graph-size sync (`sm120_ep.dp_sync`) takes the
+  varying `num_batched_tokens`.
+- **Counters:** P12 (`sm120_patches`) counts verified / accepted draft tokens. `/health` reports them as
+  `stats.mtp_verified` / `mtp_accepted` / `mtp_seq_steps`, and `eval/scenarios.py` derives `draft_acceptance`
+  (= accepted / verified) and `drafts_verified_per_step` from them. `draft_acceptance_est` = (tokens_per_step − 1) / K
+  is only valid for fixed K.
+
+**Measured** (RTX 5090, `ckpt_full`, graphs, `--max-num-seqs 8`, `eval/scenarios.py realistic`, 256 tokens, greedy).
+Output tok/s / TPOT p50 ms, mean of the sets code, chat_en, chat_de (16-24 requests each). Per-set numbers are in
+`/work/mtpv_<tag>.md` on the test machine.
+
+| config | c=1 tok/s | c=1 TPOT | c=8 tok/s | c=8 TPOT | tokens/step | acceptance | drafts verified/step |
+|---|---|---|---|---|---|---|---|
+| `--nextn 0` | 57 | 15.9 | 345 | 21.4 | 1.00 | - | - |
+| `--nextn 3` | 129 | 6.2 | 587 | 9.9 | 3.75 | 0.91 | 3.00 |
+| `--nextn 5` | 174 | 4.2 | 597 | 9.0 | 5.2 | 0.84 | 5.00 |
+| `--nextn 5 --mtp-varlen` | 171 | 4.2 | 663 | 9.4 | 5.15 | 0.89 | 4.5-4.7 |
+| `--nextn 7` | 188 | 3.6 | 658 | 9.7 | 6.4 | 0.76 | 7.00 |
+| `--nextn 7 --mtp-varlen` | 190 | 3.6 | 572 | 9.3 | 5.9 | 0.78 | 6.0-6.5 |
+
+Reading:
+- **K matters most.** Going from K=3 to K=5/7 gives +35-45 % at c=1 (TPOT 6.2 → 3.6 ms). On this GPU the decode step
+  costs almost the same for 8 and 64 rows (curve: 21.9 ms at 8 rows, 34.8 ms at 64), so verifying more drafts is cheap.
+- **Adaptive trimming is within the run-to-run noise at ≤ 8 sequences.** It trims about 0.3-1 drafts per step. The c=8
+  differences of ±10 % come with TPOT p99 outliers (single long stalls) in single runs; vLLM's documentation also
+  expects the gain at high concurrency.
+- **Caveat:** `ckpt_full` has 16 routed experts per layer, and its acceptance is higher than the real model's (4-GPU host,
+  real model, K=3: 74-77 %). With lower acceptance, deep drafts pay less and trimming matters more. Measure K=5/7 with
+  and without `--mtp-varlen` on the real model before choosing a default.
+
+## 10. Caveats
 
 - DeepInfer scores candidate blocks in bf16 (`candidate_block_max` on bf16 logits) while the reference uses fp32 scores.
   Near-tied blocks can flip, and top-k ties at the 512 boundary too. Judge `compress_idx` and `cand_mask` by mean

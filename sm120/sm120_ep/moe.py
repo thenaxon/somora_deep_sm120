@@ -15,7 +15,7 @@ DeepInfer's own: the HF loader keeps physical slots [ep_rank*n_local, (ep_rank+1
 
 Row counts per rank must match inside a collective:
   * decode (CUDA graphs): with the DP-wide graph-size sync (dp_sync.py, default) every rank replays the same
-    graph size, so the rows are simply the step's token count; without it (SM120_EP_DP_SYNC=0 or eager
+    graph size, so the rows are simply the step's token count, also inside the start-up capture; without it (SM120_EP_DP_SYNC=0 or eager
     decode) a fixed capacity C = SM120_EP_DECODE_ROWS (default: the layer's max_num_decoding_tokens) rows per
     rank, padding rows masked (ids -1, weight 0); no host sync, graph-capturable with NCCL;
   * prefill (eager; DeepInfer's scheduler makes the step type uniform across DP ranks by vote, see
@@ -187,8 +187,11 @@ class EPRoutedExperts:
         T = int(x.shape[0])
         fixed = (not is_prompt) if is_prompt is not None else _capturing()
         if fixed:
-            if dp_sync.active() and dp_sync._STATE["synced"] is not None:
-                rows = T  # every DP rank replays the same (DP-max) graph size, see dp_sync.py
+            if dp_sync.active() and (dp_sync._STATE["synced"] is not None or _capturing()):
+                # every DP rank replays the same (DP-max) graph size, see dp_sync.py; at start-up capture (no step
+                # synced yet) every rank captures the same batch-size list in the same order, so the captured graph
+                # of size T must use T rows too (the fixed capacity here was baked into every replayed graph)
+                rows = T
             else:
                 rows = self.decode_rows
                 if T > rows:

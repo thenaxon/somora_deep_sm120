@@ -14,6 +14,11 @@ before 1.0 any minor release may change interfaces.
   `config.nextn`), and the scenario reports tokens per decode step of a sequence at any concurrency, with
   `draft_acceptance_est` = (tokens_per_step - 1) / nextn. The `--dp` proxy reports `steps` / `flushes` per rank
   instead of summing them.
+- `--dp` decode graphs: the EP MoE layers were captured at start-up, before any step had been DP-synced, with the
+  fixed capacity (`max_num_decoding_tokens` rows per rank, 128 at 16 seqs x nextn 7), and every replayed graph
+  padded its all-gather / reduce-scatter and expert call to it. With the DP sync on, each graph is now captured with
+  its own size as rows (all ranks capture the same sizes in the same order). A `--mtp-varlen` decode cost curve
+  profiled with an older version (`/cache/decode_perf`) measured the padded graphs; delete it once.
 
 ### Added
 - `SM120_ENGRAM_MODE=pinned`: the engram tables are kept once in shared, pinned host memory for all ranks, the way the

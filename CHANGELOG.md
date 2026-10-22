@@ -11,6 +11,24 @@ before 1.0 any minor release may change interfaces.
   `--dp` (docs/SERVER.md).
 
 ### Fixed
+- `--deterministic` (or `SM120_MOE_IMPL=torch`) with `--dp` / `--ep` > 1 computed wrong MoE outputs in 0.3.0: the
+  torch MoE reference applied each rank's local expert weights to the global expert ids and skipped the expert-
+  parallel collectives. 0.3.0's docs and its start-up message recommended exactly this combination. The server now
+  refuses it at start-up (the torch reference stays single-GPU); with `--dp` use `SM120_MOE_DETERMINISTIC=1`.
+- Fail closed instead of computing wrong results:
+  - `sm120_moe` raises for the torch MoE reference with expert parallelism instead of applying rank-local weights
+    to global expert ids;
+  - a b12x MoE failure no longer falls back to the torch reference when the expert weights were already partly
+    repacked in place, or with expert parallelism (a rank on another path would leave the others in their
+    collectives); a missing `sm120_ep` with expert parallelism raises;
+  - inside CUDA graph capture, a first-time b12x GEMM pack / plan, decode attention or indexer failure is raised
+    (the server then exits) instead of recording the fp32 torch path into the graph; the GEMM weight is no longer
+    marked unsupported for good by a capture-time error.
+- `--dp`: the decode graph-size sync uses DeepInfer's own condition (CUDA graphs on and captured). Without captured
+  graphs DeepInfer decodes eagerly and unpadded; the EP layer then uses its fixed capacity instead of a synced size.
+- b12x indexer: the active-width scalar is one buffer per device; a constant tensor was cached per context length
+  and prefill length and grew without bound on a long-running server.
+
 - b12x's deterministic MoE: `SM120_MOE_DETERMINISTIC=1` (also on with `DEEPINFER_BATCH_INVARIANT=1` or `B12X_DYNAMIC_DETERMINISTIC_OUTPUT=1`) gave
   wrong MoE outputs in two cases, both b12x 1.5.1 `deterministic_output` bugs:
   - plans with `dynamic_tile_m` < 64 (b12x's own choice, e.g. E=16 at 5-64 tokens, E=96 at 65-512): cos ~0 against
@@ -18,10 +36,13 @@ before 1.0 any minor release may change interfaces.
   - masked routes (id -1) summed stale scratch rows. With `--dp` every rank masks the routes to the other ranks'
     experts, so real tokens were wrong (single GPU: only discarded padding rows). They now go to a local expert with
     weight 0.
-  The default b12x MoE and `--deterministic` (torch MoE) were not affected. New tests in `tests/test_gemm_moe_graphs.py`
+  The default b12x MoE and `--deterministic` (torch MoE, one GPU) were not affected. New tests in `tests/test_gemm_moe_graphs.py`
   and `tests/sweep_moe_deterministic.py`. Upstream: [flashinfer-ai/flashinfer#7021](https://github.com/flashinfer-ai/flashinfer/issues/7021).
 
 ### Changed
+- MoE epilogue: the shared-expert output is added in place in bf16 (bit-identical to the fp32 round trip, fewer
+  kernels and temporaries in prefill). FlashMLA decode shim: no `repeat_interleave` copy of the top-k lengths at
+  one query token per sequence.
 - The server no longer refuses b12x's deterministic MoE (0.3.0 did). It logs one start-up line (bit-exact, slower
   decode, with `--dp N` the masked routes computed at weight 0) and a warning if the installed b12x is not 1.5.1,
   the version the workarounds were validated on. `SM120_ALLOW_B12X_DETERMINISTIC`, the 0.3.0 override, is still

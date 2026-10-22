@@ -142,8 +142,9 @@ opt-in for hosts where NCCL cannot use P2P at all.
    (NCCL vs b12x all-gather / reduce-scatter at 10 KB - 4 MB).
 2. **`tests/test_ep_moe.py` at W=4 with NCCL**, one GPU per rank.
 3. **DeepInfer `data_parallel_size = expert_parallel_size = 4`:** compare 4 requests per rank against the single-GPU run
-   of the same 16 requests (where the model fits). `SM120_MOE_IMPL=torch` gives a deterministic comparison; its
-   reference MoE must then accept -1 ids or have non-local weights zeroed.
+   of the same 16 requests (where the model fits). For a deterministic comparison use `SM120_MOE_DETERMINISTIC=1`
+   (b12x, expert-parallel); the torch MoE reference (`SM120_MOE_IMPL=torch`, `--deterministic`) is single-GPU only
+   and is refused with `--dp` / `--ep` > 1.
 4. **CUDA graphs on 4 ranks:** DP sync on/off, MTP verify batches (rows = B*(1+nextn)).
 5. **Transport:** `tests/test_ep_b12x_transport.py` (4 ranks), then end-to-end prefill TTFT and TPOT at B = 1/8/32 with
    NCCL (with and without `NCCL_P2P_LEVEL=SYS`) vs `SM120_EP_TRANSPORT=b12x`.

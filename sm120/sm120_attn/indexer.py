@@ -49,11 +49,10 @@ def _b12x(name: str, fn, *args):
     try:
         res = getattr(b12x_indexer, fn)(*args)
     except Exception as exc:  # noqa: BLE001
-        if cfg.strict():
+        if cfg.strict() or cfg.capturing():  # a graph must not record the (slower, fp32) torch path
             raise
         cfg.log_once(("b12x_idx_fail", name, type(exc).__name__, str(exc)[:200]),
-                     f"b12x {name} failed ({type(exc).__name__}: {exc}); falling back to torch"
-                     + (" (inside CUDA graph capture)" if cfg.capturing() else ""), logging.WARNING)
+                     f"b12x {name} failed ({type(exc).__name__}: {exc}); falling back to torch", logging.WARNING)
         return None
     if isinstance(res, torch.Tensor):
         cfg.log_once(("b12x_idx_ok", name), f"{name}: b12x dsa_indexer MXFP4 score")

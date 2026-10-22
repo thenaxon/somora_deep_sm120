@@ -147,6 +147,13 @@ def _sf_bytes(sf: torch.Tensor, k: int) -> torch.Tensor:
     return b[..., : k // 32].clone(memory_format=torch.contiguous_format)
 
 
+def _mark_prepare_started(*params) -> None:
+    """b12x prepare_weights repacks DeepInfer's expert bytes in place; mark the parameters first, so that setup()
+    refuses the torch fallback when it raises half-way."""
+    for p in params:
+        p.sm120_b12x_prepare_started = True
+
+
 class B12xRoutedExperts:
     """b12x fused_moe over all local experts of one DeepInfer MoE layer."""
 
@@ -191,6 +198,7 @@ class B12xRoutedExperts:
                                              swiglu_limit=self.swiglu_limit),
                 geometry=fm.MoEGeometry(num_experts=E, hidden_size=K, intermediate_size=n),
             )
+            _mark_prepare_started(w13, w2)
             self.experts = fm.prepare_weights(plan=self.wplan, weights=fm.PackedWeights(
                 w13=w13_u8, w2=w2_u8, w13_block_scales=s13, w2_block_scales=s2,
                 w13_global_scales=ones(), w2_global_scales=ones(), immutable_input_scales=True))
@@ -205,6 +213,7 @@ class B12xRoutedExperts:
                 intermediate_size=n,
                 w13_layout="w31",
             )
+            _mark_prepare_started(w13, w2)
             self.experts = fm.prepare_weights(
                 plan=self.wplan,
                 params_dtype=torch.bfloat16,
@@ -481,12 +490,23 @@ class TorchRoutedExperts:
 # ------------------------------------------------------------------------------------------------
 # DeepseekMoE hooks (called by sm120_patches)
 # ------------------------------------------------------------------------------------------------
+def _ep_size(moe) -> int:
+    group = getattr(moe, "ep_group", None)
+    try:
+        return int(group.size()) if group is not None and hasattr(group, "size") else 1
+    except Exception:  # noqa: BLE001
+        return 1
+
+
 def _wrap_ep(moe) -> None:
     """Hand-off to multi-GPU EP (sm120/sm120_ep, Option B): wraps the rank-local b12x experts when the EP
     group has > 1 rank; returns them unchanged for EP=1 or SM120_EP_IMPL=off."""
     import importlib.util
 
     if importlib.util.find_spec("sm120_ep") is None:
+        if _ep_size(moe) > 1:  # b12x would get global expert ids against the rank-local experts
+            raise RuntimeError(f"sm120_moe layer {moe.layer_idx}: expert parallelism ({_ep_size(moe)} ranks) needs "
+                               "the sm120_ep package, which is not importable")
         return
     import sm120_ep
 
@@ -505,17 +525,31 @@ def setup(moe) -> None:
         return
     if impl == "deepep":
         return
+    ep = _ep_size(moe)
     if impl == "b12x":
         try:
             moe.sm120_routed = B12xRoutedExperts(moe)
             _wrap_ep(moe)
             return
         except Exception as exc:  # noqa: BLE001
-            mutated = bool(getattr(moe.gate_up_proj_weight, "sm120_b12x_repacked", False))
-            if _strict() or mutated:
+            # Fail closed: the torch reference must not run on weights b12x already started to repack in place, and
+            # with expert parallelism a rank that falls back would never join the other ranks' collectives (and the
+            # torch reference is not expert-parallel, see below).
+            w13, w2 = moe.gate_up_proj_weight, moe.down_proj_weight
+            mutated = any(getattr(p, a, False) for p in (w13, w2)
+                          for a in ("sm120_b12x_repacked", "sm120_b12x_prepare_started"))
+            if _strict() or mutated or ep > 1:
+                if mutated or ep > 1:
+                    _log(f"layer {moe.layer_idx}: b12x MoE failed ({type(exc).__name__}: {exc}); no torch fallback "
+                         + ("(expert weights already partly repacked in place)" if mutated else
+                            f"(expert parallelism, {ep} ranks)"))
                 raise
             _log(f"layer {moe.layer_idx}: b12x MoE unavailable ({type(exc).__name__}: {exc}); using torch reference")
             moe.sm120_moe_impl = "torch"
+    if ep > 1:
+        # TorchRoutedExperts applies the rank-local weights to global expert ids (no expert offset, no EP collectives)
+        raise RuntimeError(f"sm120_moe layer {moe.layer_idx}: SM120_MOE_IMPL=torch (--deterministic) does not support "
+                           f"expert parallelism ({ep} ranks); use the b12x MoE with --dp > 1")
     moe.sm120_routed = TorchRoutedExperts(moe)
 
 
@@ -535,7 +569,7 @@ def forward(moe, orig_forward, hidden_states, hidden_states_bf16, input_metadata
             out = routed(hidden_states_bf16, topk_idx, topk_weights)
         shared = moe.shared_forward(hidden_states)
         if shared is not None:
-            out = (out.float() + shared.float()).to(torch.bfloat16)
+            out.add_(shared)  # bf16 add computes in fp32 and rounds once: = (out.float() + shared.float()).to(bf16)
         return out
     out = routed(hidden_states, hidden_states_bf16, topk_idx, topk_weights)  # fp32
     shared = moe.shared_forward(hidden_states)

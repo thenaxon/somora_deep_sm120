@@ -630,7 +630,8 @@ def main() -> int:
                          "waiting prompt waits before all ranks do a prefill step. auto = 1 for --dp 1, 16 otherwise; "
                          "DeepInfer default 100. Smaller = lower TTFT, larger = fewer decode stalls for the others")
     ap.add_argument("--deterministic", action="store_true",
-                    help="SM120_MOE_IMPL=torch: run-to-run reproducible outputs (b12x fused_moe is not), slower")
+                    help="SM120_MOE_IMPL=torch: run-to-run reproducible outputs (b12x fused_moe is not), slower; one GPU only "
+                         "(with --dp use SM120_MOE_DETERMINISTIC=1)")
     ap.add_argument("--request-timeout", type=float, default=600.0, help="max seconds between two tokens")
     ap.add_argument("--yoco-compact", type=int, nargs="?", const=140, default=0, metavar="KEEP",
                     help="YOCO compact prefill truncation (DeepInfer DEEPINFER_YOCO_PREFILL_TRUNCATION_MODE=compact): layers "
@@ -668,6 +669,11 @@ def main() -> int:
     # docker stop / kill -TERM: run the finally blocks (engine shutdown here, rank shutdown in the dp proxy) instead
     # of dying in place; the default SIGTERM action skips them.
     signal.signal(signal.SIGTERM, _sigterm)
+    torch_moe = args.deterministic or os.environ.get("SM120_MOE_IMPL", "b12x").strip().lower() == "torch"
+    if torch_moe and max(args.dp, args.ep or args.dp) > 1:
+        ap.error("--deterministic / SM120_MOE_IMPL=torch (the torch MoE reference) is single-GPU only: it is not "
+                 "expert-parallel. With --dp use SM120_MOE_DETERMINISTIC=1 (deterministic b12x MoE) for reproducible "
+                 "outputs, or --dp 1")
     if args.mtp_varlen and (args.nextn <= 0 or not args.graphs):
         ap.error("--mtp-varlen needs --nextn > 0 and --graphs (DeepInfer profiles the decode graphs for its cost model)")
     logging.basicConfig(level=args.log_level, format="%(asctime)s %(name)s %(levelname)s %(message)s")

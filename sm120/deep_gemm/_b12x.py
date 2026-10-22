@@ -231,7 +231,9 @@ def try_linear(a, sfa, gran_k_a, b, sfb, gran_k_b, d, alpha, epilogue) -> torch.
     try:
         return linear(a, sfa, gran_k_a, b, sfb, gran_k_b)
     except Exception as exc:  # noqa: BLE001
-        if _env.strict():
+        # inside a CUDA graph capture (e.g. a first-time pack / plan, _not_in_capture): raise instead of recording the
+        # torch path into the graph and marking the weight unsupported for good
+        if _env.strict() or _capturing():
             raise
         _UNSUPPORTED.add(key)
         _env.warn_once(("b12x_fail", tuple(b.shape)), f"b12x block_fp8_linear failed for N,K={tuple(b.shape)}: "

@@ -131,9 +131,10 @@ def flash_mla_with_kvcache(
     rows = b * s_q
     q3 = q.reshape(rows, h_q, d)
     idx = indices.reshape(rows, topk)
-    tl = None if topk_length is None else topk_length.reshape(b).repeat_interleave(s_q)
+    rep = (lambda t: t.reshape(b)) if s_q == 1 else (lambda t: t.reshape(b).repeat_interleave(s_q))  # no copy at s_q 1
+    tl = None if topk_length is None else rep(topk_length)
     eidx = None if extra_indices_in_kvcache is None else extra_indices_in_kvcache.reshape(rows, extra_topk)
-    etl = None if extra_topk_length is None else extra_topk_length.reshape(b).repeat_interleave(s_q)
+    etl = None if extra_topk_length is None else rep(extra_topk_length)
     out, lse = sparse_decode(q3, k_cache, idx, tl, float(softmax_scale), int(head_dim_v), attn_sink,
                              extra_k_cache, eidx, etl, None, torch.bfloat16)
     out = out.view(b, s_q, h_q, head_dim_v)

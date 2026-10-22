@@ -79,7 +79,8 @@ b12x 1.5.1's `deterministic_output` is wrong for some batch sizes (dynamic tiles
 That is 1.06-1.19x slower decode on one GPU (with `--dp N` plus the masked routes each rank computes at weight 0,
 not measured yet); the mode stays off by default. The server's
 `--deterministic` flag is a different mechanism: it switches the MoE to the exact torch reference
-(`SM120_MOE_IMPL=torch`), which is also reproducible and is what the server test suite uses.
+(`SM120_MOE_IMPL=torch`), which is also reproducible and is what the server test suite uses. The torch reference is
+single-GPU only (not expert-parallel; refused with `--dp` / `--ep` > 1); with `--dp` use `SM120_MOE_DETERMINISTIC=1`.
 
 ### MoE tuning levers (optional)
 

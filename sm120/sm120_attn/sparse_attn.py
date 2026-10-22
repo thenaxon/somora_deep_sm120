@@ -181,12 +181,10 @@ def sparse_decode(q: torch.Tensor, k_cache: torch.Tensor, indices: torch.Tensor,
                     o = o.to(out_dtype)
                 return o, l
             except Exception as exc:  # noqa: BLE001
-                if cfg.strict():
+                if cfg.strict() or cfg.capturing():  # a graph must not record the (slower, fp32) torch path
                     raise
                 cfg.log_once(("b12x_decode_fail", type(exc).__name__, str(exc)[:200]),
-                             f"b12x sparse decode failed ({type(exc).__name__}: {exc}); falling back to torch"
-                             + (" (inside CUDA graph capture: the graph records the torch path)"
-                                if cfg.capturing() else ""),
+                             f"b12x sparse decode failed ({type(exc).__name__}: {exc}); falling back to torch",
                              logging.WARNING)
         else:
             if cfg.strict():

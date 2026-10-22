@@ -140,6 +140,6 @@ Other consequences of having no NVLink: the mega-MoE (symmetric memory) path and
   individual FP8 codes of `kv` flip. It reproduces with pure-torch shims, and the kernel matches its own torch reference on SM120.
   Every other layer is within the reference noise floor ([VALIDATION.md](VALIDATION.md)).
 - **b12x `fused_moe` is not run-to-run deterministic** (atomic top-k combine). `SM120_MOE_IMPL=torch` (or the server's
-  `--deterministic`) gives bit-reproducible outputs; `SM120_MOE_DETERMINISTIC=1` (or `--batch-invariant` in the tools) keeps b12x and gives bit-identical repeats.
+  `--deterministic`, one GPU only) gives bit-reproducible outputs; `SM120_MOE_DETERMINISTIC=1` (or `--batch-invariant` in the tools) keeps b12x and gives bit-identical repeats.
 - DeepInfer needs `max_model_len >= 16384` (candidate_topk_blocks 2048 × block 8) and loads vision/aligner weights even for
   text-only prompts; the truncated test checkpoints synthesize them.

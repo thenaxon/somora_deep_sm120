@@ -285,9 +285,9 @@ shared pool. Input metadata is copied into static buffers before each replay.
 What the shims do so that capture works:
 
 - **Plans are created in the eager warm-up** (decode attention per row bucket, indexer per row capacity). Under
-  capture `prepare_plan` raises before b12x would compile; the dispatcher then falls back to torch with a warning that
-  the graph records the torch path (or raises with `STRICT=1`). A capture-time miss is not marked as permanently
-  failed.
+  capture `prepare_plan` raises before b12x would compile, and the dispatcher re-raises it (decode attention and
+  indexer): a graph never records the slower fp32 torch path. With the fatal capture handling (P9) the server exits
+  with code 4 instead of serving degraded graphs. Eager calls still fall back to torch with one warning.
 - **No host syncs on the decode path.** b12x decode reads lengths in the kernel; the torch paged indexer uses the
   static `max_context_len` while capturing; top-k is sync-free.
 - **Persistent staging buffers per plan.** Padded rows get length 0 on every call, so a graph does not depend on the
@@ -512,7 +512,7 @@ configurations diverge after a few tokens, so the comparison is step-0 cosine ag
 2. **Coverage:** validated on the truncated test checkpoints and the unit shapes. A b12x error on a new shape falls
    back to torch with one warning, so a failure costs speed, not correctness; use `SM120_ATTN_STRICT=1` to surface it.
    Main cache 288 B (non-SWA layers) or extra cache 528 B goes to torch.
-3. **Plan creation under capture** (a shape not warmed up) records the torch path: correct but slow, with a warning.
+3. **Plan creation under capture** (a shape not warmed up) is an error, not a silent torch path in the graph.
 4. **Top-k is still `torch.topk`** over the full `max_kv_len` width, which costs bandwidth on decode. The fused radix
    kernel (`SM120_TOPK_FUSED=1`) is correct but slower; a faster fused top-k is open.
 5. **Prefill overhead:** the KV re-encode is repeated per YOCO consumer layer, and there is one host sync per call.

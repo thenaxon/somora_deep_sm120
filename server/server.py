@@ -605,6 +605,11 @@ def _logprobs_obj(self, out_ids, rows, chat: bool):
 Handler._logprobs_obj = _logprobs_obj
 
 
+def _max_request_bytes(args) -> int:
+    # a chat request carries its images base64-encoded (4/3 of the bytes) in the JSON body
+    return args.max_request_bytes or (args.max_images * args.max_image_bytes * 4 // 3 + (16 << 20))
+
+
 class App:
     def __init__(self, args):
         self.args = args
@@ -613,8 +618,7 @@ class App:
         self.request_timeout = args.request_timeout
         self.codec = TextCodec(args.ckpt)
         self.vocab_size = self.codec.tok.get_vocab_size(with_added_tokens=True)
-        # a chat request carries its images base64-encoded (4/3 of the bytes) in the JSON body
-        self.max_request_bytes = args.max_request_bytes or (args.max_images * args.max_image_bytes * 4 // 3 + (16 << 20))
+        self.max_request_bytes = _max_request_bytes(args)
         self.image_limits = images.ImageLimits(max_images=args.max_images, max_bytes=args.max_image_bytes,
                                                max_pixels=args.max_image_pixels, fetch_urls=not args.no_image_urls,
                                                fetch_private=args.image_fetch_private,
@@ -842,6 +846,10 @@ def main() -> int:
                     help="data-parallel ranks = GPUs (DP attention + EP MoE, docs/MULTI_GPU.md): one engine process per "
                          "rank on ports PORT+1.., and a least-loaded proxy on --port (dp_proxy.py)")
     ap.add_argument("--ep", type=int, default=None, help="expert-parallel size (default: --dp)")
+    ap.add_argument("--start-timeout", type=float, default=3600.0,
+                    help="--dp: seconds until every rank must answer /health (weights, JIT, graph capture; a cold "
+                         "/cache compiles for a long time), else all ranks are stopped and the server exits non-zero. "
+                         "0 = no limit")
     ap.add_argument("--dp-rank", type=int, default=None, help=argparse.SUPPRESS)  # set by the proxy for its children
     ap.add_argument("--force-proxy", action="store_true", help=argparse.SUPPRESS)  # tests: proxy even with --dp 1
     ap.add_argument("--max-images", type=int, default=8, help="images per chat request")
@@ -888,8 +896,9 @@ def main() -> int:
                 continue
             rest.append(a)
         try:
-            rc = dp_proxy.run(rest, args.dp, args.host, args.port)
-        except SystemExit as exc:  # start-up failure, after the ranks were stopped
+            rc = dp_proxy.run(rest, args.dp, args.host, args.port, start_timeout=args.start_timeout,
+                              max_request_bytes=_max_request_bytes(args))
+        except SystemExit as exc:  # start-up failure or a failed rank (watchdog), after the ranks were stopped
             if exc.code is None or isinstance(exc.code, int):
                 rc = exc.code or 0
             else:

@@ -3,6 +3,17 @@
 All notable changes to this project are documented here. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0 any minor release may change interfaces.
 
+## [0.2.4] - unreleased
+
+### Fixed
+- `--dp` with CUDA graphs failed at start-up in 0.2.3 (`sm120_moe layer 0: b12x plan for max_tokens=64 requested
+  during CUDA graph capture`; the other ranks then hung). DeepInfer's eager warm-up before each graph capture still ran
+  the EP layer at the fixed capacity, so the rank-local experts were planned only for that bucket, while the capture
+  itself used the graph size (0.2.3). `CudaGraphRunner.capture` and `DFlashCudaGraphRunner.capture` are now marked as a
+  whole (`dp_sync.patch_capture`), and warm-up and capture both use the graph size as EP rows, so the warm-up creates
+  every bucket the capture needs. New `tests/test_ep_capture_plans.py` (world 4 emulated, real b12x plan path) fails
+  on the 0.2.3 behaviour.
+
 ## [0.2.3] - 2026-10-22
 
 0.2.2 was tested but not tagged; its changes ship with 0.2.3.

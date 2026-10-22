@@ -189,9 +189,9 @@ curl -s localhost:8100/health | python3 -m json.tool
   (attention, mHC, embed/head, vision, MTP). That leaves about 10 GB for KV and activations at `0.92`. If it does not
   start, lower `--max-num-batched-tokens` to 2048 first.
 - With CUDA graphs, the DP-wide decode graph-size sync (`SM120_EP_DP_SYNC`, default on) makes every rank replay the
-  same graph size in each step. The start-up capture uses each graph's own size as EP rows (rows = T; all ranks
-  capture the same sizes in the same order), so the collectives carry only the graph's rows. `SM120_EP_DP_SYNC=0` is
-  the A/B switch back: no sync, and every graph pads to the fixed capacity (`max_num_seqs` × (1 + nextn) rows per
+  same graph size in each step. The start-up capture (its eager warm-ups included) uses each graph's own size as EP
+  rows (rows = T; all ranks capture the same sizes in the same order), so the collectives carry only the graph's
+  rows. `SM120_EP_DP_SYNC=0` is the A/B switch back: no sync, and every graph pads to the fixed capacity (`max_num_seqs` × (1 + nextn) rows per
   rank). Before 0.2.3 the capture always padded; delete a `/cache/decode_perf` profiled by an older version once.
 - DSpark/MTP after the plain run: smoke `--nextn 7`, then `--nextn 7 --mtp-varlen`, before any benchmark (§5a).
 - `--max-blocks` caps the KV cache in 128-token blocks. The server default of 256 (32k tokens) is sized for the

@@ -187,10 +187,12 @@ class EPRoutedExperts:
         T = int(x.shape[0])
         fixed = (not is_prompt) if is_prompt is not None else _capturing()
         if fixed:
-            if dp_sync.active() and (dp_sync._STATE["synced"] is not None or _capturing()):
-                # every DP rank replays the same (DP-max) graph size, see dp_sync.py; at start-up capture (no step
-                # synced yet) every rank captures the same batch-size list in the same order, so the captured graph
-                # of size T must use T rows too (the fixed capacity here was baked into every replayed graph)
+            if dp_sync.active() and (dp_sync._STATE["synced"] is not None or dp_sync._STATE["in_capture"]
+                                     or _capturing()):
+                # every DP rank replays the same (DP-max) graph size, see dp_sync.py. Start-up capture (no step synced
+                # yet): every rank runs the same batch-size list in the same order, each size an eager warm-up and
+                # then the capture, so both use T rows; the warm-up thereby creates the local experts' b12x plan for
+                # the world*T bucket that the capture needs (plans cannot be created while capturing)
                 rows = T
             else:
                 rows = self.decode_rows

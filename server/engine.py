@@ -273,6 +273,8 @@ class EngineLoop:
                 self._drain(block=not unfinished and not pending_flush)
                 unfinished = self.engine.has_unfinished_requests()
                 if unfinished:
+                    if self._dprof_n:
+                        self._decode_profile_tick()
                     t0 = time.perf_counter()
                     with _prof_rng("sm120:engine.step"):
                         outs = self.engine.step()
@@ -354,6 +356,9 @@ class EngineLoop:
 
     # ------------------------------------------------------------------ SM120_PROFILE_PREFILL (diagnostics)
     _prof = None
+    _dprof = None  # SM120_PROFILE_DECODE: None = not started, tuple = recording, () = done
+    _dprof_n = int(os.environ.get("SM120_PROFILE_DECODE", "0") or 0)
+    _dprof_skip = int(os.environ.get("SM120_PROFILE_DECODE_SKIP", "8") or 0)
 
     def _profile_maybe_start(self, r) -> None:
         """SM120_PROFILE_PREFILL=N: profile (torch profiler, CPU + CUDA) from the N-th request this engine process
@@ -361,6 +366,10 @@ class EngineLoop:
         SM120_PROFILE_DIR (default /work). One shot per process; with --dp every rank counts its own requests."""
         n = int(os.environ.get("SM120_PROFILE_PREFILL", "0") or 0)
         if n <= 0 or self.stats["added"] != n or self._prof is not None:
+            return
+        if self._dprof:  # SM120_PROFILE_DECODE is recording (one profiler at a time)
+            log.warning("SM120_PROFILE_PREFILL: request %d arrived while SM120_PROFILE_DECODE records; not profiled", n)
+            self._prof = ("", None, 0.0, 0, 0)
             return
         try:
             import torch
@@ -381,29 +390,70 @@ class EngineLoop:
         rid, p, t0, s0, plen = self._prof
         self._prof = ("", None, 0.0, 0, 0)  # one shot
         try:
-            import torch
-            torch.cuda.synchronize()
-            wall = (time.perf_counter() - t0) * 1000
-            p.__exit__(None, None, None)
-            _set_prof_active(False)
-            out = os.environ.get("SM120_PROFILE_DIR", "/work")
-            tag = f"prefill_r{self.cfg.get('dp_rank', 0)}_p{os.getpid()}"
-            path = os.path.join(out, tag)
-            p.export_chrome_trace(path + ".trace.json")
-            sys.path.insert(0, os.path.join(ROOT, "tests"))
-            import contextlib
-            import io
-            import prof_e2e
-            buf = io.StringIO()
-            with contextlib.redirect_stdout(buf):
-                prof_e2e.summarize(f"prefill of {plen} tokens ({rid})", prof_e2e.kernels(p), wall,
-                                   self.stats["steps"] - s0)
-                self._profile_cpu_table(p, wall)
-            open(path + ".txt", "w").write(buf.getvalue())
-            log.info("SM120_PROFILE_PREFILL: wrote %s.trace.json and %s.txt (wall %.0f ms)\n%s", path, path, wall,
-                     buf.getvalue())
+            self._profile_write("SM120_PROFILE_PREFILL", "prefill", f"prefill of {plen} tokens ({rid})", p, t0, s0)
         except Exception as exc:  # noqa: BLE001
             log.warning("SM120_PROFILE_PREFILL: could not write the profile: %r", exc)
+
+    def _profile_write(self, env: str, kind: str, label: str, p, t0: float, s0: int) -> None:
+        """Stop profiler p (started at t0, engine step s0) and write <kind>_r<rank>_p<pid>.trace.json / .txt."""
+        import torch
+        torch.cuda.synchronize()
+        wall = (time.perf_counter() - t0) * 1000
+        p.__exit__(None, None, None)
+        _set_prof_active(False)
+        out = os.environ.get("SM120_PROFILE_DIR", "/work")
+        path = os.path.join(out, f"{kind}_r{self.cfg.get('dp_rank', 0)}_p{os.getpid()}")
+        p.export_chrome_trace(path + ".trace.json")
+        sys.path.insert(0, os.path.join(ROOT, "tests"))
+        import contextlib
+        import io
+        import prof_e2e
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            prof_e2e.summarize(label, prof_e2e.kernels(p), wall, self.stats["steps"] - s0)
+            self._profile_cpu_table(p, wall)
+        open(path + ".txt", "w").write(buf.getvalue())
+        log.info("%s: wrote %s.trace.json and %s.txt (wall %.0f ms)\n%s", env, path, path, wall, buf.getvalue())
+
+    def _decode_profile_tick(self) -> None:
+        """SM120_PROFILE_DECODE=N (diagnostics, inert unless set): once per engine process, profile N consecutive
+        engine steps (torch profiler, CPU + CUDA, same tables as SM120_PROFILE_PREFILL) once this rank decodes: it
+        holds requests and all of them have their first token. SM120_PROFILE_DECODE_SKIP (default 8) such steps are
+        skipped first (warm-up). With --dp every rank that holds a request profiles its own steps; a rank without
+        requests does not. A prefill step that starts inside the window is included (the table says how many steps)."""
+        if self._dprof == () or (self._prof is not None and self._prof[1] is not None):  # done / prefill recording
+            return
+        decoding = bool(self._live) and all(r.first_token_t is not None for r in self._live.values())
+        if self._dprof is None:
+            if not decoding:
+                self._dprof_seen = 0
+                return
+            self._dprof_seen = getattr(self, "_dprof_seen", 0) + 1
+            if self._dprof_seen <= self._dprof_skip:
+                return
+            try:
+                import torch
+                from torch.profiler import ProfilerActivity, profile
+                torch.cuda.synchronize()
+                p = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=False)
+                _set_prof_active(True)
+                p.__enter__()
+                self._prof_tid = threading.get_native_id()
+                self._dprof = (p, time.perf_counter(), self.stats["steps"], len(self._live))
+                log.info("SM120_PROFILE_DECODE: profiling %d decode steps (%d requests running)", self._dprof_n,
+                         len(self._live))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("SM120_PROFILE_DECODE: could not start the profiler: %r", exc)
+                self._dprof = ()
+            return
+        p, t0, s0, nreq = self._dprof
+        if self.stats["steps"] - s0 < self._dprof_n:
+            return
+        self._dprof = ()  # one shot
+        try:
+            self._profile_write("SM120_PROFILE_DECODE", "decode", f"decode, {nreq} requests running", p, t0, s0)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("SM120_PROFILE_DECODE: could not write the profile: %r", exc)
 
     def _profile_cpu_table(self, p, wall: float) -> None:
         """Host side of the profiled prefill: named ranges (sm120:* ours, deepinfer:* DeepInfer's) and the CUDA /

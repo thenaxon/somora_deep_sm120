@@ -18,6 +18,13 @@ before 1.0 any minor release may change interfaces.
   teardown, and with `--dp` the proxy waited for it forever. The server now exits at once with code 3; the `--dp`
   proxy stops the other ranks (SIGTERM, `kill` after 10 s) and exits non-zero.
 
+### Changed
+- `SM120_ENGRAM_MODE=pinned`: each rank logs the GPU memory its registration of the shared segment costs (page tables,
+  about 2 MiB per GiB of tables, ~0.35-0.4 GiB per GPU for the full tables). It comes out of the KV cache: on a tight
+  budget raise `--gpu-memory-utilization` (on 4× RTX PRO 6000 with `--max-model-len 40960`: 0.92 left 0.17 GiB of KV,
+  which pinned mode used up). Documented in docs/MULTI_GPU_RUNBOOK.md §3 and docs/ENGRAM.md, which also corrects the
+  gather time to ~2.3 ms per 98k rows after a one-time warm-up.
+
 ## [0.2.3] - 2026-10-22
 
 0.2.2 was tested but not tagged; its changes ship with 0.2.3.

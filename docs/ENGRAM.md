@@ -340,7 +340,7 @@ SM120_ENGRAM_MODE=uring python3 /opt/sm120/tests/tests_engram.py --ckpt /ckpt --
 # DeepInfer with engram: a truncated checkpoint that keeps layer 1 + the symlinked shard 00047
 SM120_ENGRAM_MODE=host python3 /opt/sm120/tools/run_deepinfer.py --ckpt /work/ckpt_yoco_engram ...
 # prefill TTFT with a cold engram cache, one server per mode (docker host; see the script header)
-IMG=somora_deep_sm120:0.2.3 CKPT_DIR=... WORK=... CACHE_DIR=... MODEL=/work/ckpt_full \
+IMG=somora_deep_sm120:0.2.4 CKPT_DIR=... WORK=... CACHE_DIR=... MODEL=/work/ckpt_full \
   MODES="host host_nopf:SM120_ENGRAM_PREFETCH=0 uring" bash tests/engram_cold_ttft.sh
 # CUDA graphs: graph vs eager (teacher forced, negative control); decode cost with vs without engram
 bash /opt/sm120/tests/tests_engram_graph.sh

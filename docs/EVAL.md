@@ -1,7 +1,7 @@
 # Evaluation tools: endpoint comparison, load generation, quality spot-check
 
 All tools in `eval/` are stdlib-only clients of any OpenAI-compatible endpoint: this repo's server (`server/server.py`, image
-`somora_deep_sm120:0.2.3`) or a vLLM baseline deployment. The multi-GPU bring-up procedure that uses them is in
+`somora_deep_sm120:0.2.4`) or a vLLM baseline deployment. The multi-GPU bring-up procedure that uses them is in
 [MULTI_GPU_RUNBOOK.md](MULTI_GPU_RUNBOOK.md).
 
 | tool | what |

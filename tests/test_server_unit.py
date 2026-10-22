@@ -406,22 +406,29 @@ def test_finish_reason_and_misc():
     assert S._abort_reason("stop", False) is None and S._abort_reason("abort", True) is None
 
 
-def test_prefix_cache_pinned_blocks_thread_safe():
-    """/health (an HTTP thread) counts the pinned blocks while the engine thread adds and evicts entries."""
+def test_prefix_cache_summary_thread_safe():
+    """/health (an HTTP thread) calls PrefixCache.summary() while the engine thread adds and evicts entries and
+    updates the per-block pin counts (_ref). Real PrefixCache methods on an instance built without __init__ (no engine)."""
     sys.path.insert(0, os.path.join(os.path.dirname(HERE), "prefix_cache"))
     from collections import OrderedDict
 
     import prefix_cache as pc
 
-    fake = SimpleNamespace(entries=OrderedDict())
+    fake = pc.PrefixCache.__new__(pc.PrefixCache)  # the real class, without __init__ (that needs an engine)
+    fake.__dict__.update(entries=OrderedDict(), _pin_refs={}, grain=128, checkpoint_stride=128,
+                         stats=dict(lookups=1, hits=0, hit_tokens=0, prompt_tokens=1, snapshots=0, gen_end_snapshots=0,
+                                    evictions=0, snapshot_skipped=0, snapshot_errors=0))
     stop = threading.Event()
 
     def churn():
         k = 0
         while not stop.is_set():
-            fake.entries[(k, b"")] = pc.Entry(k=k, digest=b"", blocks=list(range(k % 7, k % 7 + 20)), state_id=0)
+            blocks = list(range(k % 7, k % 7 + 20))  # overlapping block sets: shared blocks are counted once
+            fake.entries[(k, b"")] = pc.Entry(k=k, digest=b"", blocks=blocks, state_id=0)
+            fake._ref(blocks, 1)
             if len(fake.entries) > 50:
-                fake.entries.popitem(last=False)
+                _, e = fake.entries.popitem(last=False)
+                fake._ref(e.blocks, -1)
             k += 1
 
     t = threading.Thread(target=churn, daemon=True)
@@ -430,11 +437,15 @@ def test_prefix_cache_pinned_blocks_thread_safe():
         old = sys.getswitchinterval()
         sys.setswitchinterval(1e-6)  # switch threads as often as possible
         for _ in range(3000):
-            pc.PrefixCache._pinned_blocks(fake)
+            s = fake.summary()
+            assert 0 <= s["pinned_blocks"] <= 26, s  # blocks 0..25 exist
     finally:
         sys.setswitchinterval(old)
         stop.set()
         t.join()
+    union = {b for e in fake.entries.values() for b in e.blocks}
+    assert fake._pinned_blocks() == len(union) and set(fake._pin_refs) == union
+    assert all(fake._pin_refs[b] == sum(b in e.blocks for e in fake.entries.values()) for b in union)
 
 
 def main() -> int:

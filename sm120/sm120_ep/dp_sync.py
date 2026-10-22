@@ -15,8 +15,9 @@ Mechanism (one gloo all-reduce MAX per decode step on DeepInfer's cpu_data_paral
     graph, and DeepInfer pads the batch with its own padding_seq_metadata_list as usual;
   * DFlashCudaGraphRunner.select(req_cnt) (MTP draft graph; its MoE layers are EP too) all-reduces its request
     count the same way.
-Capture needs no sync: all ranks capture the same batch-size list in the same order, so the EP layer captures
-each graph with its own size as rows (moe.py, while dp_sync is active); replay picks the synced size. The extra cost is one localhost gloo all-reduce of an int (~tens of us) per decode step (+1 with MTP).
+Capture needs no sync: all ranks capture the same batch-size list in the same order, so the EP layer uses each
+graph's own size as rows in its eager warm-up and in the capture (CudaGraphRunner.capture and
+DFlashCudaGraphRunner.capture are wrapped to mark the whole loop, see patch_capture); replay picks the synced size. The extra cost is one localhost gloo all-reduce of an int (~tens of us) per decode step (+1 with MTP).
 
 Prefill steps (eager) are synced the same way: the step's token count (sum of seqlen_q, 1 for a placeholder
 step, whose forward runs DeepInfer's one-token placeholder sequence) is all-gathered once per step, and every
@@ -37,7 +38,7 @@ import torch
 import torch.distributed as dist
 
 _STATE = {"active": False, "synced": None, "prefill_rows": None, "prefill_counts": None, "consumer_counts": None,
-          "group": None, "n_sync": 0, "yoco_boundary": None}
+          "group": None, "n_sync": 0, "yoco_boundary": None, "in_capture": False}
 
 
 def enabled_by_env() -> bool:
@@ -102,6 +103,24 @@ def patch_graph_runner(cls) -> None:
     cls.select = select
 
 
+def patch_capture(cls) -> None:
+    """Mark the whole capture() of a graph runner (the eager warm-up of every size and its capture), so that the EP
+    layer uses the graph size as rows in both: the warm-up then plans exactly the buckets the capture replays."""
+    orig = cls.capture
+    if getattr(orig, "_sm120_dp_sync", False):
+        return
+
+    def capture(self, *args, **kwargs):
+        prev, _STATE["in_capture"] = _STATE["in_capture"], True
+        try:
+            return orig(self, *args, **kwargs)
+        finally:
+            _STATE["in_capture"] = prev
+
+    capture._sm120_dp_sync = True
+    cls.capture = capture
+
+
 def patch_dflash_runner(cls, group) -> None:
     orig = cls.select
     if getattr(orig, "_sm120_dp_sync", False):
@@ -127,9 +146,11 @@ def install(group=None) -> bool:
         group = group if group is not None else PG.cpu_data_parallel_group()
         patch_worker(wk.Worker, group)
         patch_graph_runner(cgr.CudaGraphRunner)
+        patch_capture(cgr.CudaGraphRunner)
         try:
             from deepinfer.worker import dflash_cuda_graph_runner as dcgr
             patch_dflash_runner(dcgr.DFlashCudaGraphRunner, group)
+            patch_capture(dcgr.DFlashCudaGraphRunner)
         except ImportError:
             pass
     except Exception as exc:  # noqa: BLE001

@@ -196,12 +196,14 @@ def run(argv: list[str], dp: int, host: str, port: int) -> int:
                "--host", "127.0.0.1", "--port", str(p)]
         log.info("rank %d: %s", r, " ".join(cmd))
         procs.append(subprocess.Popen(cmd, env=env, pass_fds=(shm_fd,) if shm_fd is not None else ()))
+    start_failed = False
     try:
         t0 = time.time()
         pending = set(range(dp))
         while pending:
             for r in list(pending):
-                if procs[r].poll() is not None:
+                if procs[r].poll() is not None:  # the others may be stuck in a collective with it: stop them all
+                    start_failed = True
                     raise SystemExit(f"rank {r} exited with {procs[r].returncode} during start-up")
                 try:
                     urllib.request.urlopen(f"http://127.0.0.1:{ports[r]}/health", timeout=2)
@@ -233,8 +235,10 @@ def run(argv: list[str], dp: int, host: str, port: int) -> int:
         for p in procs:
             p.terminate()
         for p in procs:
-            try:
-                p.wait(timeout=60)
+            try:  # a failed start-up: ranks blocked in NCCL do not unwind on SIGTERM, do not wait a minute each
+                p.wait(timeout=10 if start_failed else 60)
             except subprocess.TimeoutExpired:
+                log.warning("rank pid %d did not exit after SIGTERM: killing it", p.pid)
                 p.kill()
+                p.wait()
     return 0

@@ -58,7 +58,7 @@ at start-up and again after the post-load step (`[sm120_engram] engram tables re
 
 | MemAvailable | mode | flags |
 |---|---|---|
-| **before** start-up >= tables + 5 GiB per rank + 6 GiB (215 GiB for `--dp 4`) | **`pinned`** (recommended, the way the baseline keeps its tables):<br>- The server (the `--dp` proxy) creates one anonymous shared segment (memfd) of 188.8 GiB before the ranks start. Every rank registers it with `cudaHostRegister` (portable, mapped).<br>- Once all ranks have loaded, rank 0 reads the shards into it (buffered reads, the shard pages dropped behind them, about 1 min at 3.5 GB/s). Every rank's lookups then gather on the GPU straight from that pinned host memory.<br>- One copy for all ranks: two processes registering a 15.7 GiB segment raised Shmem by 15.8 GiB, not 31.<br>- Shared memory without swap is never reclaimed, and the registration pins it: residency is guaranteed, and there is no I/O while serving.<br>- Start-up fails with a message naming the numbers if it does not fit | `-e SM120_ENGRAM_MODE=pinned --ulimit memlock=-1 -e DEEPINFER_MULTIMODAL_POOL_SIZE_GB=1` |
+| **before** start-up >= tables + (5 GiB + 2.6 GiB registration) per rank + 6 GiB (225 GiB for `--dp 4`) | **`pinned`** (recommended, the way the baseline keeps its tables):<br>- The server (the `--dp` proxy) creates one anonymous shared segment (memfd) of 188.8 GiB before the ranks start. Every rank registers it with `cudaHostRegister` (portable, mapped).<br>- Once all ranks have loaded, rank 0 reads the shards into it (buffered reads, the shard pages dropped behind them, about 1 min at 3.5 GB/s). Every rank's lookups then gather on the GPU straight from that pinned host memory.<br>- One copy for all ranks: two processes registering a 15.7 GiB segment raised Shmem by 15.8 GiB, not 31.<br>- Shared memory without swap is never reclaimed, and the registration pins it: residency is guaranteed, and there is no I/O while serving.<br>- Start-up fails with a message naming the numbers if it does not fit | `-e SM120_ENGRAM_MODE=pinned --ulimit memlock=-1 -e DEEPINFER_MULTIMODAL_POOL_SIZE_GB=1` |
 | after start-up >= tables + 8 GiB (about 212 GB, tables 188.8 GiB) | `host` + locked page cache: once all ranks have loaded their weights, rank 0 drops the weight shards' page-cache pages, reads both tables into the page cache (sequential reads, about 1 min at 3.5 GB/s) and `mlock`s them. The locked pages are the shared page cache of the shard files, so the 4 ranks share one locked copy (measured: two processes locking the same 16 GiB raise `Mlocked` by 16 GiB, not 32). The kernel cannot evict them; lookups never do I/O. Start-up fails with a clear message if the tables plus `SM120_ENGRAM_PIN_HEADROOM_GB` (8) do not fit | `-e SM120_ENGRAM_MODE=host -e SM120_ENGRAM_PIN=mlock --ulimit memlock=-1 -e DEEPINFER_MULTIMODAL_POOL_SIZE_GB=1` |
 | >= tables + 4 GiB | `host` + prefault (best effort: page cache, no lock; process growth evicts table pages) | `-e SM120_ENGRAM_MODE=host -e SM120_ENGRAM_PREFAULT=1` (0.2.1: `=force`) |
 | below that | `uring` (O_DIRECT reads per lookup batch, flat latency) | `-e SM120_ENGRAM_MODE=uring -e SM120_ENGRAM_THREADS=16 --security-opt seccomp=unconfined --ulimit memlock=-1` |
@@ -69,15 +69,24 @@ with `cudaErrorNotSupported` (measured on the RTX 5090 test machine), so `mlock`
 **Memory budget for `--dp 4` on a 246 GiB host without swap.**
 - In `pinned` mode the tables are 188.8 GiB of shared memory (`Shmem` in `/proc/meminfo`), counted once.
 - The ranks no longer map the shard files, so their page tables stay small: VmPTE 0.03 GiB instead of 0.4.
-- Each registration costs the driver some bookkeeping: about 0.4 GiB for two registrations of 15.7 GiB, i.e. up to
-  about 1 GiB per rank for the full tables.
-- The start-up check uses `SM120_ENGRAM_RANK_HOST_GB=5` per rank and `SM120_ENGRAM_PIN_HEADROOM_GB=6`.
+- Each rank's registration costs host memory besides the segment: the driver's per-page bookkeeping (12 MiB of
+  `VmallocUsed` per GiB) and the rank's page tables for the mapping (2 MiB per GiB), both for 4 KiB pages and not
+  reclaimable while registered. For the full tables that is 2.6 GiB per rank, 10.4 GiB for `--dp 4` (measured on the
+  RTX 5090; the start-up log prints it per rank: "registered the shared segment ... host: page tables +X MiB, driver
+  vmalloc +Y MiB"). Only 2 MiB host pages would shrink it, and those need hugetlbfs or shmem THP, i.e. host settings.
+- The start-up check uses `SM120_ENGRAM_RANK_HOST_GB=5` per rank plus the registration cost above per rank and
+  `SM120_ENGRAM_PIN_HEADROOM_GB=6`: tables + 4 x (5 + 2.6) + 6 = 225 GiB for `--dp 4`.
+- After the fill the server prints where the host memory is ("read ... GiB of engram tables ... MemAvailable X GiB
+  (Shmem, AnonPages, VmallocUsed, PageTables, page cache, SUnreclaim)"). On the 4-GPU host about 14 GiB stay
+  available after the fill: about 232 GiB before start - 188.8 GiB tables - 4 x (about 4.5 GiB per rank + 2.6 GiB
+  registration). The fill itself holds nothing afterwards (it reads straight into the segment and drops the shard
+  pages behind it), and the shard page cache that remains is reclaimable and counted in MemAvailable.
 - **GPU memory:** the registration also costs GPU memory for the driver's page tables of the mapping, about 2 MiB per
   GiB of tables: 0.34 GiB per rank for the full tables (measured on the 4-GPU host: non-torch memory 3.73 GiB vs 3.39
   with `host` + `mlock`; 30 MiB for 15.7 GiB on the RTX 5090). DeepInfer sizes the KV cache from the free GPU memory, so
   that comes out of the KV cache. If the KV budget is already tight (`kv_cache_size` in the "Memory profiling results"
-  line close to 0), raise `--gpu-memory-utilization` by about 0.005 or lower `--max-model-len`; otherwise start-up stops
-  with "No available memory for the cache blocks". The start-up log prints the cost per rank ("registered the shared
+  line close to 0), raise `--gpu-memory-utilization` (e.g. 0.92 -> 0.95) or lower `--max-model-len`; otherwise start-up stops
+  with "No available memory for the cache blocks" plus a pinned-mode hint naming the cost. The start-up log prints the cost per rank ("registered the shared
   segment ... MiB of GPU memory"; device-wide, so ranks sharing one GPU see each other's registrations).
 
 Per rank, measured on the RTX 5090 test machine after load and a few 4k/32k requests:

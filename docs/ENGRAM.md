@@ -361,7 +361,7 @@ original shard directory must be visible at the same absolute path wherever the 
   each rank maps the same files and the page cache holds **one shared copy** (203 GB for both tables). Nothing is
   replicated per rank and nothing is exchanged between GPUs. Row sharding plus all-to-all only pays off when shards sit
   in GPU memory, and ~51 GB per GPU next to the weights does not fit on 96 GB cards.
-- **MemAvailable before start-up >= tables + 5 GiB per rank + 6 GiB (215 GiB for 4 ranks):** `pinned`. There is
+- **MemAvailable before start-up >= tables + 5 GiB per rank + the registration (2.6 GiB per rank) + 6 GiB (225 GiB for 4 ranks):** `pinned`. There is
   one shared copy in pinned host memory and every rank gathers on the GPU. On the RTX 5090 test machine (tables
   truncated with `SM120_ENGRAM_SHM_MAX_ROWS`), the cost of the lookups disappeared: TTFT 4k 0.81 s, 32k 6.32 s,
   4 x 4k 3.15 s, the same as without engram (0.81 / 6.29 / 3.13 s).
@@ -393,7 +393,7 @@ original shard directory must be visible at the same absolute path wherever the 
 | `SM120_ENGRAM_PRESTAGE` | 1 | 0 skips prestaging (negative control only) |
 | `SM120_ENGRAM_PREFAULT` | 0 | 1 reads the whole tables into the page cache. The server does it once after every rank has loaded its weights, before it accepts requests (`--dp`: the proxy asks rank 0), and skips it when the tables do not fit into MemAvailable minus `SM120_ENGRAM_PREFAULT_HEADROOM_GB` (use `uring` there). `force` prefaults regardless |
 | `SM120_ENGRAM_PREFAULT_HEADROOM_GB` | 4 | MemAvailable that the prefault leaves free. A partial prefault is not offered: on the RTX 5090 test machine it made cold prefills 20 % slower (page-cache pressure), and the second table's pages evicted the first's |
-| `SM120_ENGRAM_RANK_HOST_GB` | 5 | `pinned`: host memory budgeted per rank in the start-up check (tables + ranks x this + `SM120_ENGRAM_PIN_HEADROOM_GB`, default 6 in this mode, must fit into MemAvailable before the ranks start) |
+| `SM120_ENGRAM_RANK_HOST_GB` | 5 | `pinned`: host memory budgeted per rank in the start-up check (tables + ranks x (this + the registration, 14 MiB per GiB of tables) + `SM120_ENGRAM_PIN_HEADROOM_GB`, default 6 in this mode, must fit into MemAvailable before the ranks start) |
 | `SM120_ENGRAM_SHM_MAX_ROWS` | 0 | tests only: truncate the shared tables to this many rows so that `pinned` fits a small machine (lookups beyond read zeros) |
 | `SM120_ENGRAM_PIN` | 0 | `mlock`: after load, prefault the tables and `mlock` them once in rank 0's process. The pages are the shared page cache of the shard files, so all ranks get guaranteed residency from one locked copy. Start-up fails if the tables plus `SM120_ENGRAM_PIN_HEADROOM_GB` do not fit into MemAvailable, or if `RLIMIT_MEMLOCK` is too low (`--ulimit memlock=-1`). The prefetcher is turned off (nothing to read ahead) |
 | `SM120_ENGRAM_PIN_HEADROOM_GB` | 8 | MemAvailable that must remain after pinning (locked memory is not reclaimable and there is no swap) |

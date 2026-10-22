@@ -588,11 +588,11 @@ def main() -> int:
     ap.add_argument("--zos", choices=("default", "0", "1"), default="default")
     ap.add_argument("--prefill-interval", default="auto",
                     help="DEEPINFER_PREFILL_ATTEMPT_INTERVAL: decode steps between prefill attempts (with --dp > 1: "
-                         "attempts that need every rank to have a waiting prompt). auto = 1 for --dp 1, 8 otherwise; "
+                         "attempts that need every rank to have a waiting prompt). auto = 1 for --dp 1, 16 otherwise; "
                          "DeepInfer default 70")
     ap.add_argument("--prefill-any-interval", default="auto",
                     help="DEEPINFER_PREFILL_ANY_ATTEMPT_INTERVAL: with --dp > 1, decode steps a rank that alone has a "
-                         "waiting prompt waits before all ranks do a prefill step. auto = 1 for --dp 1, 8 otherwise; "
+                         "waiting prompt waits before all ranks do a prefill step. auto = 1 for --dp 1, 16 otherwise; "
                          "DeepInfer default 100. Smaller = lower TTFT, larger = fewer decode stalls for the others")
     ap.add_argument("--deterministic", action="store_true",
                     help="SM120_MOE_IMPL=torch: run-to-run reproducible outputs (b12x fused_moe is not), slower")

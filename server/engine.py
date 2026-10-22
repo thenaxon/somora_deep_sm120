@@ -79,8 +79,8 @@ class GenRequest:
 
 
 # Prefill attempt interval used by "auto" with DP > 1 (decode steps between two prefill chunks when several ranks
-# share the step-type vote). Placeholder until the 4-GPU measurements pick it.
-DP_AUTO_INTERVAL = 8
+# share the step-type vote). 16 was the best of 1 / 8 / 16 on 4x RTX PRO 6000 (docs/SERVER.md).
+DP_AUTO_INTERVAL = 16
 
 
 def resolve_prefill_interval(value, dp_size: int) -> int:

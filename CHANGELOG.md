@@ -12,8 +12,9 @@ before 1.0 any minor release may change interfaces.
   decode steps). The server now sets it (`--prefill-any-interval`, docs/SERVER.md).
 - `--dp > 1` with both prefill intervals at 1: while any rank had prompt chunks waiting, the decoders of all ranks got
   about one token per prefill chunk (mixed load: TPOT p99 401 ms). `--prefill-interval` and `--prefill-any-interval`
-  now default to `auto`: 1 / 1 for `--dp 1`, 8 / 8 for `--dp > 1`, so that at least 8 decode steps run between two
-  chunks. The image no longer sets the two `DEEPINFER_PREFILL_*` variables (an explicit `-e` still overrides).
+  now default to `auto`: 1 / 1 for `--dp 1`, 16 / 16 for `--dp > 1`, so that at least 16 decode steps run between two
+  chunks. Measured on 4× RTX PRO 6000 (`--nextn 7`), against 0.2.4: TTFT 58 tokens 2.0 → 0.85 s, 4k 2.9 → 1.4 s, 32k
+  24 → 11 s; mixed load short-chat TPOT p99 57 → 65 ms (401 ms with 1 / 1); loadgen 4096×16 376 → 388 tok/s. The image no longer sets the two `DEEPINFER_PREFILL_*` variables (an explicit `-e` still overrides).
 
 ## [0.2.4] - 2026-10-22
 

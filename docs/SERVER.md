@@ -272,8 +272,18 @@ ranks (MIN all-reduce, `scheduler.hpp:296-340`).
   While any rank has prompt chunks waiting, the decoders of all ranks got about one token per chunk (about 1.1 s for
   4096 tokens on the 4-GPU host: mixed-load TPOT p99 401 ms). When every rank has prompts waiting, the chunks ran
   back to back.
-- **Default (`auto`) with `--dp > 1`: 8 for both intervals.** Between two prefill chunks at least 8 decode steps run, and
-  a request that only one rank holds waits at most 8 decode steps.
+- **Default (`auto`) with `--dp > 1`: 16 for both intervals.** Between two prefill chunks at least 16 decode steps run,
+  and a request that only one rank holds waits at most 16 decode steps. Measured on 4× RTX PRO 6000 (`--nextn 7`,
+  TTFT 58 / 4k / 32k tokens; mixed load: short-chat TPOT p50 / p99; loadgen 4096×16):
+
+  | both intervals | TTFT | mixed short TPOT p50 / p99 | loadgen tok/s, TPOT p99 |
+  |---|---|---|---|
+  | 100 / 70 (DeepInfer's defaults) | 2.0 / 2.9 / 24.0 s | 27 / 57 ms | 376, 49 ms |
+  | 1 | 0.24 / 1.1 / 8.8 s | 226 / 401 ms | – |
+  | 8 | 0.70 / 1.24 / 9.8 s | 62 / 118 ms | 325, 81 ms |
+  | 8, `--max-num-batched-tokens 2048` | 0.78 / 1.42 / 11.2 s | 42 / 71 ms | 363, 56 ms |
+  | **16** | 0.85 / 1.39 / 11.0 s | 36 / 65 ms | 388, 45 ms |
+
 - The trade-off per value N, with about 25 ms per decode step and a chunk time t:
   - Decoders during a long prefill: TPOT ≈ (t + N × 25 ms) / N.
   - A short prompt waits up to N × 25 ms extra.

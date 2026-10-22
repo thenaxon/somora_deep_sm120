@@ -306,6 +306,20 @@ docker run ... -e SM120_PROFILE_PREFILL=2 -e SM120_PROFILE_DIR=/work ...   # the
 docker logs <container> 2>&1 | grep -A20 "SM120_PROFILE_PREFILL: wrote"
 ```
 
+## Profiling decode steps (`SM120_PROFILE_DECODE`)
+
+`-e SM120_PROFILE_DECODE=N` makes every engine process that holds requests profile N consecutive engine steps once
+all of its requests are decoding (have their first token), after `SM120_PROFILE_DECODE_SKIP` (default 8) such steps
+of warm-up. One shot per process. It writes `decode_r<rank>_p<pid>.trace.json` and `.txt` with the same tables as the
+prefill profile (GPU kernels per category incl. NCCL and EP pack, wall vs GPU busy per step, host-side ranges such as
+the DP sync all-reduces) to `SM120_PROFILE_DIR`, and logs them. With `--dp`, ranks without a request do not profile.
+Unset (default), the engine does not touch the profiler.
+
+```bash
+docker run ... -e SM120_PROFILE_DECODE=32 -e SM120_PROFILE_DIR=/work ...   # then one request with >= 64 output tokens
+docker logs <container> 2>&1 | grep -A30 "SM120_PROFILE_DECODE: wrote"
+```
+
 ## Determinism
 
 The bare engine (`tools/diag_repeat.py`, no HTTP) gives different tokens for the same prompt, run after run, with the default b12x

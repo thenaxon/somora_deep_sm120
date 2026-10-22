@@ -3,6 +3,13 @@
 All notable changes to this project are documented here. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0 any minor release may change interfaces.
 
+## [Unreleased]
+
+### Added
+- `SM120_PROFILE_DECODE=N` (diagnostics, off by default): every engine process that holds requests profiles N decode
+  steps once (torch profiler; same per-category GPU and host tables as `SM120_PROFILE_PREFILL`), also per rank with
+  `--dp` (docs/SERVER.md).
+
 ## [0.3.0] - 2026-10-22
 
 First public release, experimental. Accepted on 4× RTX PRO 6000 Blackwell as v0.3.0-rc1 (same code). 0.2.5 was not

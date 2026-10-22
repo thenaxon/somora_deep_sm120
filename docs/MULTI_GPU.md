@@ -106,6 +106,12 @@ opt-in for hosts where NCCL cannot use P2P at all.
   `SM120_NCCL_P2P_LEVEL=default` skips the test. Check with `NCCL_DEBUG=INFO`: the channel lines should read
   "via P2P/CUMEM" (or P2P/IPC) instead of "via SHM". The self-test proves peer copies are correct, not that P2P is
   faster through the root complex on every platform; compare `tests/bench_ep_comm.py` with and without it.
+* **Other `NCCL_*` variables** (`NCCL_PROTO`, `NCCL_ALGO`, `NCCL_DEBUG`, ...) pass through the proxy to every rank
+  unchanged: the ranks inherit the full environment, plus `NCCL_P2P_LEVEL` as above. DeepInfer's worker set-up
+  overrides only `NCCL_PXN_DISABLE`, `NCCL_CUMEM_ENABLE` and `NCCL_NO_CACHE`, and removes `NCCL_NVLS_ENABLE`
+  (`worker/runtime_config.py`). To see which protocol NCCL uses, read `NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=TUNING` ("Algo
+  RING proto SIMPLE"), not the kernel names in a profile. With `NCCL_PROTO=Simple` set, a server profile on the
+  4-GPU host still showed `ncclDevKernel_*_RING_LL` launches, so the kernel name is not a reliable indicator.
 * **`SM120_EP_TRANSPORT=b12x`** (`sm120_ep/transport.py` `B12xTransport`): the prefill all-gather and reduce-scatter
   go through `PCIeTwoShotBF16` (CUDA-IPC, fp32-accumulating reduce-scatter with one bf16 rounding; world size 4 only).
   Prefill rows per rank are padded to multiples of 256 (one prepared plan per size, built on first use); the

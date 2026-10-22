@@ -483,7 +483,8 @@ class App:
                                  max_num_batched_tokens=args.max_num_batched_tokens,
                                  gpu_memory_utilization=args.gpu_memory_utilization, max_blocks=args.max_blocks,
                                  nextn=args.nextn, graphs=args.graphs, zos=args.zos,
-                                 prefill_interval=args.prefill_interval, deterministic=args.deterministic,
+                                 prefill_interval=args.prefill_interval,
+                                 prefill_any_interval=args.prefill_any_interval, deterministic=args.deterministic,
                                  dp_size=args.dp, dp_rank=args.dp_rank or 0, ep_size=args.ep,
                                  mtp_varlen=args.mtp_varlen,
                                  prefix_cache=dict(grain=args.prefix_cache_grain, checkpoint_stride=args.prefix_cache_checkpoint_stride,
@@ -587,6 +588,10 @@ def main() -> int:
     ap.add_argument("--zos", choices=("default", "0", "1"), default="default")
     ap.add_argument("--prefill-interval", type=int, default=1,
                     help="DEEPINFER_PREFILL_ATTEMPT_INTERVAL (DeepInfer default 70 decode steps; 1 = lowest TTFT)")
+    ap.add_argument("--prefill-any-interval", type=int, default=1,
+                    help="DEEPINFER_PREFILL_ANY_ATTEMPT_INTERVAL: with --dp > 1, how many decode steps a rank that alone "
+                         "has a waiting prompt waits before all ranks do a prefill step (DeepInfer default 100; "
+                         "1 = lowest TTFT)")
     ap.add_argument("--deterministic", action="store_true",
                     help="SM120_MOE_IMPL=torch: run-to-run reproducible outputs (b12x fused_moe is not), slower")
     ap.add_argument("--request-timeout", type=float, default=600.0, help="max seconds between two tokens")

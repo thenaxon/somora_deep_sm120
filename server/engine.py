@@ -84,13 +84,15 @@ class EngineLoop:
     def __init__(self, ckpt: str, *, max_num_seqs: int = 8, max_model_len: int = 16384,
                  max_num_batched_tokens: int = 4096, gpu_memory_utilization: float = 0.90, max_blocks: int = 256,
                  nextn: int = 0, graphs: bool = False, zos: str = "default", chunked_prefill: bool = True,
-                 prefill_interval: int = 1, deterministic: bool = False, prefix_cache: dict | None = None,
+                 prefill_interval: int = 1, prefill_any_interval: int = 1, deterministic: bool = False,
+                 prefix_cache: dict | None = None,
                  dp_size: int = 1, dp_rank: int = 0, ep_size: int | None = None, mtp_varlen: bool = False):
         self.ckpt = ckpt
         self.cfg = dict(max_num_seqs=max_num_seqs, max_model_len=max_model_len,
                         max_num_batched_tokens=max_num_batched_tokens, gpu_memory_utilization=gpu_memory_utilization,
                         max_blocks=max_blocks, nextn=nextn, graphs=graphs, zos=zos, chunked_prefill=chunked_prefill,
-                        prefill_interval=prefill_interval, deterministic=deterministic, prefix_cache=prefix_cache,
+                        prefill_interval=prefill_interval, prefill_any_interval=prefill_any_interval,
+                        deterministic=deterministic, prefix_cache=prefix_cache,
                         dp_size=dp_size, dp_rank=dp_rank, ep_size=ep_size or dp_size, mtp_varlen=mtp_varlen)
         # has_unfinished_requests() is an all-reduce over the DP group: with several ranks, an idle rank must keep
         # polling quickly or it delays the other ranks' steps (docs/MULTI_GPU.md)
@@ -174,6 +176,13 @@ class EngineLoop:
         # idle/placeholder steps included (csrc/engine/scheduler.hpp:296-330): ~2.3 s of TTFT at 32 ms/step on the
         # RTX 5090 test machine. 1 = prefill whenever a prompt waits (one decode step stalls per prefill; chunked prefill caps it).
         os.environ.setdefault("DEEPINFER_PREFILL_ATTEMPT_INTERVAL", str(c["prefill_interval"]))
+        # With DP > 1 that interval only marks "ALL" points, where a prefill step happens only if EVERY DP rank has a
+        # waiting prompt (MIN all-reduce of the ranks' votes). A rank alone with a prompt waits for an "ANY" point,
+        # every DEEPINFER_PREFILL_ANY_ATTEMPT_INTERVAL decode steps (default 100; scheduler.hpp:296-340). With
+        # --dp 4 a single request waited up to 100 decode steps (~2 s TTFT at 20 ms per step). 1 = an ANY point at
+        # every step except the one right after a prefill step. Cost: while any rank has a waiting prompt, every
+        # rank's decode pauses for that prefill chunk (the other ranks run an empty prompt step).
+        os.environ.setdefault("DEEPINFER_PREFILL_ANY_ATTEMPT_INTERVAL", str(c["prefill_any_interval"]))
         if c["mtp_varlen"]:
             # DeepInfer's adaptive speculative decoding (csrc/engine/mtp_varlen.hpp): after graph capture the worker
             # replays every decode graph to get a (graph size -> ms) curve (model_runner.profile_decode_perf, cached in

@@ -15,7 +15,7 @@ because one GPU reads each prompt here while vLLM's tensor parallelism spreads i
 ### Setup
 
 - **Hardware, model, baseline:** as for v0.2.0 below (4× RTX PRO 6000 Blackwell Max-Q, 96 GB, PCIe only; full
-  DeepSeek-V4.1-Flash; vLLM fork with b12x kernels, TP=4, adaptive DSpark up to 7 drafts, engram tables in RAM).
+  DeepSeek-V4.1-Flash-1017; vLLM fork with b12x kernels, TP=4, adaptive DSpark up to 7 drafts, engram tables in RAM).
 - **This engine:** `--dp 4` with CUDA graphs, `--nextn 7`, `--prefix-cache`, `--gpu-memory-utilization 0.95
   --max-model-len 40960 --max-num-seqs 16 --max-num-batched-tokens 4096 --max-blocks 4096`,
   `SM120_ENGRAM_MODE=pinned` (one copy of the 189 GiB engram tables in pinned host RAM for all ranks).

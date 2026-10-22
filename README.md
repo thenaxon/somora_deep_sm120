@@ -3,7 +3,7 @@
 Part of the [somora](https://somora.ai) family.
 
 DeepSeek's [DeepInfer](https://github.com/deepseek-ai/DeepInfer) inference engine on NVIDIA **SM120** GPUs (the
-Blackwell workstation generation). It runs the full **DeepSeek-V4.1-Flash** on **4× RTX PRO 6000 Blackwell** over
+Blackwell workstation generation). It runs the full **DeepSeek-V4.1-Flash-1017** on **4× RTX PRO 6000 Blackwell** over
 PCIe, behind an OpenAI-compatible server with tool calling, structured output and image input.
 
 DeepInfer targets SM100 (B200/GB200): its hot path depends on FlashMLA, DeepGEMM, DeepEP and DeepSelect, which do not
@@ -23,7 +23,7 @@ As far as we know this is the first port of DeepInfer to SM120 workstation GPUs.
 >   225 GiB free before start ([docs/MULTI_GPU_RUNBOOK.md](docs/MULTI_GPU_RUNBOOK.md) §3 lists modes for less RAM).
 >   While it serves, a 246 GiB host has about 12 GiB left, so do not run other large processes next to it.
 > - Linux, Docker with the NVIDIA container toolkit, NVIDIA driver >= 595 (CUDA 13.2), the DeepSeek-V4.1-Flash
->   checkpoint (~300 GB, not included).
+>   checkpoint (`deepseek-ai/DeepSeek-V4.1-Flash-1017`, ~300 GB, not included).
 
 > **Status: experimental (v0.3.0).** Stable on 4× RTX PRO 6000, quality on par with a tuned vLLM deployment of the
 > same model. With many concurrent users and long prompts it matches vLLM's throughput and reaches the first token
@@ -48,7 +48,7 @@ git clone <this repository> somora_deep_sm120 && cd somora_deep_sm120
 docker build -t somora_deep_sm120:0.3.0 -f docker/Dockerfile .      # ~6 min; clones DeepInfer at the pinned commit
 
 docker run -d --name sm120-serve --gpus all --ipc=host --shm-size=32g --ulimit memlock=-1 --stop-timeout 120 \
-  -p 8000:8000 -v /models/DeepSeek-V4.1-Flash:/models/ds41:ro -v sm120-cache:/cache \
+  -p 8000:8000 -v /models/DeepSeek-V4.1-Flash-1017:/models/ds41:ro -v sm120-cache:/cache \
   -e SM120_EP_IMPL=allgather -e SM120_ENGRAM_MODE=pinned -e DEEPINFER_MULTIMODAL_POOL_SIZE_GB=1 \
   somora_deep_sm120:0.3.0 --model /models/ds41 --served-model-name deepseek-v4.1-flash \
     --dp 4 --nextn 7 --prefix-cache --gpu-memory-utilization 0.95 --max-model-len 40960 \

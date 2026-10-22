@@ -12,7 +12,11 @@ before 1.0 any minor release may change interfaces.
   itself used the graph size (0.2.3). `CudaGraphRunner.capture` and `DFlashCudaGraphRunner.capture` are now marked as a
   whole (`dp_sync.patch_capture`), and warm-up and capture both use the graph size as EP rows, so the warm-up creates
   every bucket the capture needs. New `tests/test_ep_capture_plans.py` (world 4 emulated, real b12x plan path) fails
-  on the 0.2.3 behaviour.
+  on the 0.2.3 behaviour. The extra plans (buckets 4 and 64 next to 512) add about 17 MiB of shared b12x scratch
+  per GPU, once, not per layer.
+- A failed engine start (e.g. a CUDA-graph capture that raised) left the server process hanging in the interpreter
+  teardown, and with `--dp` the proxy waited for it forever. The server now exits at once with code 3; the `--dp`
+  proxy stops the other ranks (SIGTERM, `kill` after 10 s) and exits non-zero.
 
 ## [0.2.3] - 2026-10-22
 

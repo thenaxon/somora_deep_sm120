@@ -552,6 +552,22 @@ def _sigterm(signum, frame):
     raise KeyboardInterrupt
 
 
+def _exit_start_failed(exc: BaseException, dp_rank) -> None:
+    """The engine did not come up: exit non-zero at once (os._exit), never through the interpreter's teardown. After a
+    failed start (a CUDA-graph capture that raised, NCCL communicators with work in flight, DeepInfer's threads)
+    that teardown can block forever, and with --dp the proxy waits for the rank to exit. Python's resource tracker
+    still unlinks the shared-memory segments of this process."""
+    log.error("engine start failed%s: %r; exiting with 3", "" if dp_rank is None else f" (rank {dp_rank})", exc)
+    for h in logging.getLogger().handlers:
+        try:
+            h.flush()
+        except Exception:  # noqa: BLE001
+            pass
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(3)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--ckpt", required=True)
@@ -644,7 +660,10 @@ def main() -> int:
             log.error("%s", exc)
             return 2
     app = App(args)
-    app.engine.start()
+    try:
+        app.engine.start()
+    except Exception as exc:  # noqa: BLE001 - e.g. a CUDA-graph capture failure
+        _exit_start_failed(exc, args.dp_rank)
     if args.dp_rank is None:  # single process: weights are loaded now; with --dp the proxy calls it on rank 0
         if (_engram_cache_policy(args.ckpt) or {}).get("fatal"):
             app.engine.shutdown()

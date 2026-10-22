@@ -296,6 +296,26 @@ def nccl_p2p_env(dp: int) -> dict:
     return {}
 
 
+def policy_fatal(reply: str | None, err: BaseException | None, pinned: bool) -> str | None:
+    """The proxy's verdict on rank 0's engram post-load reply: a reason to stop all ranks, or None to serve.
+    In pinned mode the shared tables are only usable after a confirmed fill: no reply, an unreadable one or one
+    without the fill is fatal. Otherwise only an explicit "fatal" (SM120_ENGRAM_PIN) is."""
+    if err is not None:
+        if pinned:
+            return f"no engram post-load reply from rank 0 ({err!r})"
+        log.warning("engram page-cache policy request failed: %r", err)
+        return None
+    try:
+        result = json.loads(reply).get("result") or {}
+    except Exception as exc:  # noqa: BLE001
+        return f"unreadable engram post-load reply from rank 0 ({exc!r})" if pinned else None
+    if result.get("fatal"):
+        return result["fatal"]
+    if pinned and "pinned_fill_s" not in result:
+        return f"rank 0 did not confirm the fill of the shared engram tables: {result}"
+    return None
+
+
 def run(argv: list[str], dp: int, host: str, port: int, start_timeout: float = 0.0,
         max_request_bytes: int = 1 << 62) -> int:
     """argv: server.py arguments without --dp/--host/--port. Spawns the ranks and serves the proxy until interrupted
@@ -339,16 +359,17 @@ def run(argv: list[str], dp: int, host: str, port: int, start_timeout: float = 0
                 except Exception:  # noqa: BLE001
                     pass
             time.sleep(1)
+        reply, err = None, None
         try:  # every rank has loaded its weights: Engram page-cache policy (prefault etc.) once, on rank 0, before serving
             req = urllib.request.Request(f"http://127.0.0.1:{ports[0]}/internal/engram_cache_policy", data=b"{}",
                                          headers={"Content-Type": "application/json"})
             reply = urllib.request.urlopen(req, timeout=3600).read().decode()
             log.info("engram page-cache policy on rank 0: %s", reply)
-            fatal = ((json.loads(reply).get("result") or {}).get("fatal"))
         except Exception as exc:  # noqa: BLE001
-            log.warning("engram page-cache policy request failed: %r", exc)
-            fatal = None
-        if fatal:  # SM120_ENGRAM_PIN cannot be honoured: stop all ranks instead of serving without the guarantee
+            err = exc
+        fatal = policy_fatal(reply, err, pinned=shm_fds is not None)
+        if fatal:  # SM120_ENGRAM_PIN cannot be honoured / pinned tables not filled: stop all ranks, never serve
+            start_failed = True
             raise SystemExit(f"engram tables cannot be pinned: {fatal}")
         ProxyHandler.backends = Backends(ports)
         ProxyHandler.max_request_bytes = max_request_bytes

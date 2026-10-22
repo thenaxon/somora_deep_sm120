@@ -675,14 +675,19 @@ def _engram_cache_policy(ckpt: str) -> dict | None:
     if eng is None or not (getattr(eng, "_TABLES", None) or getattr(eng, "_SHARED_TABLES", None)) or _CACHE_POLICY:
         return None
     _CACHE_POLICY["started"] = time.time()
+    pinned = bool(getattr(eng, "_SHARED_TABLES", None))
     try:
         _CACHE_POLICY.update(eng.post_load_cache_policy(ckpt))
-    except eng.EngramResidencyError as exc:  # SM120_ENGRAM_PIN cannot be honoured: abort the start-up
+    except eng.EngramResidencyError as exc:  # SM120_ENGRAM_PIN cannot be honoured / pinned fill failed: abort
         log.error("engram tables cannot be pinned: %s", exc)
         _CACHE_POLICY["fatal"] = str(exc)
     except Exception as exc:  # noqa: BLE001
         log.warning("engram page-cache policy failed: %r", exc)
         _CACHE_POLICY["error"] = repr(exc)
+        if pinned:  # the shared tables may be unfilled: never serve them
+            _CACHE_POLICY["fatal"] = f"pinned mode: engram post-load step failed: {exc!r}"
+    if pinned and "fatal" not in _CACHE_POLICY and "pinned_fill_s" not in _CACHE_POLICY:
+        _CACHE_POLICY["fatal"] = "pinned mode: the shared engram tables were not filled"
     return dict(_CACHE_POLICY)
 
 

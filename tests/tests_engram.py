@@ -347,6 +347,18 @@ def run_tests(args, cfg: Cfg, ckpt: str, M, E, tokenizer, device: torch.device) 
             k = np.searchsorted(lo, rows * width + base, side="right") - 1
             ok7 &= bool((k >= 0).all() and (rows * width + base + width <= hi[k]).all())
     check("T7 prefetch rows", ok7, f"{B} prompts, {nrows} rows: windows, block-wise hashes and page coverage")
+    # T7b: bookkeeping: cancel forgets the id (a reused id is prefetched again), consumption never exceeds what was
+    # prefetched (no credit beyond SM120_ENGRAM_PREFETCH_AHEAD)
+    import collections, threading
+    pf.tables, pf.slots, pf._q, pf._ids, pf._recent, pf._cv = [], [], [], set(), collections.deque(), threading.Condition()
+    pf._issued, pf._consumed, pf.stats = 0, 0, {"cancelled": 0}
+    pf._ids.add("r1"); pf._q.append(["r1", None, 0, 0, 0, None])
+    pf.cancel("r1")
+    pf._issued = 100
+    pf.consumed(4096)
+    pf.consumed(10)
+    check("T7b prefetch bookkeeping", "r1" not in pf._ids and not pf._q and pf._consumed == 100,
+          f"ids {pf._ids}, consumed {pf._consumed} of issued {pf._issued}")
 
     # T3: lookups through the EngramBuffer shim vs official ParallelEngramEmbedding on safetensors rows
     from deep_ep._engram import EngramBuffer
@@ -367,6 +379,27 @@ def run_tests(args, cfg: Cfg, ckpt: str, M, E, tokenizer, device: torch.device) 
     idx_dev = all_ids.unsqueeze(0).contiguous().to(device)
     (hook,) = buf.fetch(idx_dev)
     data, sf = hook()
+    # T7c: only prefill steps count against the prefetcher's read-ahead (decode steps / graph prestages do not)
+    class _Count:
+        n = 0
+
+        def consumed(self, k):
+            self.n += k
+    saved, se._PREFETCH = se._PREFETCH, _Count()
+    try:
+        se.set_step_is_prompt(False)
+        [h() for h in buf.fetch(idx_dev)]
+        dec = se._PREFETCH.n
+        se.set_step_is_prompt(True)
+        [h() for h in buf.fetch(idx_dev)]
+        pre = se._PREFETCH.n - dec
+        [h() for h in buf.fetcher.fetch(idx_dev, prefill=False)]
+        stg = se._PREFETCH.n - dec - pre
+    finally:
+        se._PREFETCH = saved
+        se.set_step_is_prompt(None)
+    check("T7c prefill-only consumption", dec == 0 and pre == Tn and stg == 0,
+          f"decode {dec}, prefill {pre} (of {Tn}), prestage-style {stg} tokens counted")
     pack_cols = cols * cfg.head_dim // 128
     layout_ok = (tuple(data.shape) == (Tn, cols * cfg.head_dim) and data.dtype == torch.float8_e4m3fn
                  and tuple(sf.shape) == (Tn, pack_cols) and sf.dtype == torch.int32
@@ -397,6 +430,14 @@ def run_tests(args, cfg: Cfg, ckpt: str, M, E, tokenizer, device: torch.device) 
             ok6, dt6 = graph_check(cfg, table, cols, device, args.seed + 6, prestage=(mode == "prestage"))
             check(f"T6 graph {mode}", ok6, f"5 replays x 16 tokens, graph output == eager fetch; "
                                            f"{dt6 * 1e3:.3f} ms per replay (incl. host gather)")
+        # T9: in-graph fetch failures (host tables): a gather that raises in the service thread, and one that stalls
+        # past SM120_ENGRAM_GRAPH_WAIT_S. The replay must return within the budget and check_graph_fetch() (E9: the
+        # engine step) must raise, so no output of that step is used.
+        if table.kind == "host":
+            os.environ["SM120_ENGRAM_GRAPH"] = "async"
+            for fault in ("raise", "stall"):
+                ok9, detail = graph_fault_check(cfg, table, cols, device, args.seed + 9, fault)
+                check(f"T9 graph fetch {fault}", ok9, detail)
         os.environ.pop("SM120_ENGRAM_GRAPH", None)
 
     # T5: the reference re-quantizes the bf16 rows (act_quant, ue8m0) before its fp8 GEMM; DeepInfer feeds
@@ -510,6 +551,65 @@ def graph_check(cfg, table, cols, device, seed, prestage: bool, Tg: int = 16, re
     buf.fetcher.owns_tables = False  # the table is shared with the other checks
     buf.destroy()
     return ok, dt / reps
+
+
+def graph_fault_check(cfg, table, cols, device, seed, fault: str, Tg: int = 16, wait_s: float = 1.0):
+    from deep_ep._engram import EngramBuffer
+
+    os.environ["SM120_ENGRAM_GRAPH_WAIT_S"] = str(wait_s)
+    buf = EngramBuffer(None)
+    buf.set_config([table.rows], cfg.head_dim, 64, cols, torch.float8_e4m3fn, cfg.head_dim // 128)
+    buf.attach_tables([table])
+    g = torch.Generator().manual_seed(seed)
+    static_idx = torch.randint(0, table.rows, (1, Tg, cols), generator=g, dtype=torch.int64).to(torch.int32).to(device)
+    out = torch.empty((Tg, cols * cfg.head_dim), dtype=torch.bfloat16, device=device)
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        (h,) = buf.fetch(static_idx)
+        h()
+    torch.cuda.current_stream().wait_stream(s)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=s):
+        (h,) = buf.fetch(static_idx)
+        d, f = h()
+        out.copy_(se.dequant_rows(d, f, cfg.head_dim))
+    graph.replay()
+    torch.cuda.synchronize()
+    clean = None
+    try:
+        se.check_graph_fetch()
+    except se.EngramFetchError as exc:
+        clean = exc
+    orig = table.gather_host
+
+    def faulty(*a, **k):
+        if fault == "raise":
+            raise OSError(5, "injected gather failure (test)")
+        time.sleep(3 * wait_s)
+        return orig(*a, **k)
+
+    table.gather_host = faulty
+    try:
+        t0 = time.perf_counter()
+        graph.replay()
+        torch.cuda.synchronize()
+        dt = time.perf_counter() - t0
+        raised = None
+        try:
+            se.check_graph_fetch()
+        except se.EngramFetchError as exc:
+            raised = exc
+    finally:
+        table.gather_host = orig
+    if fault == "stall":
+        time.sleep(3 * wait_s)  # let the stalled gather finish before the buffers go away
+    buf.fetcher.owns_tables = False
+    buf.destroy()
+    os.environ.pop("SM120_ENGRAM_GRAPH_WAIT_S", None)
+    ok = clean is None and raised is not None and dt < wait_s * 2 + 1
+    return ok, (f"clean replay passes the check: {clean is None}; faulty replay returned after {dt:.2f} s "
+                f"(budget {wait_s} s), check raised: {raised!r}")
 
 
 # ------------------------------------------------------------------------------------------------ benchmark

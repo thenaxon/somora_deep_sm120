@@ -24,6 +24,9 @@ of them; `sm120_patches_engram.APPLIED` lists what ran.
     E7  engine/llm_engine.py LLMEngine.add_request / abort_request report every admitted prompt to the engram
         prefetcher (sm120_engram.EngramPrefetcher; E3 starts it, E6 hands it the hash metadata): its rows are read
         into the page cache ahead of the prefill. Advisory only: the gather is unchanged.
+    E9  engine/llm_engine.py LLMEngine.step / flush_inflight_reqs: after the step (its outputs synchronized, not yet
+        returned) sm120_engram.check_graph_fetch() raises if an in-graph engram fetch failed or timed out, so no
+        output of that step is used (host / uring tables with CUDA graphs).
     E8  engine/llm_engine.py LLMEngine._init_cache: in SM120_ENGRAM_MODE=pinned, the KV sizing errors ("No available
         memory for the cache blocks", max seq len too large) get a hint with the GPU memory the registration took.
     E4  (only SM120_ENGRAM_TK=torch) tile_kernels.engram.{engram_hash,fused_weight,engram_gate_fwd} ->
@@ -297,9 +300,18 @@ def _patch_model_registry(mod):
 
             sm120_engram.set_hash_metadata(self.ngram_multipliers, self.ngram_vocab_sizes, self.ngram_offsets)
 
+    orig_fwd = cls.forward
+
+    def forward(self, kv_caches, input_metadata, *args, **kwargs):
+        if getattr(self, "engram_runtime", None) is not None:  # E7: only prefill tokens count against the read-ahead
+            import sm120_engram
+
+            sm120_engram.set_step_is_prompt(bool(getattr(input_metadata, "is_prompt", True)))
+        return orig_fwd(self, kv_caches, input_metadata, *args, **kwargs)
+
     __init__._sm120_engram = True
-    cls.__init__ = __init__
-    _note("E6 DeepseekModel.__init__: register engram models for graph prestaging")
+    cls.__init__, cls.forward = __init__, forward
+    _note("E6 DeepseekModel.__init__ / forward: register engram models for graph prestaging, step kind for E7")
 
 
 def prestage_for_replay(input_metadata) -> None:
@@ -372,6 +384,30 @@ def _patch_admission(mod):
     _note("E7 LLMEngine.add_request / abort_request: prompts reported to the engram prefetcher")
 
 
+# ------------------------------------------------------------------------------------------------ E9
+def _patch_step_check(mod):
+    """E9: a failed in-graph engram fetch fails the engine step instead of routing its outputs."""
+    cls = mod.LLMEngine
+    if getattr(cls.step, "_sm120_engram", False):
+        return
+    import sys
+
+    def wrap(orig):
+        def run(self, *args, **kwargs):
+            out = orig(self, *args, **kwargs)
+            eng = sys.modules.get("sm120_engram")
+            if eng is not None and eng._FETCHERS:
+                eng.check_graph_fetch()
+            return out
+
+        run._sm120_engram = True
+        return run
+
+    cls.step = wrap(cls.step)
+    cls.flush_inflight_reqs = wrap(cls.flush_inflight_reqs)
+    _note("E9 LLMEngine.step / flush_inflight_reqs: a failed in-graph engram fetch fails the step")
+
+
 # ------------------------------------------------------------------------------------------------ E8
 def _patch_init_cache(mod):
     """E8: DeepInfer sizes the KV cache from the free GPU memory after profiling. In pinned mode the registration of the
@@ -435,5 +471,6 @@ def install() -> None:
     when("deepinfer.worker.cuda_graph_runner")(_patch_graph_replay)
     when("deepinfer.engine.llm_engine")(_patch_admission)
     when("deepinfer.engine.llm_engine")(_patch_init_cache)
+    when("deepinfer.engine.llm_engine")(_patch_step_check)
     if os.environ.get("SM120_ENGRAM_TK", "").strip().lower() == "torch":
         when("tile_kernels.engram")(_patch_tile_kernels)

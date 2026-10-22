@@ -101,7 +101,8 @@ def _worker(rank: int, init_file: str, q):
                 outs[m] = eps["fn"](x, ids, w, is_prompt=True)
                 rows[m] = dict(moved)
                 if m in B12X_MODES:  # b12x JIT per bucket and rank is slow: the real experts on two modes only
-                    cos[m] = T.cos(eps["b12x"](x, ids, w, is_prompt=True), full(x, ids, w)) if n else 1.0
+                    got = eps["b12x"](x, ids, w, is_prompt=True)  # every rank joins the collectives, also with 0 rows
+                    cos[m] = T.cos(got, full(x, ids, w)) if n else 1.0
             os.environ.pop("SM120_EP_VARLEN", None)
             ref = outs["0"]
             same = {m: ref.shape == outs[m].shape and torch.equal(ref.view(torch.int16), outs[m].view(torch.int16))

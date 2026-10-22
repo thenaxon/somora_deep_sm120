@@ -569,25 +569,39 @@ def _exit_start_failed(exc: BaseException, dp_rank) -> None:
     os._exit(3)
 
 
-def _deterministic_moe_on_ep(args) -> str | None:
-    """b12x 1.5.1 deterministic_output (SM120_MOE_DETERMINISTIC, also turned on by DEEPINFER_BATCH_INVARIANT=1 or
-    B12X_DYNAMIC_DETERMINISTIC_OUTPUT=1) gives wrong rows: with dynamic tiles below 64 (also b12x's own choice, so a
-    single GPU is hit too) and for masked routes (topk_ids -1, which every EP rank uses for the other ranks' experts),
-    whose stale scratch is summed in. Returns the reason to refuse, or None. --deterministic (torch MoE) is not
-    affected; SM120_ALLOW_B12X_DETERMINISTIC=1 allows it anyway (tests of the b12x path)."""
+B12X_DETERMINISTIC_VALIDATED = "1.5.1"  # the b12x version sm120_moe's deterministic_output workarounds were validated on
+
+
+def _deterministic_moe_notes(args) -> list[tuple[int, str]]:
+    """Start-up log lines for b12x's deterministic MoE (SM120_MOE_DETERMINISTIC, also turned on by
+    DEEPINFER_BATCH_INVARIANT=1 or B12X_DYNAMIC_DETERMINISTIC_OUTPUT=1). b12x 1.5.1's deterministic_output has two bugs
+    (wrong rows below dynamic tile 64, stale scratch summed for masked routes); sm120_moe works around both (tile >= 64,
+    masked routes sent to a local expert with weight 0), so the mode is allowed. 0.3.0 refused it;
+    SM120_ALLOW_B12X_DETERMINISTIC, its override, is still accepted and has no effect."""
     on = lambda name: os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")  # noqa: E731
-    if args.deterministic or on("SM120_ALLOW_B12X_DETERMINISTIC"):
-        return None
-    if os.environ.get("SM120_MOE_IMPL", "b12x").strip().lower() == "torch":
-        return None
-    det = os.environ.get("SM120_MOE_DETERMINISTIC", "auto").strip().lower()
-    if det in ("0", "false", "no", "off"):
-        return None
+    if args.deterministic or os.environ.get("SM120_MOE_IMPL", "b12x").strip().lower() == "torch":
+        return []
+    if os.environ.get("SM120_MOE_DETERMINISTIC", "auto").strip().lower() in ("0", "false", "no", "off"):
+        return []
     names = [n for n in ("SM120_MOE_DETERMINISTIC", "DEEPINFER_BATCH_INVARIANT", "B12X_DYNAMIC_DETERMINISTIC_OUTPUT") if on(n)]
     if not names:
-        return None
-    return (f"{'/'.join(names)}: b12x 1.5.1's deterministic MoE output is wrong for some batch sizes and with expert "
-            "parallelism. Use --deterministic (torch MoE) for reproducible outputs, or SM120_MOE_DETERMINISTIC=0")
+        return []
+    msg = (f"deterministic b12x MoE ({'/'.join(names)}): bit-exact run to run, slower decode (1.06-1.19x on one GPU)")
+    if args.dp > 1:
+        msg += (f"; with --dp {args.dp} each rank also computes the routes to the other ranks' experts "
+                f"((dp-1)/dp of all routes) at weight 0")
+    notes = [(logging.INFO, msg)]
+    try:
+        from importlib.metadata import version
+
+        v = version("b12x")
+    except Exception:  # noqa: BLE001
+        v = None
+    if v != B12X_DETERMINISTIC_VALIDATED:
+        notes.append((logging.WARNING, f"deterministic b12x MoE: installed b12x is {v or 'unknown'}; the workarounds in "
+                                       f"sm120_moe for b12x deterministic_output bugs were validated on "
+                                       f"{B12X_DETERMINISTIC_VALIDATED} only (tests/sweep_moe_deterministic.py checks it)"))
+    return notes
 
 
 def main() -> int:
@@ -654,12 +668,12 @@ def main() -> int:
     # docker stop / kill -TERM: run the finally blocks (engine shutdown here, rank shutdown in the dp proxy) instead
     # of dying in place; the default SIGTERM action skips them.
     signal.signal(signal.SIGTERM, _sigterm)
-    reason = _deterministic_moe_on_ep(args)
-    if reason:
-        ap.error(reason)
     if args.mtp_varlen and (args.nextn <= 0 or not args.graphs):
         ap.error("--mtp-varlen needs --nextn > 0 and --graphs (DeepInfer profiles the decode graphs for its cost model)")
     logging.basicConfig(level=args.log_level, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    if args.dp_rank is None:  # once per server (the --dp proxy's ranks inherit the environment)
+        for level, note in _deterministic_moe_notes(args):
+            log.log(level, note)
     if args.dp_rank is None:  # once per server, not in the per-GPU children of --dp
         import banner
 

@@ -13,7 +13,16 @@ before 1.0 any minor release may change interfaces.
   - masked routes (id -1) summed stale scratch rows. With `--dp` every rank masks the routes to the other ranks'
     experts, so real tokens were wrong (single GPU: only discarded padding rows). They now go to a local expert with
     weight 0.
-  The default b12x MoE and `--deterministic` (torch MoE) were not affected. New tests in `tests/test_gemm_moe_graphs.py`.
+  The default b12x MoE and `--deterministic` (torch MoE) were not affected. New tests in `tests/test_gemm_moe_graphs.py`
+  and `tests/sweep_moe_deterministic.py`. Upstream: [flashinfer-ai/flashinfer#7021](https://github.com/flashinfer-ai/flashinfer/issues/7021).
+
+### Changed
+- The server no longer refuses b12x's deterministic MoE (0.3.0 did). It logs one start-up line (bit-exact, slower
+  decode, with `--dp N` the masked routes computed at weight 0) and a warning if the installed b12x is not 1.5.1,
+  the version the workarounds were validated on. `SM120_ALLOW_B12X_DETERMINISTIC`, the 0.3.0 override, is still
+  accepted and has no effect.
+- Deterministic MoE cost (full-depth test model, RTX 5090, CUDA graphs, TPOT B=1/8/32): 16.1/20.8/25.4 ->
+  19.1/23.4/27.0 ms, 1.06-1.19x (0.2.x: 2-2.9x with the small tiles that gave wrong rows).
 
 ## [0.3.0] - 2026-10-22
 

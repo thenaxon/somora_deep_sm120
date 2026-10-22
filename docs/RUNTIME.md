@@ -68,16 +68,16 @@ rows / `mtp_info_read_rows`) or the MTP info pool with several requests. The ser
 
 ### Deterministic MoE: cost
 
-**Warning (0.3.0):** b12x 1.5.1's `deterministic_output` is wrong for some batch sizes (dynamic tiles below 64) and with expert parallelism (masked routes); the server refuses it; use the torch MoE for reproducible outputs. `SM120_MOE_DETERMINISTIC=1` (or `tools/run_deepinfer.py --batch-invariant`) makes b12x `fused_moe` bit-exact run to run
+b12x 1.5.1's `deterministic_output` is wrong for some batch sizes (dynamic tiles below 64) and with expert parallelism (masked routes). `sm120_moe` works around both since 0.3.1 (the 0.3.0 server refused the mode); the server logs a warning if the installed b12x is not 1.5.1, the version the workarounds were validated on (`tests/sweep_moe_deterministic.py`). `SM120_MOE_DETERMINISTIC=1` (or `tools/run_deepinfer.py --batch-invariant`) makes b12x `fused_moe` bit-exact run to run
 ([MOE_GEMM.md](MOE_GEMM.md) section 5). CUDA graphs, prompt 256, 128 generated tokens, TPOT ms default -> deterministic:
 
 | model | B=1 | B=8 | B=32 |
 |---|---|---|---|
-| 3-layer test model | 2.3 -> 4.6 | 2.6 -> 5.2 | 3.6 -> 6.7 |
-| YOCO test model | 4.3 -> 11.0 | 6.0 -> 11.9 | 8.3 -> 16.1 |
-| full-depth test model | 16.1 -> 46.1 | 20.4 -> 42.2 | 25.6 -> 47.8 |
+| full-depth test model, 0.3.1 | 16.1 -> 19.1 | 20.8 -> 23.4 | 25.4 -> 27.0 |
+| same, 0.2.x (smaller tiles, wrong for some shapes) | 16.1 -> 46.1 | 20.4 -> 42.2 | 25.6 -> 47.8 |
 
-That is 2-2.9x slower decode, so it is meant for tests and reproducibility only and stays off by default. The server's
+That is 1.06-1.19x slower decode on one GPU (with `--dp N` plus the masked routes each rank computes at weight 0,
+not measured yet); the mode stays off by default. The server's
 `--deterministic` flag is a different mechanism: it switches the MoE to the exact torch reference
 (`SM120_MOE_IMPL=torch`), which is also reproducible and is what the server test suite uses.
 

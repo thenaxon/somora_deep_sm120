@@ -322,8 +322,10 @@ backends. This holds for greedy decoding and for seeded sampling (DeepInfer's sa
 So **b12x `fused_moe` is not run-to-run deterministic**: the logits differ slightly, and the chaotic truncated test model amplifies
 that into different tokens. `--deterministic` sets `SM120_MOE_IMPL=torch`; then the server's greedy tokens equal
 `run_deepinfer.py`'s exactly (checked by `test_server.py`). The deterministic b12x mode
-(`SM120_MOE_DETERMINISTIC=1`, [RUNTIME.md](RUNTIME.md)) is refused by the server: b12x 1.5.1's `deterministic_output` is wrong for some batch sizes (dynamic tiles below 64) and with expert parallelism (masked routes)
-(`SM120_ALLOW_B12X_DETERMINISTIC=1` overrides, for tests of that path only).
+(`SM120_MOE_DETERMINISTIC=1`, [RUNTIME.md](RUNTIME.md)) is also bit-exact run to run, 1.06-1.19x slower in decode on one GPU (with
+`--dp N` each rank also computes the routes to the other ranks' experts, at weight 0). The server logs this at start-up,
+plus a warning if the installed b12x is not 1.5.1, on which the workarounds for its `deterministic_output` bugs were
+validated. 0.3.0 refused the mode; `SM120_ALLOW_B12X_DETERMINISTIC`, its override, is still accepted and has no effect.
 
 ## Test results (RTX 5090, 3-layer test checkpoint `ckpt3`, eager)
 

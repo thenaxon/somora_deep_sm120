@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import torch
 
-from . import _env, _sf
+from . import _dequant_triton, _env, _sf
 
 _WEIGHTS: dict = {}
 _PLANS: dict = {}
@@ -201,7 +201,9 @@ def linear(a: torch.Tensor, sfa: torch.Tensor, gran_k_a: int | None,
     m, k = map(int, a.shape)
     n = int(b.shape[0])
     w = _pack(b, sfb, gran_k_b)
-    x = _sf.dequant_fp8(a, sfa, gran_k_a, torch.bfloat16).contiguous()
+    x = _dequant_triton.dequant_fp8_rows(a, sfa, gran_k_a)  # one kernel, bit-identical to _sf.dequant_fp8
+    if x is None:
+        x = _sf.dequant_fp8(a, sfa, gran_k_a, torch.bfloat16).contiguous()
     out = torch.empty((m, n, 1), dtype=torch.bfloat16, device=a.device)
     if m == 0:
         return out[:, :, 0]

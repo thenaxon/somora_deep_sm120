@@ -25,7 +25,7 @@ benchmark side in [RUNTIME.md](RUNTIME.md).
 | `SM120_MK_ALIGNMENT` | 128 | `get_theoretical_mk_alignment_for_contiguous_layout` (the value DeepGEMM returns on any arch other than SM100) |
 | `SM120_MOE_TINY_DECODE` | `0` (default), `1`, `auto` | sets `B12X_W4A8_TINY_DECODE` unless set explicitly. `0`: dynamic path (faster, section 7). `1`/`auto`: tiny-decode only if b12x carries `patches/b12x-tiny-decode-swiglu.patch` |
 | `B12X_W4A8_TINY_DECODE` | from the above | `0` = b12x's dynamic path for T <= 4 (correct on unpatched b12x 1.5.1, whose tiny-decode ignores `swiglu_limit`) |
-| `SM120_MOE_DETERMINISTIC` | `auto` | `1`: b12x `deterministic_output` (no atomic top-k combine); `auto` = on with `DEEPINFER_BATCH_INVARIANT=1` (section 5) |
+| `SM120_MOE_DETERMINISTIC` | `auto` | `1`: b12x `deterministic_output` (no atomic top-k combine); `auto` = on with `DEEPINFER_BATCH_INVARIANT=1` (section 5). **Not safe with b12x 1.5.1** (wrong rows below tile 64 and for masked routes); the server refuses it |
 | `SM120_MOE_PLAN` | `caps` | `session`: one b12x `plan_execution` per layer with exact variants for every CUDA-graph size, prepared by a `PreparationSession` (autotuned with `SM120_B12X_AUTOTUNE=1`). Optional, within about 5 % of `caps`; forced off in deterministic mode |
 | `SM120_MOE_GRAPH_BUCKETS` | 0 | `1`: every captured CUDA-graph token count gets its own exact MoE plan (section 6) |
 | `SM120_B12X_AUTOTUNE` | 0 | `1`: block_fp8_linear plans are prepared by a b12x `PreparationSession` (candidate race, section 7) |

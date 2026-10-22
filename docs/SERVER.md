@@ -278,7 +278,7 @@ ranks (MIN all-reduce, `scheduler.hpp:296-340`).
 
   | both intervals | TTFT | mixed short TPOT p50 / p99 | loadgen tok/s, TPOT p99 |
   |---|---|---|---|
-  | 100 / 70 (DeepInfer's defaults) | 2.0 / 2.9 / 24.0 s | 27 / 57 ms | 376, 49 ms |
+  | 1 / 100 (0.2.4; DeepInfer's own defaults are 70 / 100) | 2.0 / 2.9 / 24.0 s | 27 / 57 ms | 376, 49 ms |
   | 1 | 0.24 / 1.1 / 8.8 s | 226 / 401 ms | – |
   | 8 | 0.70 / 1.24 / 9.8 s | 62 / 118 ms | 325, 81 ms |
   | 8, `--max-num-batched-tokens 2048` | 0.78 / 1.42 / 11.2 s | 42 / 71 ms | 363, 56 ms |
@@ -321,8 +321,9 @@ backends. This holds for greedy decoding and for seeded sampling (DeepInfer's sa
 
 So **b12x `fused_moe` is not run-to-run deterministic**: the logits differ slightly, and the chaotic truncated test model amplifies
 that into different tokens. `--deterministic` sets `SM120_MOE_IMPL=torch`; then the server's greedy tokens equal
-`run_deepinfer.py`'s exactly (checked by `test_server.py`). See [RUNTIME.md](RUNTIME.md) for the deterministic b12x mode
-(`SM120_MOE_DETERMINISTIC=1`).
+`run_deepinfer.py`'s exactly (checked by `test_server.py`). The deterministic b12x mode
+(`SM120_MOE_DETERMINISTIC=1`, [RUNTIME.md](RUNTIME.md)) is refused by the server: b12x 1.5.1's `deterministic_output` is wrong for some batch sizes (dynamic tiles below 64) and with expert parallelism (masked routes)
+(`SM120_ALLOW_B12X_DETERMINISTIC=1` overrides, for tests of that path only).
 
 ## Test results (RTX 5090, 3-layer test checkpoint `ckpt3`, eager)
 

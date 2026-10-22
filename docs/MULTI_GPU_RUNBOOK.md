@@ -27,12 +27,12 @@ Build on the host (about 6 minutes with a warm network; the finished image is ab
 
 ```bash
 git clone <this repo> somora_deep_sm120 && cd somora_deep_sm120
-docker build -t somora_deep_sm120:0.2.4 -f docker/Dockerfile .
+docker build -t somora_deep_sm120:0.3.0 -f docker/Dockerfile .
 ```
 
 If the host has no access to the repository (e.g. no GitHub credentials for a private checkout), clone the tag on
 another machine and copy the tree over, or build elsewhere and transfer the image:
-`docker save somora_deep_sm120:0.2.4 | ssh <host> docker load`. The build itself only needs network access to
+`docker save somora_deep_sm120:0.3.0 | ssh <host> docker load`. The build itself only needs network access to
 PyPI, the PyTorch wheel index and GitHub (for the pinned DeepInfer commit).
 
 ## 2. Checkpoint and mounts
@@ -162,8 +162,10 @@ All 4 rank processes map the same files, so the page cache holds one copy.
     quality set.
   - No `/dev/shm/psm_*` leftovers. Patch P11 unlinks the segment's name right after DeepInfer forks its multimodal
     workers, so the memory exists only while a process maps it, also after SIGKILL, OOM or `docker kill`. The server
-    handles SIGTERM (`docker stop`; the server is PID 1 through `exec` in the entrypoint) with a clean shutdown, and
-    the `--dp` proxy forwards it to its ranks. Before v0.1.1 every stopped engine left a 2 GB `psm_*` file in the
+    handles SIGTERM (`docker stop`; the server is PID 1 through `exec` in the entrypoint) with an orderly shutdown, and
+    the `--dp` proxy forwards it to its ranks. With `--dp 4` and pinned engram tables that takes longer than Docker's
+    default 10 s, so start the container with `--stop-timeout 120` (§5). A `docker stop` without it ends with SIGKILL
+    (exit 137) after 10 s; in the v0.3.0 acceptance that left no processes, GPU memory or shared memory behind. Before v0.1.1 every stopped engine left a 2 GB `psm_*` file in the
     host's `/dev/shm` (with `--ipc=host`); delete leftovers from older runs by hand.
 - **NUMA:** the image has libnuma1. On a multi-socket host add `--cap-add SYS_NICE`, otherwise the memory policy part of
   DeepInfer's binding is refused (CPU affinity still applies). Single-socket hosts skip the binding (patch P10).
@@ -171,7 +173,7 @@ All 4 rank processes map the same files, so the page cache holds one copy.
 ## 4. Validate the multi-GPU path first
 
 ```bash
-docker run --rm --gpus all --ipc=host --shm-size=32g --entrypoint bash somora_deep_sm120:0.2.4 -c '
+docker run --rm --gpus all --ipc=host --shm-size=32g --entrypoint bash somora_deep_sm120:0.3.0 -c '
   nvidia-smi topo -m
   torchrun --nproc_per_node 4 /opt/sm120/tests/bench_ep_comm.py --out /tmp/bench_ep_comm.json --moe
   python3 /opt/sm120/tests/test_ep_moe.py'
@@ -182,13 +184,16 @@ Then follow the remaining steps of [MULTI_GPU.md](MULTI_GPU.md) §6 (W=4 NCCL te
 ## 5. Launch
 
 ```bash
-docker run -d --name sm120-serve --gpus all --ipc=host --shm-size=32g --ulimit memlock=-1 -p 8100:8000 \
+docker run -d --name sm120-serve --gpus all --ipc=host --shm-size=32g --ulimit memlock=-1 --stop-timeout 120 -p 8100:8000 \
   -v /models/DeepSeek-V4.1-Flash:/models/ds41:ro -v /srv/sm120/cache:/cache -v /srv/work:/work \
-  -e SM120_EP_IMPL=allgather -e SM120_EP_TRANSPORT=nccl -e SM120_ENGRAM_MODE=<per §3> \
-  somora_deep_sm120:0.2.4 --model /models/ds41 --served-model-name deepseek-v4.1-flash \
-    --dp 4 --gpu-memory-utilization 0.92 --max-model-len 40960 --max-num-seqs 16 --max-num-batched-tokens 4096 \
-    --max-blocks 4096 --prefix-cache --no-graphs        # drop --no-graphs once eager works
+  -e SM120_EP_IMPL=allgather -e SM120_EP_TRANSPORT=nccl -e SM120_ENGRAM_MODE=pinned \
+  -e DEEPINFER_MULTIMODAL_POOL_SIZE_GB=1 \
+  somora_deep_sm120:0.3.0 --model /models/ds41 --served-model-name deepseek-v4.1-flash \
+    --dp 4 --nextn 7 --gpu-memory-utilization 0.95 --max-model-len 40960 --max-num-seqs 16 \
+    --max-num-batched-tokens 4096 --max-blocks 4096 --prefix-cache
 docker logs -f sm120-serve     # 4 ranks start (one engine process per GPU, NCCL EP group), then the dp proxy serves
+# recommended configuration on 4x RTX PRO 6000 (v0.3.0). Other engram modes (§3): replace SM120_ENGRAM_MODE.
+# A first bring-up can add --no-graphs --nextn 0 to check the eager path; then start as above.
 curl -s localhost:8100/health | python3 -m json.tool
 ```
 
@@ -202,8 +207,10 @@ curl -s localhost:8100/health | python3 -m json.tool
 - `--dp 4` means DP attention + EP MoE (`--ep` defaults to `--dp`). It runs one engine process per GPU on ports
   8001-8004 inside the container, plus a least-loaded proxy on 8000 (`server/dp_proxy.py`). Prefix caches are per rank.
 - Memory per GPU (estimate): about 73 GB of routed experts (384/4 per layer x 40 layers) plus about 10 GB replicated
-  (attention, mHC, embed/head, vision, MTP). That leaves about 10 GB for KV and activations at `0.92`. If it does not
-  start, lower `--max-num-batched-tokens` to 2048 first.
+  (attention, mHC, embed/head, vision, MTP); measured on the host: 80.1 GiB of weights per GPU. At `0.92` only about
+  0.17 GiB was left for the KV cache (1,600 blocks), and `pinned` mode (0.38 GiB of page tables per GPU) left none, so
+  the recommended setting is `0.95` (4,096 blocks, the `--max-blocks` cap). If it does not start, lower
+  `--max-num-batched-tokens` to 2048 or `--max-model-len` first.
 - With CUDA graphs, the DP-wide decode graph-size sync (`SM120_EP_DP_SYNC`, default on) makes every rank replay the
   same graph size in each step. The start-up capture (its eager warm-ups included) uses each graph's own size as EP
   rows (rows = T; all ranks capture the same sizes in the same order), so the collectives carry only the graph's
@@ -240,7 +247,7 @@ For each step:
 
 **Hang symptom.** The log stops after `CudaGraphRunner capture done` on some or all ranks, `/health` never answers, and
 the GPUs sit at 100 % utilization with no progress (ranks waiting in a collective). Stop the container
-(`docker stop`; the server shuts down on SIGTERM). Keep the `docker logs` of all ranks (each line is prefixed with the
+(`docker stop`; a hung rank is killed after the stop timeout). Keep the `docker logs` of all ranks (each line is prefixed with the
 rank's port) and report which rank stopped where. A hang during serving shows as `/health` timing out or TPOT
 growing without bound; the same applies.
 

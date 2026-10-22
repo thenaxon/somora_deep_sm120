@@ -6,7 +6,7 @@ before 1.0 any minor release may change interfaces.
 ## [Unreleased]
 
 ### Fixed
-- `SM120_MOE_DETERMINISTIC=1` (also on with `DEEPINFER_BATCH_INVARIANT=1` or `B12X_DYNAMIC_DETERMINISTIC_OUTPUT=1`) gave
+- b12x's deterministic MoE: `SM120_MOE_DETERMINISTIC=1` (also on with `DEEPINFER_BATCH_INVARIANT=1` or `B12X_DYNAMIC_DETERMINISTIC_OUTPUT=1`) gave
   wrong MoE outputs in two cases, both b12x 1.5.1 `deterministic_output` bugs:
   - plans with `dynamic_tile_m` < 64 (b12x's own choice, e.g. E=16 at 5-64 tokens, E=96 at 65-512): cos ~0 against
     the default path. The shim now uses at least 64 rows per tile in deterministic mode.
@@ -14,6 +14,20 @@ before 1.0 any minor release may change interfaces.
     experts, so real tokens were wrong (single GPU: only discarded padding rows). They now go to a local expert with
     weight 0.
   The default b12x MoE and `--deterministic` (torch MoE) were not affected. New tests in `tests/test_gemm_moe_graphs.py`.
+
+## [0.3.0] - 2026-10-22
+
+First public release, experimental. Accepted on 4× RTX PRO 6000 Blackwell as v0.3.0-rc1 (same code). 0.2.5 was not
+tagged; its changes are listed here.
+
+### Fixed
+- b12x's deterministic MoE (`SM120_MOE_DETERMINISTIC=1`, or `DEEPINFER_BATCH_INVARIANT=1` /
+  `B12X_DYNAMIC_DETERMINISTIC_OUTPUT=1`, which turn it on) gives wrong outputs with b12x 1.5.1: `deterministic_output`
+  writes wrong rows when the dynamic tile is below 64 (b12x's own choice for some batch sizes, also on one GPU), and it
+  does not zero the rows of masked routes (`topk_ids` -1), which every expert-parallel rank uses for the other ranks'
+  experts. The server now refuses it at start-up (`SM120_ALLOW_B12X_DETERMINISTIC=1` overrides, for tests).
+  `--deterministic` (torch MoE) and the default b12x MoE are not affected. The docs no longer recommend the mode.
+- The start log shows the effective prefill intervals (`prefill intervals: ...`).
 - `--dp > 1`: TTFT of about 2 s even for short prompts. With several DP ranks DeepInfer votes the step type, and a
   prefill happens at the `DEEPINFER_PREFILL_ATTEMPT_INTERVAL` points only if every rank has a waiting prompt. A
   request that only one rank holds waited for the next `DEEPINFER_PREFILL_ANY_ATTEMPT_INTERVAL` point (default 100
@@ -23,6 +37,25 @@ before 1.0 any minor release may change interfaces.
   now default to `auto`: 1 / 1 for `--dp 1`, 16 / 16 for `--dp > 1`, so that at least 16 decode steps run between two
   chunks. Measured on 4× RTX PRO 6000 (`--nextn 7`), against 0.2.4: TTFT 58 tokens 2.0 → 0.85 s, 4k 2.9 → 1.4 s, 32k
   24 → 11 s; mixed load short-chat TPOT p99 57 → 65 ms (401 ms with 1 / 1); loadgen 4096×16 376 → 388 tok/s. The image no longer sets the two `DEEPINFER_PREFILL_*` variables (an explicit `-e` still overrides).
+
+### Changed
+- Documentation for a public release: the README states the hardware the full model needs (4× RTX PRO 6000, about
+  256 GB RAM; a single RTX 5090 only runs truncated test checkpoints), the recommended configuration
+  (`SM120_ENGRAM_MODE=pinned`, `--gpu-memory-utilization 0.95`, `--nextn 7`) and the current results against vLLM;
+  docs/RESULTS.md has the v0.3.0 measurements and the progress since v0.2.0; the runbook's launch command is the
+  recommended configuration. Start-up banner: "RTX PRO 6000 Blackwell" instead of "RTX 5090 / RTX PRO 6000".
+- `SM120_ENGRAM_MODE=pinned`: the start-up check counts the driver's host memory for the registration (about 14 MiB per
+  GiB of tables per rank), so `--dp 4` needs about 225 GiB available before start (was 215). A KV sizing failure in
+  pinned mode now says how much GPU memory the registration took and suggests raising `--gpu-memory-utilization`.
+  Logs: the registration's GPU and host cost per rank, and a host-memory breakdown after the fill.
+
+### Documentation
+- README and `docs/RESULTS.md`: the numbers of the v0.3.0-rc1 acceptance run on 4× RTX PRO 6000 (single user 136 / 84–87
+  tok/s for code / chat, 4k × 64 users 460 tok/s, 32 users within the latency targets like vLLM, 15-minute soak
+  without errors).
+- `docker run` examples use `--stop-timeout 120`: with `--dp 4` and pinned engram tables the orderly shutdown takes
+  longer than Docker's default 10 s, after which Docker kills the server (harmless, nothing is left behind).
+- README: about 12 GiB of host RAM stay free while serving on a 246 GiB host.
 
 ## [0.2.4] - 2026-10-22
 

@@ -22,3 +22,8 @@ It builds on, but does not redistribute, the following software:
 - DeepSeek-V4.1-Flash model weights and their reference inference code are NOT included. They are
   available from DeepSeek under their own license terms. The validation tools in tools/ref/ expect
   the user to supply them.
+
+- Some approaches were taken over, as ideas and reimplemented here, from studying vLLM
+  (https://github.com/vllm-project/vllm, Apache License 2.0) and community forks of it that serve
+  DeepSeek-V4.1-Flash on RTX PRO 6000: keeping the engram tables in pinned host memory gathered by the
+  GPU, and the evaluation scenarios. No vLLM source code is included.

@@ -27,7 +27,7 @@ DEEP_SM120 = (
 
 SOMORA_ASCII = ("somora", "deep sm120")
 
-TAGLINE = "DeepSeek DeepInfer on NVIDIA SM120 (RTX 5090 / RTX PRO 6000 Blackwell)"
+TAGLINE = "DeepSeek DeepInfer on NVIDIA SM120 (RTX PRO 6000 Blackwell)"
 MOTTO = "Run. Rest. Dream."
 
 MINT = "\x1b[38;2;126;184;154m"  # somora brand mint #7EB89A

@@ -30,7 +30,7 @@ Environment (all optional):
     SM120_ENGRAM_PREFAULT_HEADROOM_GB=<g>   prefault only if the tables fit into MemAvailable minus g GiB (default
                                             4); SM120_ENGRAM_PREFAULT=force prefaults regardless
     SM120_ENGRAM_RESIDENCY_INTERVAL=<s>     log the tables' page-cache residency every s seconds (default 0 = off)
-    SM120_ENGRAM_MODE=pinned                the tables once in shared pinned host memory (memfd), registered in every
+    SM120_ENGRAM_MODE=pinned                the tables once in shared pinned host memory (memfds), registered in every
                                             rank, GPU gathers; SM120_ENGRAM_RANK_HOST_GB (5) per rank +
                                             SM120_ENGRAM_PIN_HEADROOM_GB (6) must fit, else start-up fails
     SM120_ENGRAM_PIN=0|mlock                after load: prefault and mlock the tables once (shared by all ranks);
@@ -51,6 +51,7 @@ See docs/ENGRAM.md for the semantics and DeepInfer's data path.
 
 from __future__ import annotations
 
+import ctypes
 import json
 import math
 import mmap
@@ -784,9 +785,28 @@ def shared_layout(ckpt_dir: str) -> tuple[list, int]:
     return out, off
 
 
-def create_shared_tables(ckpt_dir: str, ranks: int = 1) -> int | None:
-    """Proxy / single server, before any rank starts: create the shared segment for SM120_ENGRAM_MODE=pinned and export
-    SM120_ENGRAM_SHM_FD. Fails (EngramResidencyError) unless the tables plus the ranks' own host memory
+def _shm_chunk(size: int) -> int:
+    """Bytes per memfd of the segment (SM120_ENGRAM_SHM_CHUNK_GB, default 8; 0 = one memfd). The kernel frees a memfd's
+    pages in the one thread that drops its last reference, about 0.06 s per GiB (2.4 s for 40 GiB on the RTX 5090 test
+    machine, ~12 s for the full 188.8 GiB tables: longer than docker stop's grace period; fallocate(PUNCH_HOLE) from
+    several threads is no faster, shmem serialises it on the inode). Separate memfds are freed in parallel
+    (release_shared_fds): 8 x 5 GiB in 0.47 s."""
+    gb = float(_env("SM120_ENGRAM_SHM_CHUNK_GB", "8"))
+    return size if gb <= 0 else max(_SHM_ALIGN, min(size, _align(int(gb * 2**30), _SHM_ALIGN)))
+
+
+def release_shared_fds(fds: Sequence[int], threads: int = 16) -> float:
+    """Close the segment's memfds from parallel threads (each close of a last reference frees that chunk's pages);
+    returns the seconds it took."""
+    t0 = time.monotonic()
+    with ThreadPoolExecutor(max_workers=max(1, min(threads, len(fds)))) as pool:
+        list(pool.map(os.close, fds))
+    return time.monotonic() - t0
+
+
+def create_shared_tables(ckpt_dir: str, ranks: int = 1) -> tuple[int, ...] | None:
+    """Proxy / single server, before any rank starts: create the shared segment for SM120_ENGRAM_MODE=pinned (memfds of
+    _shm_chunk bytes, which every process maps back to back) and export SM120_ENGRAM_SHM_FD (comma-separated fds). Fails (EngramResidencyError) unless the tables plus the ranks' own host memory
     (SM120_ENGRAM_RANK_HOST_GB per rank, default 5: measured 3.3-4.5 GiB per rank on the RTX 5090 test machine), each
     rank's registration of the segment (_REG_HOST_PER_GIB: the driver's per-page bookkeeping in vmalloc plus the
     rank's page tables, 2.6 GiB per rank for the full tables) plus SM120_ENGRAM_PIN_HEADROOM_GB (default 6) fit into
@@ -807,17 +827,22 @@ def create_shared_tables(ckpt_dir: str, ranks: int = 1) -> int | None:
             f"(SM120_ENGRAM_PIN_HEADROOM_GB) > "
             f"MemAvailable {avail / 2**30:.1f} GiB; pinned tables could OOM the host without swap. Free host memory or "
             f"use SM120_ENGRAM_MODE=host / uring (docs/MULTI_GPU_RUNBOOK.md section 3)")
-    fd = os.memfd_create("sm120-engram-tables", 0)  # inheritable (pass_fds) and not tied to /dev/shm's size
-    os.ftruncate(fd, size)
-    os.environ["SM120_ENGRAM_SHM_FD"] = str(fd)
+    chunk = _shm_chunk(size)
+    fds = []
+    for a in range(0, size, chunk):
+        fd = os.memfd_create("sm120-engram-tables", 0)  # inheritable (pass_fds) and not tied to /dev/shm's size
+        os.ftruncate(fd, min(chunk, size - a))
+        fds.append(fd)
+    os.environ["SM120_ENGRAM_SHM_FD"] = ",".join(map(str, fds))
     os.environ["SM120_ENGRAM_SHM_SIZE"] = str(size)
+    os.environ["SM120_ENGRAM_SHM_CHUNK"] = str(chunk)
     os.environ["SM120_ENGRAM_SHM_CKPT"] = os.path.abspath(ckpt_dir)  # the ranks compute the same layout from it
     os.environ["SM120_ENGRAM_SHM_PID"] = str(os.getpid())
     os.environ["SM120_ENGRAM_SHM_RANKS"] = str(ranks)
     os.environ["SM120_ENGRAM_SHM_TOKEN"] = os.urandom(8).hex()
     print(f"[sm120_engram] pinned mode: shared segment for {len(layout)} engram tables, {size / 2**30:.1f} GiB "
-          f"(memfd {fd}); MemAvailable {(avail or 0) / 2**30:.1f} GiB", flush=True)
-    return fd
+          f"({len(fds)} memfds of up to {chunk / 2**30:.1f} GiB); MemAvailable {(avail or 0) / 2**30:.1f} GiB", flush=True)
+    return tuple(fds)
 
 
 # host memory a rank's cudaHostRegister of the segment costs besides the segment, per GiB of it (RTX 5090: 12 MiB of
@@ -829,15 +854,30 @@ _SHM = {}  # this process' mapping of the shared segment: {"mm", "base", "size",
 
 def _shared_mapping() -> dict:
     if not _SHM:
-        fd, size = int(os.environ["SM120_ENGRAM_SHM_FD"]), int(os.environ["SM120_ENGRAM_SHM_SIZE"])
-        try:
-            ours = os.readlink(f"/proc/self/fd/{fd}").startswith("/memfd:sm120-engram-tables")
-        except OSError:
-            ours = False
-        if not ours:  # not inherited (e.g. a multiprocessing spawn child): reopen it through the creator's fd table
-            fd = os.open(f"/proc/{os.environ['SM120_ENGRAM_SHM_PID']}/fd/{fd}", os.O_RDWR)
-        mm = mmap.mmap(fd, size, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ | mmap.PROT_WRITE)
-        base = np.frombuffer(mm, dtype=np.uint8, count=1).ctypes.data
+        fds, size = [int(x) for x in os.environ["SM120_ENGRAM_SHM_FD"].split(",")], int(os.environ["SM120_ENGRAM_SHM_SIZE"])
+        chunk = int(os.environ.get("SM120_ENGRAM_SHM_CHUNK") or size)
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.mmap.restype = ctypes.c_void_p
+        libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_long]
+        # one contiguous range over all memfds: reserve it, then map them over it in order (MAP_FIXED)
+        base = libc.mmap(None, size, 0, mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS, -1, 0)  # PROT_NONE
+        if base in (None, ctypes.c_void_p(-1).value):
+            raise OSError(ctypes.get_errno(), f"pinned mode: cannot reserve {size} bytes of address space")
+        for i, fd in enumerate(fds):
+            try:
+                ours = os.readlink(f"/proc/self/fd/{fd}").startswith("/memfd:sm120-engram-tables")
+            except OSError:
+                ours = False
+            if not ours:  # not inherited (e.g. a multiprocessing spawn child): reopen it through the creator's fd table
+                fd = os.open(f"/proc/{os.environ['SM120_ENGRAM_SHM_PID']}/fd/{fd}", os.O_RDWR)
+            a = i * chunk
+            got = libc.mmap(base + a, min(chunk, size - a), mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED | 0x10,
+                            fd, 0)  # MAP_FIXED
+            if not ours:
+                os.close(fd)  # the mapping keeps the memfd
+            if got != base + a:
+                raise OSError(ctypes.get_errno(), f"pinned mode: cannot map memfd {i} of the shared segment")
+        mm = memoryview((ctypes.c_uint8 * size).from_address(base)).cast("B")  # writable bytes over the whole range
         _SHM.update(mm=mm, base=base, size=size, registered=False)
     return _SHM
 

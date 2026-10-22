@@ -43,7 +43,7 @@ Pinned versions are listed in [COMPATIBILITY.md](COMPATIBILITY.md).
 ## Quickstart (4× RTX PRO 6000)
 
 ```bash
-git clone https://github.com/thenaxon/somora_deep_sm120 && cd somora_deep_sm120
+git clone <this repository> somora_deep_sm120 && cd somora_deep_sm120
 docker build -t somora_deep_sm120:0.3.0 -f docker/Dockerfile .      # ~6 min; clones DeepInfer at the pinned commit
 
 docker run -d --name sm120-serve --gpus all --ipc=host --shm-size=32g --ulimit memlock=-1 -p 8000:8000 \

@@ -24,6 +24,8 @@ of them; `sm120_patches_engram.APPLIED` lists what ran.
     E7  engine/llm_engine.py LLMEngine.add_request / abort_request report every admitted prompt to the engram
         prefetcher (sm120_engram.EngramPrefetcher; E3 starts it, E6 hands it the hash metadata): its rows are read
         into the page cache ahead of the prefill. Advisory only: the gather is unchanged.
+    E8  engine/llm_engine.py LLMEngine._init_cache: in SM120_ENGRAM_MODE=pinned, the KV sizing errors ("No available
+        memory for the cache blocks", max seq len too large) get a hint with the GPU memory the registration took.
     E4  (only SM120_ENGRAM_TK=torch) tile_kernels.engram.{engram_hash,fused_weight,engram_gate_fwd} ->
         sm120_engram torch versions (for bisecting the TileLang kernels on SM120).
 
@@ -370,6 +372,38 @@ def _patch_admission(mod):
     _note("E7 LLMEngine.add_request / abort_request: prompts reported to the engram prefetcher")
 
 
+# ------------------------------------------------------------------------------------------------ E8
+def _patch_init_cache(mod):
+    """E8: DeepInfer sizes the KV cache from the free GPU memory after profiling. In pinned mode the registration of the
+    shared segment took some of it (the driver's page tables, ~2 MiB per GiB), so a budget that just fitted in host mode
+    can fail; say so instead of only the stock "Try increasing `gpu_memory_utilization`"."""
+    cls = mod.LLMEngine
+    if getattr(cls._init_cache, "_sm120_engram", False):
+        return
+    orig = cls._init_cache
+
+    def _init_cache(self, *args, **kwargs):
+        try:
+            return orig(self, *args, **kwargs)
+        except ValueError as e:
+            import sys
+
+            sh = getattr(sys.modules.get("sm120_engram"), "_SHM", None) or {}
+            if not sh.get("registered") or "gpu_memory_utilization" not in str(e):
+                raise
+            util = getattr(getattr(self, "cache_config", None), "gpu_memory_utilization", None)
+            cur = f" (now {util:.2f})" if isinstance(util, float) else ""
+            raise ValueError(
+                f"{e}\nSM120_ENGRAM_MODE=pinned: registering the {sh['size'] / 2**30:.1f} GiB engram segment took "
+                f"{sh.get('gpu_cost', 0) / 2**20:.0f} MiB of GPU memory on this rank (the driver's page tables for the "
+                f"mapping), which the KV cache does not get. Raise --gpu-memory-utilization{cur}, e.g. to 0.95, or lower "
+                f"--max-model-len (docs/MULTI_GPU_RUNBOOK.md §3).") from e
+
+    _init_cache._sm120_engram = True
+    cls._init_cache = _init_cache
+    _note("E8 LLMEngine._init_cache: pinned-mode hint on KV sizing errors")
+
+
 # ------------------------------------------------------------------------------------------------ E4
 def _patch_tile_kernels(mod):
     import sm120_engram
@@ -400,5 +434,6 @@ def install() -> None:
     when("deepinfer.model_executor.models.deepseek")(_patch_model_registry)
     when("deepinfer.worker.cuda_graph_runner")(_patch_graph_replay)
     when("deepinfer.engine.llm_engine")(_patch_admission)
+    when("deepinfer.engine.llm_engine")(_patch_init_cache)
     if os.environ.get("SM120_ENGRAM_TK", "").strip().lower() == "torch":
         when("tile_kernels.engram")(_patch_tile_kernels)

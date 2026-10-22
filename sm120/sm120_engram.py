@@ -710,14 +710,21 @@ def _device_pointer(host_ptr: int) -> int:
 
 
 def _mem_available() -> int | None:
+    return _meminfo().get("MemAvailable")
+
+
+def _meminfo(path: str = "/proc/meminfo") -> dict:
+    """/proc/meminfo (or the VmPTE etc. of /proc/self/status) in bytes; {} if unreadable."""
+    out = {}
     try:
-        with open("/proc/meminfo") as f:
+        with open(path) as f:
             for line in f:
-                if line.startswith("MemAvailable:"):
-                    return int(line.split()[1]) * 1024
+                k, _, v = line.partition(":")
+                if v.strip().endswith("kB"):
+                    out[k] = int(v.split()[0]) * 1024
     except OSError:
         pass
-    return None
+    return out
 
 
 def open_table(ckpt_dir: str | None, layer_id: int, *, wloc: TensorLoc | None = None, sloc: TensorLoc | None = None,
@@ -780,19 +787,22 @@ def shared_layout(ckpt_dir: str) -> tuple[list, int]:
 def create_shared_tables(ckpt_dir: str, ranks: int = 1) -> int | None:
     """Proxy / single server, before any rank starts: create the shared segment for SM120_ENGRAM_MODE=pinned and export
     SM120_ENGRAM_SHM_FD. Fails (EngramResidencyError) unless the tables plus the ranks' own host memory
-    (SM120_ENGRAM_RANK_HOST_GB per rank, default 5: measured 3.3-4.5 GiB per rank on the RTX 5090 test machine plus
-    the driver's bookkeeping for the registration) plus SM120_ENGRAM_PIN_HEADROOM_GB (default 6) fit into
+    (SM120_ENGRAM_RANK_HOST_GB per rank, default 5: measured 3.3-4.5 GiB per rank on the RTX 5090 test machine), each
+    rank's registration of the segment (_REG_HOST_PER_GIB: the driver's per-page bookkeeping in vmalloc plus the
+    rank's page tables, 2.6 GiB per rank for the full tables) plus SM120_ENGRAM_PIN_HEADROOM_GB (default 6) fit into
     MemAvailable now, before the ranks start."""
     if _env("SM120_ENGRAM_MODE", "auto") != "pinned" or not _engram_layer_ids(ckpt_dir):
         return None
     layout, size = shared_layout(ckpt_dir)
     per_rank = float(_env("SM120_ENGRAM_RANK_HOST_GB", "5")) * 2**30
+    reg = size * _REG_HOST_PER_GIB / 2**30
     headroom = float(_env("SM120_ENGRAM_PIN_HEADROOM_GB", "6")) * 2**30
     avail = _mem_available()
-    if avail is not None and size + ranks * per_rank + headroom > avail:
+    if avail is not None and size + ranks * (per_rank + reg) + headroom > avail:
         raise EngramResidencyError(
-            f"SM120_ENGRAM_MODE=pinned: engram tables {size / 2**30:.1f} GiB + {ranks} ranks x {per_rank / 2**30:.0f} GiB "
-            f"(SM120_ENGRAM_RANK_HOST_GB) + headroom {headroom / 2**30:.0f} GiB (SM120_ENGRAM_PIN_HEADROOM_GB) > "
+            f"SM120_ENGRAM_MODE=pinned: engram tables {size / 2**30:.1f} GiB + {ranks} ranks x ({per_rank / 2**30:.0f} GiB "
+            f"(SM120_ENGRAM_RANK_HOST_GB) + {reg / 2**30:.1f} GiB registration) + headroom {headroom / 2**30:.0f} GiB "
+            f"(SM120_ENGRAM_PIN_HEADROOM_GB) > "
             f"MemAvailable {avail / 2**30:.1f} GiB; pinned tables could OOM the host without swap. Free host memory or "
             f"use SM120_ENGRAM_MODE=host / uring (docs/MULTI_GPU_RUNBOOK.md section 3)")
     fd = os.memfd_create("sm120-engram-tables", 0)  # inheritable (pass_fds) and not tied to /dev/shm's size
@@ -805,6 +815,10 @@ def create_shared_tables(ckpt_dir: str, ranks: int = 1) -> int | None:
           f"(memfd {fd}); MemAvailable {(avail or 0) / 2**30:.1f} GiB", flush=True)
     return fd
 
+
+# host memory a rank's cudaHostRegister of the segment costs besides the segment, per GiB of it (RTX 5090: 12 MiB of
+# driver vmalloc + 2 MiB of page tables for 4 KiB pages; not reclaimable while registered)
+_REG_HOST_PER_GIB = 14 << 20
 
 _SHM = {}  # this process' mapping of the shared segment: {"mm", "base", "size", "registered"}
 
@@ -843,7 +857,7 @@ def open_shared_table(ckpt_dir: str | None, layer_id: int, wloc: TensorLoc, sloc
         device = torch.device("cuda", torch.cuda.current_device())
     if not sh["registered"]:
         t0 = time.time()
-        free0 = torch.cuda.mem_get_info(device)[0]
+        free0, mi0, pte0 = torch.cuda.mem_get_info(device)[0], _meminfo(), _meminfo("/proc/self/status").get("VmPTE", 0)
         err = torch.cuda.cudart().cudaHostRegister(sh["base"], sh["size"], 0x01 | 0x02)  # Portable | Mapped
         if int(getattr(err, "value", err)) != 0:
             raise EngramResidencyError(f"pinned mode: cudaHostRegister of the {sh['size'] / 2**30:.1f} GiB shared "
@@ -852,8 +866,15 @@ def open_shared_table(ckpt_dir: str | None, layer_id: int, wloc: TensorLoc, sloc
         sh["device_base"] = _device_pointer(sh["base"])
         # the driver's GPU page tables for the mapping (~2 MiB per GiB of 4 KiB host pages) come out of the KV budget
         cost = free0 - torch.cuda.mem_get_info(device)[0]
+        sh["gpu_cost"] = cost
+        # host side, besides the segment itself: this process' page tables for the mapping (~2 MiB per GiB) and the
+        # driver's per-page bookkeeping in vmalloc (~12 MiB per GiB, RTX 5090); VmallocUsed is system-wide, so ranks
+        # registering at the same time see each other's
+        pte = _meminfo("/proc/self/status").get("VmPTE", 0) - pte0
+        vm = _meminfo().get("VmallocUsed", 0) - mi0.get("VmallocUsed", 0)
         print(f"[sm120_engram] pinned mode: registered the shared segment ({sh['size'] / 2**30:.1f} GiB) for "
-              f"{device} in {time.time() - t0:.1f} s, {cost / 2**20:.0f} MiB of GPU memory", flush=True)
+              f"{device} in {time.time() - t0:.1f} s, {cost / 2**20:.0f} MiB of GPU memory; host: page tables "
+              f"+{pte / 2**20:.0f} MiB, driver vmalloc +{vm / 2**20:.0f} MiB", flush=True)
 
     def views(off: int, width: int):
         host = torch.frombuffer(sh["mm"], dtype=torch.uint8, count=rows * width, offset=off).view(rows, width)
@@ -907,9 +928,13 @@ def fill_shared_tables(threads: int = 8, chunk: int = 64 << 20) -> dict:
         os.close(fd)
     total = sum(len(j[2]) for j in jobs)
     dt = time.time() - t0
+    mi = _meminfo()
+    gib = lambda k: f"{mi.get(k, 0) / 2**30:.1f}"  # noqa: E731
     print(f"[sm120_engram] pinned mode: read {total / 2**30:.1f} GiB of engram tables into the shared segment in "
-          f"{dt:.0f} s ({total / max(dt, 1e-9) / 1e9:.1f} GB/s); MemAvailable {(_mem_available() or 0) / 2**30:.1f} GiB",
-          flush=True)
+          f"{dt:.0f} s ({total / max(dt, 1e-9) / 1e9:.1f} GB/s); MemAvailable {gib('MemAvailable')} GiB (Shmem "
+          f"{gib('Shmem')}, AnonPages {gib('AnonPages')}, VmallocUsed {gib('VmallocUsed')}, PageTables "
+          f"{gib('PageTables')}, page cache w/o Shmem {(mi.get('Cached', 0) - mi.get('Shmem', 0)) / 2**30:.1f}, "
+          f"SUnreclaim {gib('SUnreclaim')} GiB)", flush=True)
     return {"pinned_fill_s": round(dt, 1), "pinned_gib": round(total / 2**30, 1)}
 
 

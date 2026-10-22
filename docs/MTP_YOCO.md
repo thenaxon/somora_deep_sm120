@@ -226,6 +226,35 @@ bash /opt/sm120/tests/mtp_check.sh       # nextn 0 / 5, eager / graphs, and next
 - Both MTP backbones differ from `ckpt3` / `ckpt_yoco` in expert count, so a backbone logit comparison needs its own
   reference run (which ignores the MTP layers).
 
+## 8a. YOCO compact prefill truncation (`--yoco-compact`, opt-in)
+
+DeepInfer can run the YOCO consumer half (layers >= `n_prefill_layer`, 20 on V4.1) on only the last KEEP rows of each
+prefill: `DEEPINFER_YOCO_PREFILL_TRUNCATION_MODE=compact` with `DEEPINFER_YOCO_PREFILL_KEEP_TOKENS` (DeepSeek's own
+benchmark uses 140). The caches are still written for every token from layer 20. The server switch is
+`--yoco-compact [KEEP]` (default KEEP 140, must be >= 128 + nextn + 1 for the DSpark window and the verify rows); it is
+off by default.
+
+Measured (RTX 5090, ckpt_full, server via the entrypoint, graphs, `--max-num-batched-tokens 4096`):
+
+| prompt | off | compact (KEEP 140) |
+|---|---|---|
+| 50 tokens | 0.36 s | 0.38 s (shorter than KEEP: nothing to skip) |
+| 4096 tokens | 1.04-1.11 s | 0.65-0.76 s (1.5x) |
+| 32k tokens | 6.68-6.97 s | 4.34-4.35 s (1.55x) |
+
+Exactness:
+- Greedy tokens on ckpt_full (deterministic MoE, 327-token prompt): 17/17 identical to off, eager and graphs.
+- Last prefill row vs off: cos 0.9987, same top-1. All 16 decode steps: cos >= 0.9963, top-1 identical.
+- Not exact for the earlier kept rows: cos min 0.71 over the 140 kept rows, top-1 0.936. The consumer layers'
+  SWA state only covers the rows they computed, so the first rows of the kept window lack their history. That is why
+  KEEP must exceed the 128-token window: the last rows, which sampling and DSpark use, see a full window.
+- **Not compatible with `--prefix-cache`** (the server refuses the combination). Which rows are kept depends on the
+  prompt's total length (`clip_prefix = clamp(data_len - KEEP - q_start, 0, q_len - 1)`), so the consumer-layer state at
+  a snapshot position inside prompt A differs from the state prompt B would have there. `tests/test_prefix_cache.py`
+  on ckpt_yoco with compact: 3/17 cached == chunked.
+- With `--dp`, the EP layers of the consumer half exchange the kept-row counts once per prefill step (`sm120_patches`
+  P13 records `n_prefill_layer`) and pad to them instead of to the step's tokens (`tests/test_ep_dp_sync.py`).
+
 ## 9. Caveats
 
 - DeepInfer scores candidate blocks in bf16 (`candidate_block_max` on bf16 logits) while the reference uses fp32 scores.

@@ -492,6 +492,24 @@ class App:
 _MAIN_PID = os.getpid()
 
 
+def _yoco_compact_env(args, ap) -> None:
+    """--yoco-compact KEEP -> DeepInfer's compact YOCO prefill truncation; refused together with --prefix-cache.
+
+    With truncation, the consumer layers (>= n_prefill_layer) compute only the last KEEP rows of a prompt, so their
+    per-sequence state at a prefix position depends on the prompt's total length: a snapshot taken inside prompt A is
+    not the state prompt B would have there (tests/test_prefix_cache.py on ckpt_yoco: 3/17 exact)."""
+    mode = os.environ.get("DEEPINFER_YOCO_PREFILL_TRUNCATION_MODE", "off")
+    if args.yoco_compact:
+        keep = int(args.yoco_compact)
+        need = 128 + max(0, args.nextn) + 1
+        if keep < need:
+            ap.error(f"--yoco-compact {keep}: KEEP must be >= 128 + nextn + 1 = {need} (DSpark window + verify rows)")
+        os.environ["DEEPINFER_YOCO_PREFILL_TRUNCATION_MODE"] = mode = "compact"
+        os.environ["DEEPINFER_YOCO_PREFILL_KEEP_TOKENS"] = str(keep)
+    if mode != "off" and args.prefix_cache:
+        ap.error(f"YOCO prefill truncation ({mode}) is not exact with --prefix-cache: drop one of them")
+
+
 _CACHE_POLICY: dict = {}
 
 
@@ -544,6 +562,10 @@ def main() -> int:
     ap.add_argument("--deterministic", action="store_true",
                     help="SM120_MOE_IMPL=torch: run-to-run reproducible outputs (b12x fused_moe is not), slower")
     ap.add_argument("--request-timeout", type=float, default=600.0, help="max seconds between two tokens")
+    ap.add_argument("--yoco-compact", type=int, nargs="?", const=140, default=0, metavar="KEEP",
+                    help="YOCO compact prefill truncation (DeepInfer DEEPINFER_YOCO_PREFILL_TRUNCATION_MODE=compact): layers "
+                         ">= n_prefill_layer run only the last KEEP rows of each prefill (default 140, >= 128 + nextn + 1). "
+                         "About 1.5x prefill on long prompts. Opt-in; not exact with --prefix-cache (refused)")
     ap.add_argument("--prefix-cache", action="store_true",
                     help="reuse computed prompt prefixes (prefix_cache; needs the patched _C: "
                          "PYTHONPATH=/opt/sm120/sm120:/work/deepinfer_pc DEEPINFER_ROOT=/work/deepinfer_pc)")
@@ -572,6 +594,7 @@ def main() -> int:
     ap.add_argument("--image-fetch-timeout", type=float, default=10.0, help="seconds per image URL fetch")
     ap.add_argument("--log-level", default="INFO")
     args = ap.parse_args()
+    _yoco_compact_env(args, ap)
     # docker stop / kill -TERM: run the finally blocks (engine shutdown here, rank shutdown in the dp proxy) instead
     # of dying in place; the default SIGTERM action skips them.
     signal.signal(signal.SIGTERM, _sigterm)

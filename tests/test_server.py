@@ -63,7 +63,7 @@ class Client:
         events, t_first, done = [], None, False
         buf = b""
         while True:
-            line = r.fp.readline()
+            line = r.readline()  # decoded body: chunk boundaries may split an SSE event
             if not line:
                 break
             buf = line.strip()

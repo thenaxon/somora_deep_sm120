@@ -5,6 +5,30 @@ before 1.0 any minor release may change interfaces.
 
 ## [Unreleased]
 
+### Fixed
+- `eval/loadgen.py`, `eval/scenarios.py`: a streamed request that ended with an error event, a malformed event or
+  without `[DONE]` / a finish reason counted as a success; it is now an error, and its tokens are reported separately
+  (`partial_out_tokens`). All eval and bench clients (`loadgen`, `scenarios`, `server/bench_client.py`,
+  `tests/test_server.py`, `tests/ttft_conc.py`) read SSE from the decoded HTTP body: with chunked transfer encoding
+  (vLLM) the raw socket could split an event. Shared parser `eval/sse.py`, test `tests/test_sse.py`.
+- A missing TPOT was reported as 0 ms and passed the `capacity` SLO; it is now None and a miss.
+- `tests/run_runtime_unit.sh`, `tests/determinism.sh`, `tests/e2e_matrix.sh`, `tests/mtp_check.sh`,
+  `tests/tests_engram_graph.sh` and `tools/compare.py` exit non-zero on failure (pipefail, collected exit codes,
+  integer tensors compared exactly, stale dumps removed per config, the engram negative control checked).
+  `compare.py`: exit 2 for an invalid comparison (different input ids, capture errors, missing hidden states unless
+  `--allow-missing-hidden`), `--decode-check identical|diverge` (exit 3; teacher-forced dumps are judged by the
+  decode logits, top-1 and `--diverge-kl`, because their decoded ids are the forced ones), `--known-deviation layer0`
+  for the documented layer-0 deviation (`e2e_matrix.sh` passes it, `TEST_KNOWN_DEVIATION` overrides).
+  `determinism.sh` never ran its comparison. `mtp_check.sh` printed the wrong `accepted_log` key. Test
+  `tests/test_compare_exit.py`.
+
+### Changed
+- Eval method (`eval/measure.py`, docs/EVAL.md): a per-run nonce at the start of every prompt (no prefix-cache
+  help, also across runs), an unmeasured warm-up per level with the same lengths, 3 repeats per level (median and
+  range), steady-state throughput, tails as p99 only from >= 100 samples (else the maximum, labelled),
+  `output_tokens_mean` and per-user tok/s always reported. `scenarios.py`: `ignore_eos` by default (`--allow-eos`),
+  `mixed` counts short requests only within the phase. `loadgen.py`: requests per level max(16, 3 x concurrency).
+
 ### Added
 - `SM120_PROFILE_DECODE=N` (diagnostics, off by default): every engine process that holds requests profiles N decode
   steps once (torch profiler; same per-category GPU and host tables as `SM120_PROFILE_PREFILL`), also per rank with

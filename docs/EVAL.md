@@ -9,7 +9,7 @@ All tools in `eval/` are stdlib-only clients of any OpenAI-compatible endpoint: 
 | `eval/compare_endpoints.py` | greedy A/B on identical token ids: exact match, first divergence, position-wise agreement, chosen-token logprob deltas, top-K overlap and deltas, near-tie classification of the divergence. Record/replay (`--save-a`, `--a file:PATH`) for endpoints that cannot run at the same time |
 | `compare_endpoints.py --teacher-forced` | numerical fidelity: both endpoints (and optionally DeepSeek's reference implementation) score the same continuation; top-1 agreement and KL per position; see [Numerical fidelity](#numerical-fidelity) |
 | `eval/scenarios.py` + `eval/prompts.json` | workload scenarios: realistic prompts (speculative decoding), many long prompts, shared-prefix assistant sessions, mixed long/short traffic, capacity under an SLO; see [Workload scenarios](#workload-scenarios) |
-| `eval/loadgen.py` | closed-loop load at concurrency 1/4/16/64 × prompt 512/4k/32k, 256 output tokens: TTFT, TPOT, E2E p50/p99, output and total tok/s; random token-id prompts (no prefix-cache help) |
+| `eval/loadgen.py` | closed-loop load at concurrency 1/4/16/64 × prompt 512/4k/32k, 256 output tokens, 3 repeats: TTFT, TPOT, E2E p50 and tail, output tok/s (wall and steady state, median and range), per-user tok/s; random token-id prompts with a per-run nonce (no prefix-cache help); see the method below |
 | `eval/quality_check.py` + `eval/quality_set.jsonl` | 28 prompts with known answers: math (5), Python code with asserts (3, `--exec-code` runs them in a separate `python3 -I` process with a timeout), German (4), a fact, an 8k-token passkey needle, tool calling (8), structured output (3) and images (3), see below. Items with `known_fail` (currently `math-reason`, which the model gets wrong without thinking mode) are reported as KFAIL/KPASS and not counted. Scores are reported per category |
 
 ## Requirements on the endpoint
@@ -142,19 +142,41 @@ endpoint, and writes `--out NAME` → `NAME.json` (all numbers) and `NAME.md` (t
 | scenario | what it sends | read it as |
 |---|---|---|
 | `realistic` | the bundled prompts (`eval/prompts.json`: 24 code, 24 German and 16 English chat prompts, written for this repo) at concurrency 1/4/16, greedy, 256 tokens | decode speed on real text. Speculative decoding only helps when drafts are accepted, and acceptance depends on the text: random token ids make every MTP/EAGLE engine look slow. `tokens_per_step` (this server: generated tokens per decode step of a sequence, 1 without speculative decoding, at most 1 + nextn; any concurrency) with `draft_acceptance_est` = (tokens_per_step - 1) / nextn, and `spec_acceptance` (vLLM `/metrics`: accepted / drafted tokens) show how much the drafts contribute |
-| `prefill` | 16/32/64 users, each with a distinct 8k/16k/32k-token document, all at once | prefill throughput and fairness: TTFT p50/p99/max, time until the last user has an answer, prompt tok/s. With DP attention every GPU prefills its own requests independently; with TP all GPUs work on one prefill at a time |
+| `prefill` | 16/32/64 users, each with a distinct 8k/16k/32k-token document, all at once | prefill throughput and fairness: TTFT p50 and tail, time until the last user has an answer, prompt tok/s. With DP attention every GPU prefills its own requests independently; with TP all GPUs work on one prefill at a time |
 | `shared-prefix` | 16 users × 4 turns; every user starts with the same ~6k-token system prompt (tool definitions and instructions) and continues their own conversation; run once with a shared and once with a per-user (`unique`) system prompt | what prefix caching buys: TTFT per turn for both variants, plus the endpoint's cache counters (`/health` of this server: hits and cached tokens; vLLM `/metrics`: prefix cache hits/queries). Turn 1 of `shared` and all turns of `unique` pay the full prefill on an engine without a prefix cache |
-| `mixed` | 8 short chats stream continuously; first alone, then with 16k-token requests arriving about every 4 s | head-of-line blocking: TTFT, TPOT p99 and the longest stall (`short_max_gap`) of the short streams, alone vs. with long prefills. Chunked prefill and how it is interleaved with decode decide this |
-| `capacity` | concurrency 1, 2, 4 … 128 with real prompts (or `--prompt-tokens N` synthetic documents), 256 tokens each, until an SLO is missed (default TTFT p99 ≤ 2 s, TPOT p99 ≤ 50 ms) | the number of concurrent users an endpoint serves within the SLO, and the throughput there; `missed` says which limit a level broke (ttft, tpot, errors). With a slow single-request prefill even c=1 can miss the TTFT limit: then the answer is 0 users, and `--full` shows the whole ramp |
+| `mixed` | 8 short chats stream continuously; first alone, then with 16k-token requests arriving about every 4 s | head-of-line blocking: TTFT, TPOT tail and the longest stall (`short_max_gap`) of the short streams, alone vs. with long prefills. Chunked prefill and how it is interleaved with decode decide this |
+| `capacity` | concurrency 1, 2, 4 … 128 with real prompts (or `--prompt-tokens N` synthetic documents), 256 tokens each, until an SLO is missed (default TTFT tail ≤ 2 s, TPOT tail ≤ 50 ms; the tail is a p99 from ≥ 100 samples, else the maximum) | the number of concurrent users an endpoint serves within the SLO, and the throughput there; `missed` says which limit a level broke (ttft, tpot, errors). With a slow single-request prefill even c=1 can miss the TTFT limit: then the answer is 0 users, and `--full` shows the whole ramp |
 
-**Fairness.** Run the same command with the same `--seed` against both endpoints; prompts depend only on the seed.
-Use the same `max_tokens` and temperature (default 0). `ignore_eos` only where a scenario forces it (prefill, mixed,
-capacity): realistic runs stop at EOS, so compare tok/s and TPOT, not wall time, when the two engines answer at
-different lengths. Run one endpoint at a time on the same GPUs, and give both the same `max_model_len`, the same KV
-budget and the same speculative setting (state `--nextn` / num_speculative_tokens in `--label`). Long synthetic
-documents are sized by characters (`--chars-per-token`, 3.6 for V4.1); the tables report the real prompt token counts.
-For vLLM, tool definitions in `shared-prefix` are plain text in the system prompt, so no tool parser is needed.
-Server statistics are optional: an endpoint without `/health` or `/metrics` just gets no cache or acceptance columns.
+**Method** (the same for `loadgen.py` and `scenarios.py`; `eval/sse.py`, `eval/measure.py`):
+
+- **Complete streams only.** A request counts if its SSE stream ends with `[DONE]` or a `finish_reason`. An error event,
+  a malformed event or EOF before the end makes it an error; the tokens it produced are reported separately
+  (`partial_out_tokens`) and are not in the throughput. Streams are read from the decoded HTTP body, so chunked transfer
+  encoding (vLLM, proxies) cannot split an event.
+- **No cache help.** Every prompt starts with a per-run nonce (`--nonce`, random per run and recorded in the JSON); the
+  rest comes from `--seed`, so both endpoints get the same requests, and no prefix cache helps, also not across runs
+  against the same server.
+- **Equal work.** `ignore_eos` everywhere (scenarios: `--allow-eos` to stop at the model's EOS), so both engines
+  generate `max_tokens` per request. `output_tokens_mean` and the per-user decode speed `tok_s_per_user` (1 / TPOT p50)
+  are always reported. Greedy (temperature 0) unless `--temperature`.
+- **Warm-up per level.** Before each level an unmeasured run with the same prompt and output lengths (different
+  content): lazily prepared kernels and plans of first-seen shapes are not timed (prefill levels: up to 4 prompts).
+- **Repeats.** `--repeats` measured runs per level (default 3). Throughput is the median with the range
+  (`*_min` / `*_max`) over the repeats, over the wall time and in the **steady-state window** (`steady_output_tok_s`:
+  only the time when all slots of the closed loop are busy, after the ramp-up and before the tail; needs more requests
+  than slots).
+- **Tails.** TTFT / TPOT / E2E tails are taken over the samples of all repeats: a p99 only with at least 100 samples,
+  otherwise the maximum; `*_tail_kind` says which. A level without any TPOT value is reported as such, never as 0 ms,
+  and counts as a TPOT miss in `capacity`.
+- `mixed` counts short requests only if they finish within the phase (`--duration`), so both engines get the same
+  measuring window.
+
+Run one endpoint at a time on the same GPUs, and give both the same `max_model_len`, the same KV budget and the same
+speculative setting (state `--nextn` / num_speculative_tokens in `--label`). Long synthetic documents are sized by
+characters (`--chars-per-token`, 3.6 for V4.1); the tables report the real prompt token counts. For vLLM, tool
+definitions in `shared-prefix` are plain text in the system prompt, so no tool parser is needed. Server statistics
+are optional: an endpoint without `/health` or `/metrics` just gets no cache or acceptance columns. Numbers recorded
+before this method (0.3.1) came without repeats or nonces, and counted incomplete streams as successes.
 
 ```bash
 python3 eval/scenarios.py realistic     --url http://host:8000 --label "DeepInfer nextn 3" --out results/di_realistic

@@ -15,9 +15,11 @@ def one(ids, out, k):
                                                           temperature=0, stream=True)), {"Content-Type": "application/json"})
     r = c.getresponse(); tf = None
     while True:
-        line = r.fp.readline()
+        line = r.readline()  # decoded body (chunked transfer encoding)
         if not line: break
+        if line.startswith(b"data: ") and b'"error"' in line: tf = None; break  # an error event is not a first token
         if tf is None and line.startswith(b"data: ") and line.strip() != b"data: [DONE]": tf = time.perf_counter()
+    c.close()
     out[k] = (tf - t0) if tf else float("nan")
 for case in a.cases.split(","):
     n, cc = (int(x) for x in case.split("x"))

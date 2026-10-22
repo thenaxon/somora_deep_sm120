@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import http.client
 import json
+import os
 import statistics
 import sys
 import threading
@@ -21,6 +22,8 @@ import urllib.parse
 
 TOPICS = ["the history of lighthouses", "how tides work", "why the sky is blue", "the life of a ship's carpenter",
           "how oil lamps were maintained", "storms in the nineteenth century"]
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "eval"))
+from sse import read_stream  # noqa: E402
 
 
 def stream_chat(host, port, model, messages, max_tokens, temperature=0.0):
@@ -32,28 +35,14 @@ def stream_chat(host, port, model, messages, max_tokens, temperature=0.0):
     r = c.getresponse()
     if r.status != 200:
         raise RuntimeError(f"HTTP {r.status}: {r.read()[:300]!r}")
-    t_first = t_last = None
-    text, usage = [], None
-    while True:
-        line = r.fp.readline()
-        if not line:
-            break
-        line = line.strip()
-        if not line.startswith(b"data: "):
-            continue
-        if line[6:] == b"[DONE]":
-            break
-        ev = json.loads(line[6:])
-        if ev.get("usage"):
-            usage = ev["usage"]
-        for ch in ev.get("choices") or []:
-            piece = (ch.get("delta") or {}).get("content")
-            if piece:
-                now = time.perf_counter()
-                t_first = t_first or now
-                t_last = now
-                text.append(piece)
-    c.close()
+    try:
+        s = read_stream(r)  # eval/sse.py: decoded body (chunked transfer), error events, truncation
+    finally:
+        c.close()
+    if not s.ok:
+        raise RuntimeError(f"stream failed after {len(s.stamps)} chunks: {s.error}")
+    usage, text = s.usage, [s.text]
+    t_first, t_last = (s.stamps[0], s.stamps[-1]) if s.stamps else (None, None)
     n = (usage or {}).get("completion_tokens", 0)
     ttft = (t_first - t0) if t_first else None
     tpot = ((t_last - t_first) / (n - 1)) if (t_first and n > 1) else None

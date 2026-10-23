@@ -3,9 +3,9 @@
 All notable changes to this project are documented here. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0 any minor release may change interfaces.
 
-## [0.3.1-rc1] - 2026-10-23
+## [0.3.1] - 2026-10-23
 
-Release candidate. Opt-in additions (vmm engram allocation, exact-size EP collectives, decode profiler), a faster
+Opt-in additions (vmm engram allocation, exact-size EP collectives, decode profiler), a faster
 `docker stop`, deterministic b12x MoE usable again, and fixes from an external code review of 0.3.0.
 
 ### Added
@@ -16,10 +16,13 @@ Release candidate. Opt-in additions (vmm engram allocation, exact-size EP collec
   the engram tables once as pinned host memory (`cuMemCreate`) and the other ranks import it, so only one rank pays
   the driver's registration cost. About 2.6 GiB less host memory per extra rank (7.8 GiB with `--dp 4`), start-up
   check 217 instead of 225 GiB; same lookup speed; falls back to the memfd registration if the allocation fails
-  (docs/ENGRAM.md, docs/MULTI_GPU_RUNBOOK.md §3).
+  (docs/ENGRAM.md, docs/MULTI_GPU_RUNBOOK.md §3). On 4x RTX PRO 6000 with `--dp 4`: `docker stop` 4.9 instead of
+  13-14 s, attach about 16 instead of 44 s per rank, about 5.9 GiB less kernel memory. The default stays the memfd
+  registration until 0.3.2.
 - `SM120_EP_VARLEN=ag|1` (experimental, default 0): EP prefill collectives sized to the real token counts instead of
   padding every rank to the busiest one (with one busy rank the all-gather moves about a quarter of the rows).
-  Bit-identical to the padded path in the tests; its speed on 4 GPUs is not measured yet.
+  Bit-identical to the padded path, also on 4 GPUs over NCCL. On 4x RTX PRO 6000 `1` cut the 32k-token TTFT from
+  10.8 to 9.5 s (`ag`: 10.0 s).
 - Proxy and server options: `--start-timeout` (default 3600 s), `--max-request-bytes` (413 above it).
 - `SM120_ENGRAM_GRAPH_WAIT_S` (default 30): time budget of the in-graph engram wait (`host` / `uring` modes).
 

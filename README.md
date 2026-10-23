@@ -160,7 +160,10 @@ Details and more tables: [docs/VALIDATION.md](docs/VALIDATION.md), [docs/ATTENTI
   `SM120_MOE_DETERMINISTIC=1` (below). In 0.3.0 `--deterministic` with `--dp > 1` computed wrong MoE outputs; since
   0.3.1 the server refuses that combination, and `--deterministic` with graphs at start-up.
 - b12x's deterministic MoE mode (`SM120_MOE_DETERMINISTIC=1`, also turned on by `DEEPINFER_BATCH_INVARIANT=1`) is
-  bit-exact run to run, 1.06-1.19x slower in decode on one GPU (with `--dp` more, see docs/RUNTIME.md). b12x 1.5.1's `deterministic_output` has two bugs (wrong rows
+  bit-exact run to run; on one GPU also across concurrent identical requests (measured with 8 at once). With `--dp N`
+  it holds for the same request on the same rank only: the expert-parallel reduce-scatter rounds per destination
+  rank, so identical requests that the DP proxy places on different ranks can differ. 1.06-1.19x slower in decode on
+  one GPU (with `--dp` more, see docs/RUNTIME.md). b12x 1.5.1's `deterministic_output` has two bugs (wrong rows
   below dynamic tile 64, stale rows for masked routes under expert parallelism), worked around since 0.3.1 (refused by
   the 0.3.0 server); the workarounds are validated on b12x 1.5.1 only.
 - **MTP known issue:** nextn 1 together with `DEEPINFER_SAMPLER_FORCE_TOPK=1024` at batch > 1 accepts no drafts (output

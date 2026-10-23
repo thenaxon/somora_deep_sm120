@@ -67,7 +67,8 @@ at start-up and again after the post-load step (`[sm120_engram] engram tables re
 with `cudaErrorNotSupported` (measured on the RTX 5090 test machine), so `mlock` is the way to pin.
 
 **Memory budget for `--dp 4` on a 246 GiB host without swap.**
-- In `pinned` mode the tables are 188.8 GiB of shared memory (`Shmem` in `/proc/meminfo`), counted once.
+- In `pinned` mode the tables are 188.8 GiB of shared memory (`Shmem` in `/proc/meminfo`), counted once (with
+  `SM120_ENGRAM_PINNED_ALLOC=vmm` driver memory instead, not in `Shmem`).
 - The ranks no longer map the shard files, so their page tables stay small: VmPTE 0.03 GiB instead of 0.4.
 - Each rank's registration costs host memory besides the segment: the driver's per-page bookkeeping (12 MiB of
   `VmallocUsed` per GiB) and the rank's page tables for the mapping (2 MiB per GiB), both for 4 KiB pages and not
@@ -76,7 +77,14 @@ with `cudaErrorNotSupported` (measured on the RTX 5090 test machine), so `mlock`
   vmalloc +Y MiB"). Only 2 MiB host pages would shrink it, and those need hugetlbfs or shmem THP, i.e. host settings.
 - The start-up check uses `SM120_ENGRAM_RANK_HOST_GB=5` per rank plus the registration cost above per rank and
   `SM120_ENGRAM_PIN_HEADROOM_GB=6`: tables + 4 x (5 + 2.6) + 6 = 225 GiB for `--dp 4`.
-- **Opt-in, less host memory: `-e SM120_ENGRAM_PINNED_ALLOC=vmm`.** Rank 0 allocates the segment once as pinned host
+- **Recommended option (opt-in in 0.3.1, planned as the default for 0.3.2): `-e SM120_ENGRAM_PINNED_ALLOC=vmm`.**
+  Measured on the 4-GPU host (v0.3.1-rc1, `--dp 4`, 256 users without errors): `docker stop` 4.9 s instead of 13-14 s,
+  attach about 16 s per rank instead of 44 s (the other ranks' 16 s include 12 s waiting for rank 0's allocation),
+  VmallocUsed 4.3 instead of 9.1 GiB and PageTables 0.5 instead of 1.6 GiB after the fill (about 5.9 GiB less kernel
+  memory that cannot be reclaimed), the fill at 6.3 GB/s. Two things change for monitoring: the tables are no longer
+  `Shmem` (a check for "Shmem about 189 GiB" reads about 4 GiB, the multimodal pools; check MemAvailable and the
+  "allocated" / "imported" log lines instead), and the start-up check needs 217 GiB instead of 225 GiB.
+  Rank 0 allocates the segment once as pinned host
   memory (`cuMemCreate`) and passes it to the other ranks over a Unix socket; they map it for their GPU only. The
   driver's bookkeeping then exists once and the other ranks need no CPU page tables for it: about 2.6 GiB more
   MemAvailable per extra rank, 7.8 GiB for `--dp 4` (RTX 5090: a second rank's attach costs 0 MiB of vmalloc and page
@@ -86,7 +94,10 @@ with `cudaErrorNotSupported` (measured on the RTX 5090 test machine), so `mlock`
   longer show up as `Shmem` but as a MemAvailable drop. Process exit frees them; nothing is left in `/dev/shm`, also
   after SIGKILL. If rank 0 cannot allocate it, every rank falls back to the memfd registration (log line "vmm failed
   ... registering the memfd instead"; the start-up stops instead if MemAvailable cannot take the fallback). The log
-  says "allocated (cuMemCreate ...)" on rank 0 and "imported (cuMemCreate)" on the other ranks.
+  says "allocated (cuMemCreate ...)" on rank 0 and "imported (cuMemCreate) ... (after X s waiting for rank 0)" on the
+  other ranks; their page tables and vmalloc are counted from the receipt of the allocation (VmallocUsed is
+  system-wide: ranks attaching at the same time still see each other's). An import that fails after rank 0's
+  allocation stops the start-up ("unset SM120_ENGRAM_PINNED_ALLOC"); only a failed allocation falls back.
 - After the fill the server prints where the host memory is ("read ... GiB of engram tables ... MemAvailable X GiB
   (Shmem, AnonPages, VmallocUsed, PageTables, page cache, SUnreclaim)"). On the 4-GPU host about 14 GiB stay
   available after the fill: about 232 GiB before start - 188.8 GiB tables - 4 x (about 4.5 GiB per rank + 2.6 GiB
@@ -176,10 +187,15 @@ All 4 rank processes map the same files, so the page cache holds one copy.
     handles SIGTERM (`docker stop`; the server is PID 1 through `exec` in the entrypoint) with an orderly shutdown, and
     the `--dp` proxy forwards it to its ranks. The ranks stop together, a rank still there after 7 s is killed, and
     every stage logs a `shutdown: ...` line (docs/SERVER.md). Most of the time goes into freeing the pinned engram
-    tables. From the test machine's numbers (about 0.03 s per GiB per rank, plus the parallel release), 188.8 GiB with
-    `--dp 4` comes out at roughly 7-10 s, so start the container with `--stop-timeout 30` (§5). A `docker stop` that
-    runs into the timeout ends with SIGKILL (exit 137); in the v0.3.0 acceptance that left no processes, GPU memory
-    or shared memory behind. Before v0.1.1 every stopped engine left a 2 GB `psm_*` file in the
+    tables: after a rank's `os._exit` the kernel and the driver unpin and unmap every 4 KiB page of its
+    `cudaHostRegister` of the 188.8 GiB segment (and with a translated IOMMU unmap them page by page). With the default
+    memfd registration a `docker stop` of `--dp 4` takes **13-14 s on the 4-GPU host (v0.3.1-rc1), and that is
+    expected**: the ranks reach their fast exit within 0.7 s, the teardown then takes 5-11 s per rank (the 7 s kill
+    does not shorten it, the kernel finishes it either way), and the proxy frees the memfds in about 2 s. Neither an
+    explicit `cudaHostUnregister` before the exit nor unregistering chunks from several threads is faster (measured:
+    the driver serializes it). **`--stop-timeout 30` is required** (§5); with docker's default of 10 s the stop ends
+    with SIGKILL (exit 137). That loses nothing (in the v0.3.0 acceptance it left no processes, GPU memory or shared
+    memory behind), but it is not an orderly stop. With `SM120_ENGRAM_PINNED_ALLOC=vmm` (below) the stop took 4.9 s. Before v0.1.1 every stopped engine left a 2 GB `psm_*` file in the
     host's `/dev/shm` (with `--ipc=host`); delete leftovers from older runs by hand.
 - **NUMA:** the image has libnuma1. On a multi-socket host add `--cap-add SYS_NICE`, otherwise the memory policy part of
   DeepInfer's binding is refused (CPU affinity still applies). Single-socket hosts skip the binding (patch P10).

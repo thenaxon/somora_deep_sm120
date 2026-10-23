@@ -160,8 +160,9 @@ Cost (RTX 5090, CUDA graphs, prompt 256, 128 generated tokens, TPOT ms default -
 
 With the tile >= 64 plans of 0.3.1 the decode step is 1.06-1.19x slower on one GPU (the 0.2.x plans were 2-2.9x
 slower, and wrong for some shapes). With `--dp N` each rank also computes the (N-1)/N routes to the other ranks'
-experts at weight 0 (masked-route workaround), which is not measured yet. The mode stays opt-in, for tests and
-reproducibility
+experts at weight 0 (masked-route workaround), which is not measured yet. With `--dp N` the result is bit-exact for
+the same request on the same rank, not across ranks: the EP reduce-scatter (NCCL ring, bf16) sums every destination
+rank's segment in a different order. The mode stays opt-in, for tests and reproducibility
 (`server.py --deterministic` is a different switch: it uses the torch MoE reference, `SM120_MOE_IMPL=torch`).
 `SM120_MOE_PLAN=session` is forced off in deterministic mode: session plans did not give bit-identical repeats. Whether b12x `block_fp8_linear` is bit-reproducible
 (split-K configs) is not checked. Test: `tests/test_gemm_moe_graphs.py::test_moe_determinism`.

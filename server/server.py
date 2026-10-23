@@ -784,10 +784,14 @@ def _deterministic_moe_notes(args) -> list[tuple[int, str]]:
     names = [n for n in ("SM120_MOE_DETERMINISTIC", "DEEPINFER_BATCH_INVARIANT", "B12X_DYNAMIC_DETERMINISTIC_OUTPUT") if on(n)]
     if not names:
         return []
-    msg = (f"deterministic b12x MoE ({'/'.join(names)}): bit-exact run to run, slower decode (1.06-1.19x on one GPU)")
     if args.dp > 1:
-        msg += (f"; with --dp {args.dp} each rank also computes the routes to the other ranks' experts "
-                f"((dp-1)/dp of all routes) at weight 0")
+        msg = (f"deterministic b12x MoE ({'/'.join(names)}): bit-exact run to run for the same request on the same "
+               f"rank; with --dp {args.dp} the expert-parallel reduce-scatter rounds per destination rank, so identical "
+               f"requests placed on different ranks (the DP proxy places by load) can differ. Slower decode; each rank "
+               f"also computes the routes to the other ranks' experts ((dp-1)/dp of all routes) at weight 0")
+    else:
+        msg = (f"deterministic b12x MoE ({'/'.join(names)}): bit-exact run to run, also across concurrent identical "
+               f"requests; slower decode (1.06-1.19x on one GPU)")
     notes = [(logging.INFO, msg)]
     try:
         from importlib.metadata import version

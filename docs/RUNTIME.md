@@ -18,7 +18,7 @@ All numbers below are from one RTX 5090 with truncated test checkpoints ([VALIDA
 | DeepInfer sampler / DFlash TileLang op tests | 74 + 124 passed |
 | b12x tiny-decode SwiGLU patch ([flashinfer#6866](https://github.com/flashinfer-ai/flashinfer/issues/6866)) | all checks pass incl. the V4.1 shape; tiny-decode is 0.90-0.95x the dynamic path, so the default stays dynamic (`SM120_MOE_TINY_DECODE=0`) |
 | logit capture (`tools/run_deepinfer.py`, 3-layer model) | decode argmax == sampled token for all 16 steps |
-| determinism | default b12x MoE: repeats differ (atomic top-k combine). `SM120_MOE_DETERMINISTIC=1` / `--batch-invariant`: bit-identical repeats, prefill + decode logits and tokens; on the full-depth test model eager, graphs and a second graphs run are bit-identical (17/17 tokens, 0.0 error on every layer) |
+| determinism | default b12x MoE: repeats differ (atomic top-k combine). `SM120_MOE_DETERMINISTIC=1` / `--batch-invariant`: bit-identical repeats (with `--dp`: on the same rank), prefill + decode logits and tokens; on the full-depth test model eager, graphs and a second graphs run are bit-identical (17/17 tokens, 0.0 error on every layer) |
 | CUDA graphs end to end | 3-layer, YOCO and full-depth test models; no b12x fallback warnings under capture |
 | MTP / DSpark | nextn 1 and 5, eager and graphs; speculative == greedy holds exactly with the deterministic MoE ([VALIDATION.md](VALIDATION.md)) |
 
@@ -69,7 +69,11 @@ rows / `mtp_info_read_rows`) or the MTP info pool with several requests. The ser
 ### Deterministic MoE: cost
 
 b12x 1.5.1's `deterministic_output` is wrong for some batch sizes (dynamic tiles below 64) and with expert parallelism (masked routes). `sm120_moe` works around both since 0.3.1 (the 0.3.0 server refused the mode); the server logs a warning if the installed b12x is not 1.5.1, the version the workarounds were validated on (`tests/sweep_moe_deterministic.py`). `SM120_MOE_DETERMINISTIC=1` (or `tools/run_deepinfer.py --batch-invariant`) makes b12x `fused_moe` bit-exact run to run
-([MOE_GEMM.md](MOE_GEMM.md) section 5). CUDA graphs, prompt 256, 128 generated tokens, TPOT ms default -> deterministic:
+([MOE_GEMM.md](MOE_GEMM.md) section 5). Scope: on one GPU the server output is identical for the same request, also
+when identical requests run concurrently (8 at once, CUDA graphs, nextn 0 and 7, RTX 5090). With `--dp N` it is
+identical for the same request on the same rank; across ranks it can differ, because the expert-parallel
+reduce-scatter sums each destination rank's segment in a different ring order with a bf16 rounding per step, and the
+DP proxy places requests by load. CUDA graphs, prompt 256, 128 generated tokens, TPOT ms default -> deterministic:
 
 | model | B=1 | B=8 | B=32 |
 |---|---|---|---|

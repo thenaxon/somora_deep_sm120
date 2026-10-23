@@ -52,6 +52,9 @@ Release candidate. Opt-in additions (vmm engram allocation, exact-size EP collec
   budget).
 
 ### Fixed
+- Deterministic b12x MoE with `--dp N`: the start-up line and docs claimed "bit-exact run to run" without a scope.
+  It holds for the same request on the same rank; identical requests on different ranks can differ (the EP
+  reduce-scatter rounds per destination rank). On one GPU it also holds across concurrent identical requests.
 - `--deterministic` / `SM120_MOE_IMPL=torch` with CUDA graphs (the docker image's default) loaded the whole model and
   then exited at the graph capture (the torch MoE reference is not capturable). The server now refuses it at argument
   parsing: add `--no-graphs`, or use `SM120_MOE_DETERMINISTIC=1` (deterministic b12x MoE; graphs and `--dp` work).

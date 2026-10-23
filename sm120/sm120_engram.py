@@ -1029,7 +1029,7 @@ def _attach_segment(sh: dict, device: torch.device) -> None:
     with torch.cuda.device(device):
         torch.empty(0, device=device)  # this rank's context is current for the driver calls
         free0, mi0, pte0 = torch.cuda.mem_get_info(device)[0], _meminfo(), _meminfo("/proc/self/status").get("VmPTE", 0)
-        how = "registered"
+        how, waited = "registered", 0.0
         if _env("SM120_ENGRAM_PINNED_ALLOC", "register") != "vmm":
             _register_memfd(sh, device)
         else:
@@ -1066,6 +1066,10 @@ def _attach_segment(sh: dict, device: torch.device) -> None:
                                  daemon=True).start()
             else:
                 msg, fd = _vmm_receive()
+                # measure from here: the wait covered rank 0's allocation (and its vmalloc, a system-wide counter)
+                waited, t0 = time.time() - t0, time.time()
+                free0, mi0 = torch.cuda.mem_get_info(device)[0], _meminfo()
+                pte0 = _meminfo("/proc/self/status").get("VmPTE", 0)
                 if msg.get("alloc") != "vmm":
                     _register_memfd(sh, device)
                 else:
@@ -1093,8 +1097,9 @@ def _attach_segment(sh: dict, device: torch.device) -> None:
     pte = _meminfo("/proc/self/status").get("VmPTE", 0) - pte0
     vm = _meminfo().get("VmallocUsed", 0) - mi0.get("VmallocUsed", 0)
     print(f"[sm120_engram] pinned mode: {how} the shared segment ({sh['size'] / 2**30:.1f} GiB) for "
-          f"{device} in {time.time() - t0:.1f} s, {cost / 2**20:.0f} MiB of GPU memory; host: page tables "
-          f"+{pte / 2**20:.0f} MiB, driver vmalloc +{vm / 2**20:.0f} MiB", flush=True)
+          f"{device} in {time.time() - t0:.1f} s{f' (after {waited:.1f} s waiting for rank 0)' if waited else ''}, "
+          f"{cost / 2**20:.0f} MiB of GPU memory; host: page tables {round(pte / 2**20):+d} MiB, driver vmalloc "
+          f"{round(vm / 2**20):+d} MiB", flush=True)
 
 
 def open_shared_table(ckpt_dir: str | None, layer_id: int, wloc: TensorLoc, sloc: TensorLoc,
